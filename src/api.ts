@@ -12,6 +12,7 @@ import type {
   ExecReport,
   FileEntry,
   LockReport,
+  MaintenanceProgress,
   MigrationCleanupPlan,
   MigrationMode,
   MigrationResult,
@@ -84,6 +85,24 @@ export function commandExecute(
 // 需要管理员权限的清理项：只传规则 ID，内置操作和安全路径都由后端决定。
 export function elevatedExecute(ruleId: string): Promise<ElevatedResult> {
   return invoke<ElevatedResult>("elevated_execute", { ruleId });
+}
+
+// 分析组件存储（DISM，只读）。会弹一次授权提示。
+export function maintenanceAnalyze(): Promise<ElevatedResult> {
+  return invoke<ElevatedResult>("maintenance_analyze");
+}
+
+// 系统维护：只传规则 ID，选中的项合成一次提权调用，只弹一次授权。
+export function maintenanceExecute(
+  ruleIds: string[],
+  onProgress: (progress: MaintenanceProgress) => void,
+): Promise<ElevatedResult> {
+  const channel = new Channel<MaintenanceProgress>();
+  channel.onmessage = (progress) => {
+    onProgress(progress);
+  };
+
+  return invoke<ElevatedResult>("maintenance_execute", { ruleIds, onProgress: channel });
 }
 
 export function volumeInfo(): Promise<VolumeInfo[]> {

@@ -21,7 +21,7 @@ use crate::win::volume;
 use crate::win::{KnownFolder, dirinfo, equals_ignore_case, known_folder};
 
 use super::args::{HelperArgs, SystemOp};
-use super::{ElevationError, HelperResult, OpOutcome};
+use super::{ElevationError, HelperResult, OpOutcome, maintenance, windows_files};
 
 /// 联想应用商店的 cicada 目录（相对 ProgramData）。路径由 helper 自己解析，不接受命令行传入。
 const LE_APPSTORE_CICADA: &str = r"Lenovo\LeAppStore\cicada";
@@ -102,7 +102,14 @@ fn run_ops(args: &HelperArgs) -> Result<HelperResult, ElevationError> {
 
     let mut outcomes = Vec::with_capacity(args.ops.len());
     for op in &args.ops {
-        let outcome = run_op(*op, &forbidden, quarantine_root, &mut journal);
+        let outcome = run_op(
+            *op,
+            &forbidden,
+            &roots,
+            quarantine_root,
+            args.progress.as_deref(),
+            &mut journal,
+        );
 
         // 每个操作都先写日志再交结果：日志写不进去就停手，不留没有记录的操作。
         journal
@@ -119,11 +126,16 @@ fn run_ops(args: &HelperArgs) -> Result<HelperResult, ElevationError> {
     Ok(HelperResult { ops: outcomes })
 }
 
-/// 执行一个内置操作。M5b 的系统操作由后续任务实现，这里如实报告未实现。
+/// 执行一个内置操作。
+///
+/// 文件类操作在 helper 里现生成冻结清单，再交给执行器逐项删除；
+/// 长耗时操作走 DISM 和官方 cmdlet，进度写进 `--progress` 指定的文件。
 fn run_op(
     op: SystemOp,
     forbidden: &Forbidden,
+    roots: &RootMap,
     quarantine_root: Option<&Path>,
+    progress: Option<&Path>,
     journal: &mut dyn JournalSink,
 ) -> OpOutcome {
     match op {
@@ -147,13 +159,11 @@ fn run_op(
         ),
         SystemOp::RestoreBatch(id) => restore_batch(op, id, quarantine_root, journal),
         SystemOp::PurgeBatch(id) => purge_batch(op, id, quarantine_root, journal),
-        SystemOp::WindowsTemp
-        | SystemOp::WindowsLogs
-        | SystemOp::SysReset
-        | SystemOp::DismAnalyze
-        | SystemOp::DismComponentCleanup
-        | SystemOp::DeliveryOptimization => {
-            OpOutcome::skipped(op.token(), "这个操作属于 M5b，尚未实现".to_string())
+        SystemOp::WindowsTemp | SystemOp::WindowsLogs | SystemOp::SysReset => {
+            windows_files::run(op, forbidden, roots, journal)
+        }
+        SystemOp::DismAnalyze | SystemOp::DismComponentCleanup | SystemOp::DeliveryOptimization => {
+            maintenance::run(op, roots, progress)
         }
     }
 }

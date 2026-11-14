@@ -8,6 +8,7 @@ use std::io::{self, Read};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -161,6 +162,133 @@ pub fn run_with_env(
         stdout_tail: stdout.snapshot(),
         stderr_tail: stderr.snapshot(),
     }
+}
+
+/// 启动命令并等待结束，同时把标准输出的新内容交给调用方处理。
+///
+/// DISM 这类长耗时命令会在运行中不断刷新进度行，只有边跑边收才拿得到百分比；
+/// [`run`] 只在命令结束后给出末尾输出，做不到这一点。
+///
+/// 和 [`run`] 一样：超时只停止等待，不结束进程。
+pub fn run_streaming(
+    tool: &Path,
+    args: &[&str],
+    timeout: Duration,
+    on_stdout: &mut dyn FnMut(&str),
+) -> CmdOutcome {
+    let mut command = match command_for(tool) {
+        Ok(command) => command,
+        Err(error) => return failed(&error),
+    };
+
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return failed(&format!("无法启动命令：{error}")),
+    };
+
+    // 标准输出走通道回到本线程：读取线程只负责读，调用方的回调在本线程里执行。
+    let (sender, receiver) = std::sync::mpsc::channel::<String>();
+    drain_to_channel(child.stdout.take(), sender);
+    let stderr = Tail::drain(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let mut stdout_tail = String::new();
+    let mut timed_out = false;
+    let mut exit_code = None;
+
+    loop {
+        // 先收输出再判退出：进程退出前写入的最后几行还在管道里。
+        match receiver.recv_timeout(POLL_INTERVAL) {
+            Ok(chunk) => {
+                push_tail(&mut stdout_tail, &chunk);
+                on_stdout(&chunk);
+                continue;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            // 管道已关闭但进程还没退出，稍等一下再查，避免空转。
+            Err(RecvTimeoutError::Disconnected) => std::thread::sleep(POLL_INTERVAL),
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = status.code();
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return CmdOutcome {
+                    exit_code: None,
+                    timed_out: false,
+                    stdout_tail,
+                    stderr_tail: format!("等待命令结束时出错：{error}"),
+                };
+            }
+        }
+
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+    }
+
+    // 退出之后管道里可能还有没读完的行，这里再收一轮。
+    while let Ok(chunk) = receiver.recv_timeout(POLL_INTERVAL) {
+        push_tail(&mut stdout_tail, &chunk);
+        on_stdout(&chunk);
+    }
+
+    CmdOutcome {
+        exit_code,
+        timed_out,
+        stdout_tail,
+        stderr_tail: stderr.snapshot(),
+    }
+}
+
+/// 只保留末尾 `TAIL_BYTES` 长度的输出。
+fn push_tail(buffer: &mut String, chunk: &str) {
+    buffer.push_str(chunk);
+    if buffer.len() <= TAIL_BYTES * 2 {
+        return;
+    }
+
+    let mut cut = buffer.len() - TAIL_BYTES;
+    // 从字符边界切开，避免把多字节字符截成半个。
+    while cut < buffer.len() && !buffer.is_char_boundary(cut) {
+        cut += 1;
+    }
+    buffer.drain(..cut);
+}
+
+/// 把标准输出的新内容按块送到主线程。管道关闭时线程自己结束。
+fn drain_to_channel(pipe: Option<impl Read + Send + 'static>, sender: Sender<String>) {
+    let Some(mut pipe) = pipe else {
+        return;
+    };
+
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => break,
+            };
+
+            // 接收端已经不在了（调用方超时返回），没必要继续读。
+            let text = String::from_utf8_lossy(&chunk[..read]).into_owned();
+            if sender.send(text).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 /// 组装要执行的命令。`.cmd` 和 `.bat` 是批处理脚本，必须交给 cmd.exe 解释。

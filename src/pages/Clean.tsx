@@ -3,6 +3,8 @@ import {
   candidateLocks,
   commandExecute,
   elevatedExecute,
+  maintenanceAnalyze,
+  maintenanceExecute,
   openCandidateInExplorer,
   planBuild,
   recycleBinEmpty,
@@ -18,6 +20,7 @@ import type {
   CommandReport,
   ElevatedResult,
   LockReport,
+  MaintenanceProgress,
   Phase,
   PlanSummary,
   RecycleBinInfo,
@@ -53,6 +56,25 @@ type LockState =
 // 能按冻结清单执行的规则。命令和特殊操作各有自己的执行方式，不进清单。
 function isPlanRule(rule: RuleInfo): boolean {
   return rule.targetKind !== "command" && rule.targetKind !== "special";
+}
+
+// 有内置操作的系统项只在“系统维护”分组里出现，不再进分级表格。
+function isMaintenanceRule(rule: RuleInfo): boolean {
+  return rule.systemOp !== null;
+}
+
+// 内置操作名到界面文案。后端返回的是 kebab-case 的操作名。
+const SYSTEM_OP_LABELS: Record<string, string> = {
+  "windows-temp": "Windows\\Temp",
+  "windows-logs": "Windows\\Logs",
+  "sys-reset": "$SysReset",
+  "dism-analyze": "组件存储分析",
+  "dism-component-cleanup": "组件存储清理",
+  "delivery-optimization": "传递优化缓存",
+};
+
+function systemOpLabel(op: string): string {
+  return SYSTEM_OP_LABELS[op] ?? op;
 }
 
 // 单条命令的运行状态。
@@ -94,6 +116,15 @@ export function CleanPage() {
   const [commandStates, setCommandStates] = useState<Record<string, CommandState>>({});
   // 需要管理员权限的清理项的执行状态，同样按规则 ID 分开记。
   const [elevatedStates, setElevatedStates] = useState<Record<string, ElevatedState>>({});
+  // 系统维护分组的勾选项。默认全不选，避免误删系统文件。
+  const [maintenanceSelected, setMaintenanceSelected] = useState<Set<string>>(new Set());
+  // 组件存储分析（只读）的状态。
+  const [analyzeState, setAnalyzeState] = useState<ElevatedState | null>(null);
+  // 系统维护执行中、最近一条进度和最终结果。
+  const [maintenanceRunning, setMaintenanceRunning] = useState(false);
+  const [maintenanceProgress, setMaintenanceProgress] = useState<MaintenanceProgress | null>(null);
+  const [maintenanceResult, setMaintenanceResult] = useState<ElevatedResult | null>(null);
+  const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
 
   const refreshRecycle = () => {
     recycleBinQuery()
@@ -291,6 +322,58 @@ export function CleanPage() {
       });
   };
 
+  // 系统维护分组：勾选、只读分析，以及一次授权执行全部选中项。
+  const toggleMaintenance = (ruleId: string) => {
+    setMaintenanceSelected((previous) => {
+      const next = new Set(previous);
+      if (next.has(ruleId)) {
+        next.delete(ruleId);
+      } else {
+        next.add(ruleId);
+      }
+      return next;
+    });
+  };
+
+  // 分析组件存储：只读，不改动任何内容，但同样要管理员权限。
+  const analyzeComponentStore = () => {
+    setAnalyzeState({ phase: "running" });
+    maintenanceAnalyze()
+      .then((result) => setAnalyzeState({ phase: "done", result }))
+      .catch((reason) =>
+        setAnalyzeState({ phase: "failed", message: String(reason) }),
+      );
+  };
+
+  // 执行选中的系统维护项。全部选中项合成一次提权调用，只弹一次授权。
+  const runMaintenance = (ruleIds: string[]) => {
+    if (ruleIds.length === 0) {
+      return;
+    }
+
+    const text = `将执行选中的 ${ruleIds.length} 项系统维护操作，只会弹出一次授权提示；其中组件存储清理（DISM）可能需要 10–30 分钟且无法取消，请勿关机；这些操作不可撤销。确认继续？`;
+    if (!window.confirm(text)) {
+      return;
+    }
+
+    setMaintenanceRunning(true);
+    setMaintenanceProgress(null);
+    setMaintenanceResult(null);
+    setMaintenanceError(null);
+
+    maintenanceExecute(ruleIds, setMaintenanceProgress)
+      .then((result) => {
+        setMaintenanceResult(result);
+        // 系统文件已经清过，重新评估一次，界面上的数字才是当前的。
+        evaluate();
+      })
+      .catch((reason) => setMaintenanceError(String(reason)))
+      .finally(() => {
+        setMaintenanceProgress(null);
+        setMaintenanceRunning(false);
+      });
+  };
+
   // 清空回收站：确认文案里写明执行时清空的是全部内容，并把当前数值一起回传。
   const emptyRecycle = () => {
     if (!recycle) {
@@ -319,6 +402,12 @@ export function CleanPage() {
   // 命令类规则单独成组：它们不生成冻结清单，一条一行单独运行。
   const commandRules = rules.filter((rule) => rule.targetKind === "command");
 
+  // 有内置操作的系统项。还没有内置操作的项留在分级表格里显示“阶段未开放”。
+  const maintenanceRules = rules.filter(isMaintenanceRule);
+  const maintenanceIds = maintenanceRules
+    .filter((rule) => maintenanceSelected.has(rule.id))
+    .map((rule) => rule.id);
+
   // 命令、回收站和清单共用后端的执行锁：任一操作进行时，其他执行按钮都禁用。
   // 判断以后端为准，这里只是不让用户白点。
   const anyCommandRunning = Object.values(commandStates).some(
@@ -327,7 +416,15 @@ export function CleanPage() {
   const anyElevatedRunning = Object.values(elevatedStates).some(
     (state) => state.phase === "running",
   );
-  const execBusy = planning || recycleBusy || planRunning || anyCommandRunning || anyElevatedRunning;
+  const anyAnalyzeRunning = analyzeState?.phase === "running";
+  const execBusy =
+    planning ||
+    recycleBusy ||
+    planRunning ||
+    anyCommandRunning ||
+    anyElevatedRunning ||
+    anyAnalyzeRunning ||
+    maintenanceRunning;
 
   return (
     <section>
@@ -357,7 +454,10 @@ export function CleanPage() {
         const groupRules = rules.filter((rule) => rule.tier === group.tier);
         const isCollapsed = collapsed.has(group.tier);
         // 特殊操作（回收站）和命令都不走冻结清单，单独成行，不参与勾选。
-        const tableRules = groupRules.filter(isPlanRule);
+        // 系统维护项有内置操作，放到下面的“系统维护”分组里。
+        const tableRules = groupRules.filter(
+          (rule) => isPlanRule(rule) && !isMaintenanceRule(rule),
+        );
         const specialRules = groupRules.filter((rule) => rule.targetKind === "special");
         // 卡片标题按实际渲染的条目数统计：命令和特殊操作已经移出各自的表格。
         const cardCount =
@@ -654,6 +754,95 @@ export function CleanPage() {
           </div>
         );
       })}
+
+      {maintenanceRules.length > 0 && (
+        <div className="card">
+          <div className="group-header">
+            <h3>系统维护（需要管理员）（{maintenanceRules.length}）</h3>
+            <div className="actions">
+              <button
+                type="button"
+                className="link"
+                disabled={execBusy}
+                onClick={analyzeComponentStore}
+              >
+                {anyAnalyzeRunning ? "正在分析…" : "分析组件存储（只读）"}
+              </button>
+              <button
+                type="button"
+                className="button-primary"
+                disabled={execBusy || maintenanceIds.length === 0}
+                onClick={() => runMaintenance(maintenanceIds)}
+              >
+                {maintenanceRunning ? "正在执行…" : "执行选中项"}
+              </button>
+            </div>
+          </div>
+          <p className="muted">
+            这些项走 Windows 自己的维护流程，需要管理员权限。勾选多项后点“执行选中项”，整个过程中只会弹出一次授权提示。
+            文件类操作按冻结清单逐项删除，被占用的文件跳过；DISM 组件存储清理不做 ResetBase，可能需要 10–30
+            分钟且无法取消，请勿关机；传递优化缓存调用官方 cmdlet。
+          </p>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>选择</th>
+                <th>名称</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              {maintenanceRules.map((rule) => (
+                <tr key={rule.id}>
+                  <td>
+                    <input
+                      type="checkbox"
+                      checked={maintenanceSelected.has(rule.id)}
+                      disabled={maintenanceRunning || anyAnalyzeRunning}
+                      onChange={() => toggleMaintenance(rule.id)}
+                      aria-label={`选择 ${rule.name}`}
+                    />
+                  </td>
+                  <td>{rule.name}</td>
+                  <td>
+                    <span>{rule.description}</span>
+                    {rule.warning && <p className="warn">注意：{rule.warning}</p>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          {anyAnalyzeRunning && <p className="muted">正在分析组件存储，可能需要几分钟…</p>}
+          {analyzeState?.phase === "failed" && (
+            <p className="warn">分析失败：{analyzeState.message}</p>
+          )}
+          {analyzeState?.phase === "done" &&
+            analyzeState.result.ops.map((op) => (
+              <p key={op.op} className={op.status === "failed" ? "warn" : "muted"}>
+                {systemOpLabel(op.op)}：{op.detail}
+              </p>
+            ))}
+
+          {maintenanceRunning && (
+            <p className="muted">
+              {maintenanceProgress
+                ? `${systemOpLabel(maintenanceProgress.op)}：${maintenanceProgress.detail}`
+                : "等待管理员授权并执行…"}
+            </p>
+          )}
+          {maintenanceError && <p className="warn">系统维护失败：{maintenanceError}</p>}
+          {maintenanceResult && (
+            <ul className="sample-list">
+              {maintenanceResult.ops.map((op) => (
+                <li key={op.op} className={op.status === "failed" ? "warn" : "muted"}>
+                  {systemOpLabel(op.op)}：{op.detail}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       {commandRules.length > 0 && (
         <div className="card">

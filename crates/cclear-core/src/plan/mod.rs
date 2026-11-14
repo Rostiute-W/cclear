@@ -1,7 +1,7 @@
 //! 冻结清单：预览时定下条目，执行时只按这份清单动手。
 
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -119,6 +119,28 @@ pub fn build_plan(
     })
 }
 
+/// 生成清单时的筛选条件。普通规则直接用规则的 `Selector`；
+/// 需要按扩展名筛选或只收文件的操作（helper 的系统维护）用它描述。
+pub struct PlanOptions {
+    pub selector: Selector,
+    /// 只收这些扩展名的文件，比较时不区分大小写。空表示不限扩展名。
+    pub extensions: &'static [&'static str],
+    /// 子目录是否也进清单。只清文件的操作填 false，免得顺带删掉别的空目录。
+    pub keep_dirs: bool,
+}
+
+/// 全部内容：递归、不限年龄、目录也进清单。
+const ALL_CONTENTS: PlanOptions = PlanOptions {
+    selector: Selector {
+        kind: SelectKind::AllContents,
+        min_age_hours: None,
+        exclude_newest_per_dir: false,
+        exclude_child_dirs: &[],
+    },
+    extensions: &[],
+    keep_dirs: true,
+};
+
 /// 按给定的锚点生成冻结清单。
 ///
 /// 迁移这类锚点来自运行时查询（当前生效的缓存目录）的流程用它：没有规则模板，
@@ -132,13 +154,31 @@ pub fn build_plan_at(
     procs: &[ProcInfo],
     now: SystemTime,
 ) -> FrozenPlan {
+    build_plan_selected(
+        rule_id,
+        recovery,
+        anchors,
+        ALL_CONTENTS,
+        forbidden,
+        procs,
+        now,
+    )
+}
+
+/// 同 [`build_plan_at`]，但可以用更窄的筛选条件。
+///
+/// 需要管理员权限的系统维护操作（Windows\Temp、Windows\Logs）用它：只清指定年龄、
+/// 指定扩展名的文件，清单之外的一个都不碰。
+pub fn build_plan_selected(
+    rule_id: &'static str,
+    recovery: Recovery,
+    anchors: &[PathBuf],
+    options: PlanOptions,
+    forbidden: &Forbidden,
+    procs: &[ProcInfo],
+    now: SystemTime,
+) -> FrozenPlan {
     let now_ticks = system_time_ticks(now);
-    let selector = Selector {
-        kind: SelectKind::AllContents,
-        min_age_hours: None,
-        exclude_newest_per_dir: false,
-        exclude_child_dirs: &[],
-    };
 
     let mut items: Vec<FrozenItem> = Vec::new();
     let mut skipped: Vec<(PathBuf, String)> = Vec::new();
@@ -160,8 +200,9 @@ pub fn build_plan_at(
             // 锚点数量远小于 u16 上限。
             anchor_index: index as u16,
             volume_serial: anchor.identity().volume_serial,
-            selector,
-            keep_dirs: true,
+            selector: options.selector,
+            extensions: options.extensions,
+            keep_dirs: options.keep_dirs,
             forbidden,
             procs,
             now_ticks,
@@ -234,6 +275,7 @@ fn walk_anchors(
             anchor_index: index as u16,
             volume_serial: anchor.identity().volume_serial,
             selector,
+            extensions: &[],
             keep_dirs: true,
             forbidden,
             procs,
@@ -313,6 +355,7 @@ fn expand_adapter(
                 anchor_index: anchor_index as u16,
                 volume_serial: anchor.identity().volume_serial,
                 selector: selector_of(rule),
+                extensions: &[],
                 keep_dirs: false,
                 forbidden,
                 procs,
@@ -401,6 +444,8 @@ struct Walker<'a> {
     anchor_index: u16,
     volume_serial: u64,
     selector: Selector,
+    /// 只收这些扩展名的文件。空表示不限。
+    extensions: &'a [&'a str],
     /// 子目录是否也进清单。适配器展开的子树只收文件，目录交给用户自己处理。
     keep_dirs: bool,
     forbidden: &'a Forbidden,
@@ -468,6 +513,11 @@ impl Walker<'_> {
             }
 
             if at_anchor && !keep_anchor_file(&self.selector, &entry.name.to_string_lossy()) {
+                continue;
+            }
+
+            // 扩展名不在范围内只是不选，不是跳过原因，所以不记录。
+            if !extension_allowed(&entry.name, self.extensions) {
                 continue;
             }
 
@@ -580,6 +630,21 @@ fn join_all(base: &Path, rel: &[OsString]) -> PathBuf {
         path.push(part);
     }
     path
+}
+
+/// 文件名是否落在允许的扩展名集合里。空集合表示不限扩展名。
+fn extension_allowed(name: &OsStr, extensions: &[&str]) -> bool {
+    if extensions.is_empty() {
+        return true;
+    }
+
+    let Some(extension) = Path::new(name).extension().and_then(OsStr::to_str) else {
+        return false;
+    };
+
+    extensions
+        .iter()
+        .any(|allowed| crate::win::equals_ignore_case(extension, allowed))
 }
 
 /// 这个目录里哪些文件该进清单。口径与 `resolve::allowed_ids` 相同。

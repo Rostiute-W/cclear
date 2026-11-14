@@ -7,6 +7,9 @@
 mod args;
 mod helper;
 mod launch;
+mod maintenance;
+mod progress;
+mod windows_files;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,11 +18,21 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::rules::resolve::RootMap;
 use crate::win::{KnownFolder, known_folder};
 
 pub use args::{HelperArgs, SystemOp, parse_helper_args};
 pub use helper::helper_main;
 pub use launch::command_line;
+pub use progress::OpProgress;
+
+/// Windows 目录。系统操作的路径一律从它拼出，不读环境变量。
+fn windows_dir(roots: &RootMap) -> Result<PathBuf, String> {
+    roots
+        .get(crate::model::KnownRoot::Windows)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "无法解析 Windows 目录".to_string())
+}
 
 /// 提权流程的错误。文案都是给用户看的中文。
 #[derive(Debug, Error)]
@@ -126,6 +139,18 @@ pub fn run_elevated(
     ops: &[SystemOp],
     quarantine_root: &Path,
 ) -> Result<HelperResult, ElevationError> {
+    run_elevated_with(ops, Some(quarantine_root), None)
+}
+
+/// 同 [`run_elevated`]，但隔离根目录和进度文件都是可选的。
+///
+/// 系统维护操作既不用隔离区，又要在长耗时过程中把进度写给主程序看，
+/// 所以两者都要能省略或单独给出。
+pub fn run_elevated_with(
+    ops: &[SystemOp],
+    quarantine_root: Option<&Path>,
+    progress: Option<&Path>,
+) -> Result<HelperResult, ElevationError> {
     if ops.is_empty() {
         return Err(ElevationError::InvalidArgs("没有要执行的操作".to_string()));
     }
@@ -138,7 +163,7 @@ pub fn run_elevated(
     std::fs::create_dir_all(&dir)?;
     let result_file = dir.join(format!("{}.json", Uuid::new_v4()));
 
-    let params = vec![
+    let mut params = vec![
         "--elevated".to_string(),
         "--ops".to_string(),
         ops.iter()
@@ -147,11 +172,36 @@ pub fn run_elevated(
             .join(","),
         "--result".to_string(),
         result_file.to_string_lossy().into_owned(),
-        "--quarantine-root".to_string(),
-        quarantine_root.to_string_lossy().into_owned(),
     ];
 
+    if let Some(progress) = progress {
+        params.push("--progress".to_string());
+        params.push(progress.to_string_lossy().into_owned());
+    }
+
+    if let Some(root) = quarantine_root {
+        params.push("--quarantine-root".to_string());
+        params.push(root.to_string_lossy().into_owned());
+    }
+
     launch::runas_and_wait(&program, &params, &result_file)
+}
+
+/// 字节数写成 `x.xx GB / MB / KB`，和界面一样用二进制单位。
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// 结果文件和进度文件的固定目录：`<LocalAppData>\CClear\elevated`。
