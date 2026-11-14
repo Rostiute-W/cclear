@@ -1,3 +1,4 @@
+// 总览页：C 盘用量、其他固定卷、只读环境状态与全盘空间扫描入口。
 import { useEffect, useState } from "react";
 import {
   currentScanProgress,
@@ -9,6 +10,8 @@ import {
   subscribeScan,
   volumeInfo,
 } from "../api";
+import { IconFolder, IconSearch } from "../components/Icons";
+import { AlertBanner, StatusBadge } from "../components/Ui";
 import { formatDuration, formatSize } from "../format";
 import type {
   EnvLocation,
@@ -18,10 +21,6 @@ import type {
   ScanSummary,
   VolumeInfo,
 } from "../types";
-
-const RING_RADIUS = 54;
-const RING_STROKE = 14;
-const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
 
 export function OverviewPage() {
   const [volumes, setVolumes] = useState<VolumeInfo[]>([]);
@@ -69,6 +68,17 @@ export function OverviewPage() {
   const usedBytes = systemVolume ? systemVolume.total - systemVolume.free : 0;
   const usedRatio =
     systemVolume && systemVolume.total > 0 ? usedBytes / systemVolume.total : 0;
+  const usedPercent = Math.round(usedRatio * 100);
+
+  const radius = 58;
+  const circumference = 2 * Math.PI * radius;
+  const strokeDashoffset = circumference * (1 - usedRatio);
+  const ringClass =
+    usedPercent >= 92
+      ? "ring-fill ring-fill-crit"
+      : usedPercent >= 80
+        ? "ring-fill ring-fill-warn"
+        : "ring-fill";
 
   const startScan = (root: string) => {
     setError(null);
@@ -78,201 +88,282 @@ export function OverviewPage() {
   };
 
   return (
-    <section>
-      <h2>总览</h2>
+    <section className="page-section">
+      <div className="page-header">
+        <div>
+          <h2 className="page-title">总览</h2>
+          <p className="page-subtitle">系统盘容量状态、只读环境体检与全盘空间扫描</p>
+        </div>
+      </div>
 
-      <div className="card disk-card">
-        {systemVolume ? (
-          <>
-            <svg
-              className="ring"
-              viewBox="0 0 140 140"
-              width="140"
-              height="140"
-              role="img"
-              aria-label="系统盘使用情况"
-            >
-              <circle
-                cx="70"
-                cy="70"
-                r={RING_RADIUS}
-                fill="none"
-                stroke="#e3e6ea"
-                strokeWidth={RING_STROKE}
-              />
-              <circle
-                cx="70"
-                cy="70"
-                r={RING_RADIUS}
-                fill="none"
-                stroke="#1a56db"
-                strokeWidth={RING_STROKE}
-                strokeLinecap="round"
-                strokeDasharray={`${usedRatio * RING_CIRCUMFERENCE} ${RING_CIRCUMFERENCE}`}
-                transform="rotate(-90 70 70)"
-              />
-              <text x="70" y="68" textAnchor="middle" className="ring-percent">
-                {(usedRatio * 100).toFixed(0)}%
-              </text>
-              <text x="70" y="88" textAnchor="middle" className="ring-label">
-                已用
-              </text>
-            </svg>
+      <div className="overview-hero">
+        <div className="card">
+          <div className="card-header">
+            <h3 className="card-title">系统卷容量</h3>
+            {systemVolume && (
+              <StatusBadge tone={usedPercent >= 90 ? "danger" : usedPercent >= 78 ? "caution" : "safe"}>
+                {usedPercent >= 90 ? "空间紧张" : usedPercent >= 78 ? "建议关注" : "空间充裕"}
+              </StatusBadge>
+            )}
+          </div>
 
-            <div className="disk-detail">
-              <p className="disk-title">
-                {systemVolume.root} {systemVolume.label || "本地磁盘"}
-                {systemVolume.isSystem ? "（系统盘）" : ""} ·{" "}
-                {systemVolume.fs || "未知文件系统"}
-              </p>
-              <p>已用 {formatSize(usedBytes)}</p>
-              <p>剩余 {formatSize(systemVolume.free)}</p>
-              <p>总计 {formatSize(systemVolume.total)}</p>
+          {!systemVolume && <p className="muted">没有读到磁盘信息</p>}
+
+          {systemVolume && (
+            <div className="volume-hero">
+              <div className="ring-wrap">
+                <svg
+                  className="ring-svg"
+                  width="148"
+                  height="148"
+                  viewBox="0 0 148 148"
+                  role="img"
+                  aria-label="系统盘使用情况"
+                >
+                  <circle className="ring-track" cx="74" cy="74" r={radius} />
+                  <circle
+                    className={ringClass}
+                    cx="74"
+                    cy="74"
+                    r={radius}
+                    strokeDasharray={circumference}
+                    strokeDashoffset={strokeDashoffset}
+                  />
+                </svg>
+                <div className="ring-center">
+                  <span className="ring-percent">{usedPercent}%</span>
+                  <span className="ring-caption">已用</span>
+                </div>
+              </div>
+
+              <div className="volume-meta">
+                <p className="volume-title">
+                  {systemVolume.root} {systemVolume.label || "本地磁盘"}
+                  {systemVolume.isSystem ? "（系统盘）" : ""}
+                </p>
+                <p className="volume-free-hero">
+                  剩余 <strong>{formatSize(systemVolume.free)}</strong> /{" "}
+                  <span className="td-num">{formatSize(systemVolume.total)}</span>
+                </p>
+
+                <dl className="stats-grid">
+                  <div className="stat-tile">
+                    <dt>已用</dt>
+                    <dd>{formatSize(usedBytes)}</dd>
+                  </div>
+                  <div className="stat-tile">
+                    <dt>总计</dt>
+                    <dd>{formatSize(systemVolume.total)}</dd>
+                  </div>
+                  <div className="stat-tile">
+                    <dt>文件系统</dt>
+                    <dd>{systemVolume.fs || "未知"}</dd>
+                  </div>
+                </dl>
+              </div>
             </div>
-          </>
-        ) : (
-          <p className="muted">没有读到磁盘信息</p>
-        )}
+          )}
+        </div>
+
+        <div className="card">
+          <div className="card-header">
+            <h3 className="card-title">扫描</h3>
+            <span className="muted">只读统计，不修改文件</span>
+          </div>
+          <p className="card-lead">
+            扫描完成后可在「空间分析」页查看目录树图与最大文件分布。
+          </p>
+
+          <div className="actions">
+            {roots.map((root) => (
+              <button
+                key={root.path}
+                type="button"
+                className="btn btn-primary"
+                disabled={scanning}
+                onClick={() => startScan(root.path)}
+              >
+                <IconSearch width={14} height={14} />
+                <span>扫描{root.label}</span>
+              </button>
+            ))}
+            {scanning && (
+              <button
+                type="button"
+                className="btn btn-subtle"
+                onClick={() => scanCancel().catch((reason) => setError(String(reason)))}
+              >
+                取消扫描
+              </button>
+            )}
+          </div>
+
+          {error && (
+            <div style={{ marginTop: 12 }}>
+              <AlertBanner tone="danger">{error}</AlertBanner>
+            </div>
+          )}
+          {progress?.error && (
+            <div style={{ marginTop: 12 }}>
+              <AlertBanner tone="danger">{progress.error}</AlertBanner>
+            </div>
+          )}
+
+          {scanning && progress && (
+            <div className="scan-live">
+              <div className="scan-pulse-bar" />
+              <dl className="stats-grid">
+                <div className="stat-tile">
+                  <dt>目录数</dt>
+                  <dd>{progress.dirs.toLocaleString()}</dd>
+                </div>
+                <div className="stat-tile">
+                  <dt>文件数</dt>
+                  <dd>{progress.files.toLocaleString()}</dd>
+                </div>
+                <div className="stat-tile">
+                  <dt>已统计大小</dt>
+                  <dd>{formatSize(progress.allocated)}</dd>
+                </div>
+                <div className="stat-tile">
+                  <dt>耗时</dt>
+                  <dd>{formatDuration(progress.elapsedMs)}</dd>
+                </div>
+              </dl>
+            </div>
+          )}
+
+          {summary && !scanning && (
+            <div className="summary-box">
+              <p className="summary-title">
+                {summary.cancelled ? "扫描已取消" : "扫描完成"}：
+                <span className="path-text">{summary.root}</span>
+              </p>
+              <dl className="stats-grid">
+                <div className="stat-tile">
+                  <dt>占盘大小</dt>
+                  <dd>{formatSize(summary.allocated)}</dd>
+                </div>
+                <div className="stat-tile">
+                  <dt>逻辑大小</dt>
+                  <dd>{formatSize(summary.logical)}</dd>
+                </div>
+                <div className="stat-tile">
+                  <dt>文件数</dt>
+                  <dd>{summary.files.toLocaleString()}</dd>
+                </div>
+                <div className="stat-tile">
+                  <dt>目录数</dt>
+                  <dd>{summary.dirs.toLocaleString()}</dd>
+                </div>
+                <div className="stat-tile">
+                  <dt>耗时</dt>
+                  <dd>{formatDuration(summary.elapsedMs)}</dd>
+                </div>
+              </dl>
+              {summary.cancelled && (
+                <div style={{ marginTop: 10 }}>
+                  <AlertBanner tone="warn">扫描中途取消，结果不完整。</AlertBanner>
+                </div>
+              )}
+              {summary.deniedDirs > 0 && (
+                <div style={{ marginTop: 10 }}>
+                  <AlertBanner tone="warn">
+                    {summary.deniedDirs.toLocaleString()} 个目录无权读取（普通权限扫描不完整）
+                  </AlertBanner>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
 
       {otherVolumes.length > 0 && (
         <div className="card">
-          <h3>其他固定盘</h3>
-          {otherVolumes.map((volume) => (
-            <div className="volume-row" key={volume.root}>
-              <span className="volume-name">
-                {volume.root} {volume.label || "本地磁盘"}
-              </span>
-              <div className="bar">
-                <div
-                  className="bar-fill"
-                  style={{
-                    width: `${
-                      volume.total > 0
-                        ? ((volume.total - volume.free) / volume.total) * 100
-                        : 0
-                    }%`,
-                  }}
-                />
-              </div>
-              <span className="volume-size">
-                剩余 {formatSize(volume.free)} / 共 {formatSize(volume.total)}
-              </span>
-            </div>
-          ))}
+          <div className="card-header">
+            <h3 className="card-title">其他固定盘</h3>
+            <span className="muted">可用作隔离区或目录迁移目标盘</span>
+          </div>
+          <div className="volume-list">
+            {otherVolumes.map((volume) => {
+              const used = volume.total - volume.free;
+              const ratio = volume.total > 0 ? (used / volume.total) * 100 : 0;
+
+              return (
+                <div className="volume-item" key={volume.root}>
+                  <div className="volume-item-head">
+                    <span className="volume-item-name">
+                      {volume.root} {volume.label || "本地磁盘"}
+                    </span>
+                    <span className="badge badge-neutral">{volume.fs || "未知"}</span>
+                  </div>
+                  <div className="bar">
+                    <div className="bar-fill" style={{ width: `${ratio.toFixed(1)}%` }} />
+                  </div>
+                  <span className="volume-item-stat">
+                    剩余 {formatSize(volume.free)} / 共 {formatSize(volume.total)}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
 
       {env && (
         <div className="card">
-          <h3>环境状态</h3>
-
-          <div className="env-line">
-            <span className="env-name">休眠</span>
-            <span className="env-path">
-              {env.hibernateEnabled === null ? "未知" : env.hibernateEnabled ? "已开启" : "已关闭"}
-            </span>
+          <div className="card-header">
+            <div className="card-title-group">
+              <IconFolder />
+              <h3 className="card-title">环境状态</h3>
+            </div>
+            <span className="muted">只读展示系统目录与虚拟磁盘当前位置</span>
           </div>
 
-          <p className="env-group">页面文件</p>
-          {locationLines(env.pagefiles, "没有配置页面文件")}
+          <div className="env-grid">
+            <div className="env-panel">
+              <h4 className="env-panel-title">休眠与页面文件</h4>
+              <div className="env-lines">
+                <div className="env-line">
+                  <span className="env-name">休眠</span>
+                  <span className="env-path">
+                    {env.hibernateEnabled === null
+                      ? "未知"
+                      : env.hibernateEnabled
+                        ? "已开启"
+                        : "已关闭"}
+                  </span>
+                </div>
+                {locationLines(env.pagefiles, "没有配置页面文件")}
+              </div>
+            </div>
 
-          <p className="env-group">WSL 发行版</p>
-          {locationLines(env.wslDistros, "没有安装 WSL 发行版")}
+            <div className="env-panel">
+              <h4 className="env-panel-title">用户目录与 OneDrive</h4>
+              <div className="env-lines">
+                {locationLines(env.knownFolders, "未知")}
+                {env.onedrive
+                  ? locationLines([env.onedrive], "")
+                  : emptyLine("没有配置 OneDrive")}
+              </div>
+            </div>
 
-          <p className="env-group">未关联虚拟磁盘</p>
-          {locationLines(env.unregisteredVhdx, "没有未关联的虚拟磁盘")}
+            <div className="env-panel">
+              <h4 className="env-panel-title">WSL 发行版</h4>
+              <div className="env-lines">
+                {locationLines(env.wslDistros, "没有安装 WSL 发行版")}
+              </div>
+            </div>
 
-          <p className="env-group">用户目录</p>
-          {locationLines(env.knownFolders, "未知")}
-
-          <p className="env-group">OneDrive</p>
-          {/* OneDrive 的 null 表示没有配置，不是读取失败。 */}
-          {env.onedrive ? locationLines([env.onedrive], "") : emptyLine("没有配置 OneDrive")}
+            <div className="env-panel">
+              <h4 className="env-panel-title">未关联虚拟磁盘</h4>
+              <div className="env-lines">
+                {locationLines(env.unregisteredVhdx, "没有未关联的虚拟磁盘")}
+              </div>
+            </div>
+          </div>
         </div>
       )}
-
-      <div className="card">
-        <h3>扫描</h3>
-        <div className="actions">
-          {roots.map((root) => (
-            <button
-              key={root.path}
-              type="button"
-              className="button-primary"
-              disabled={scanning}
-              onClick={() => startScan(root.path)}
-            >
-              扫描{root.label}
-            </button>
-          ))}
-          {scanning && (
-            <button type="button" onClick={() => scanCancel().catch((reason) => setError(String(reason)))}>
-              取消扫描
-            </button>
-          )}
-        </div>
-
-        {error && <p className="warn">{error}</p>}
-        {progress?.error && <p className="warn">{progress.error}</p>}
-
-        {scanning && progress && (
-          <dl className="stats">
-            <div>
-              <dt>目录数</dt>
-              <dd>{progress.dirs.toLocaleString()}</dd>
-            </div>
-            <div>
-              <dt>文件数</dt>
-              <dd>{progress.files.toLocaleString()}</dd>
-            </div>
-            <div>
-              <dt>已统计大小</dt>
-              <dd>{formatSize(progress.allocated)}</dd>
-            </div>
-            <div>
-              <dt>耗时</dt>
-              <dd>{formatDuration(progress.elapsedMs)}</dd>
-            </div>
-          </dl>
-        )}
-
-        {summary && !scanning && (
-          <div className="summary">
-            <p className="summary-title">
-              {summary.cancelled ? "扫描已取消" : "扫描完成"}：{summary.root}
-            </p>
-            <dl className="stats">
-              <div>
-                <dt>占盘大小</dt>
-                <dd>{formatSize(summary.allocated)}</dd>
-              </div>
-              <div>
-                <dt>逻辑大小</dt>
-                <dd>{formatSize(summary.logical)}</dd>
-              </div>
-              <div>
-                <dt>文件数</dt>
-                <dd>{summary.files.toLocaleString()}</dd>
-              </div>
-              <div>
-                <dt>目录数</dt>
-                <dd>{summary.dirs.toLocaleString()}</dd>
-              </div>
-              <div>
-                <dt>耗时</dt>
-                <dd>{formatDuration(summary.elapsedMs)}</dd>
-              </div>
-            </dl>
-            {summary.cancelled && <p className="warn">扫描中途取消，结果不完整。</p>}
-            {summary.deniedDirs > 0 && (
-              <p className="warn">
-                {summary.deniedDirs.toLocaleString()} 个目录无权读取（普通权限扫描不完整）
-              </p>
-            )}
-          </div>
-        )}
-      </div>
     </section>
   );
 }
@@ -294,11 +385,19 @@ function locationLines(locations: EnvLocation[] | null, emptyText: string) {
         {location.path ?? "未知"}
       </span>
       {location.sizeBytes !== null && (
-        <span className="muted">{formatSize(location.sizeBytes)}</span>
+        <span className="muted td-num">{formatSize(location.sizeBytes)}</span>
       )}
-      <span className={location.onSystemDrive === true ? "env-drive env-drive-c" : "env-drive"}>
+      <StatusBadge
+        tone={
+          location.onSystemDrive === true
+            ? "caution"
+            : location.onSystemDrive === false
+              ? "safe"
+              : "neutral"
+        }
+      >
         {driveLabel(location.onSystemDrive)}
-      </span>
+      </StatusBadge>
     </div>
   ));
 }

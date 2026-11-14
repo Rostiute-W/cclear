@@ -10,6 +10,8 @@ import type {
   PlanSummary,
   Recovery,
 } from "../types";
+import { IconWarning } from "./Icons";
+import { AlertBanner, StatusBadge, type SemanticTone } from "./Ui";
 
 // 清单可能有几十万条，一次全取会把 IPC 撑爆，所以按页取。
 const PAGE_SIZE = 200;
@@ -21,6 +23,14 @@ const RECOVERY_LABELS: Record<Recovery, string> = {
   quarantine: "隔离（可还原）",
   irreversibleCommand: "不可撤销命令",
   none: "仅展示",
+};
+
+const RECOVERY_TONES: Record<Recovery, SemanticTone> = {
+  regenerable: "safe",
+  quarantine: "quarantine",
+  irreversibleFile: "danger",
+  irreversibleCommand: "danger",
+  none: "neutral",
 };
 
 interface PlanPreviewProps {
@@ -128,161 +138,184 @@ export function PlanPreview({
   const skippedShown = report ? report.skipped.length : 0;
 
   return (
-    <div className="card">
-      <h3>清理预览</h3>
+    <div className={hasIrreversible ? "card card-tier-forbidden" : "card card-tier-safe"}>
+      <div className="card-header">
+        <div className="card-title-group">
+          <h3 className="card-title">清理预览</h3>
+          {hasIrreversible && (
+            <StatusBadge tone="danger" icon={<IconWarning width={12} height={12} />}>
+              包含不可恢复删除项
+            </StatusBadge>
+          )}
+        </div>
+        <span className="muted">清单已冻结，点击规则名称可分页查看具体条目</span>
+      </div>
 
-      <table className="table">
-        <thead>
-          <tr>
-            <th>名称</th>
-            <th>恢复方式</th>
-            <th>文件数</th>
-            <th>占盘大小</th>
-            <th>逻辑大小</th>
-            <th>构建时跳过</th>
-          </tr>
-        </thead>
-        <tbody>
-          {summary.rules.map((rule) => (
-            <Fragment key={rule.ruleId}>
-              <tr>
-                <td>
-                  <button
-                    type="button"
-                    className="link"
-                    onClick={() => toggleItems(rule.ruleId)}
-                  >
-                    {nameOf(rule.ruleId)}
-                  </button>
-                </td>
-                <td>{RECOVERY_LABELS[rule.recovery]}</td>
-                <td>{rule.files.toLocaleString()}</td>
-                <td>{formatSize(rule.allocated)}</td>
-                <td>{formatSize(rule.logical)}</td>
-                <td>{skippedCell(rule, openSkips, setOpenSkips)}</td>
-              </tr>
-
-              {openSkips === rule.ruleId && (
-                <tr className="sub-row">
-                  <td colSpan={6}>
-                    <ul className="sample-list">
-                      {rule.skippedDetails.map((skipped) => (
-                        <li key={`${skipped.path}-${skipped.reason}`}>
-                          <span className="path-text" title={skipped.path}>
-                            {skipped.path}
-                          </span>
-                          <span className="muted">{skipped.reason}</span>
-                        </li>
-                      ))}
-                    </ul>
+      <div className="table-wrap">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>恢复方式</th>
+              <th>文件数</th>
+              <th>占盘大小</th>
+              <th>逻辑大小</th>
+              <th>构建时跳过</th>
+            </tr>
+          </thead>
+          <tbody>
+            {summary.rules.map((rule) => (
+              <Fragment key={rule.ruleId}>
+                <tr>
+                  <td>
+                    <button
+                      type="button"
+                      className="btn-link"
+                      onClick={() => toggleItems(rule.ruleId)}
+                    >
+                      {nameOf(rule.ruleId)}
+                    </button>
                   </td>
-                </tr>
-              )}
-
-              {openRule === rule.ruleId && (
-                <tr className="sub-row">
-                  <td colSpan={6}>
-                    {itemsLoading ? (
-                      <p className="muted">正在读取条目…</p>
-                    ) : (
-                      <>
-                        <table className="table">
-                          <thead>
-                            <tr>
-                              <th>路径</th>
-                              <th>类型</th>
-                              <th>占盘大小</th>
-                              <th>修改时间</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {items.length === 0 && (
-                              <tr>
-                                <td colSpan={4} className="muted">
-                                  这条规则没有清单条目
-                                </td>
-                              </tr>
-                            )}
-                            {items.map((item) => (
-                              <tr key={item.itemId}>
-                                <td className="path-cell" title={item.path}>
-                                  {item.path}
-                                </td>
-                                <td>{item.isDir ? "目录" : "文件"}</td>
-                                <td>{formatSize(item.allocated)}</td>
-                                <td>{formatTime(item.lastWrite)}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                        <div className="pager">
-                          <button
-                            type="button"
-                            disabled={page === 0}
-                            onClick={() => setPage(page - 1)}
-                          >
-                            上一页
-                          </button>
-                          <span className="muted">
-                            共 {rule.items.toLocaleString()} 条，第 {page + 1} /{" "}
-                            {pageCount(rule)} 页
-                          </span>
-                          <button
-                            type="button"
-                            disabled={page + 1 >= pageCount(rule)}
-                            onClick={() => setPage(page + 1)}
-                          >
-                            下一页
-                          </button>
-                        </div>
-                      </>
-                    )}
+                  <td>
+                    <StatusBadge tone={RECOVERY_TONES[rule.recovery]}>
+                      {RECOVERY_LABELS[rule.recovery]}
+                    </StatusBadge>
                   </td>
+                  <td className="td-num">{rule.files.toLocaleString()}</td>
+                  <td className="td-num">{formatSize(rule.allocated)}</td>
+                  <td className="td-num">{formatSize(rule.logical)}</td>
+                  <td>{skippedCell(rule, openSkips, setOpenSkips)}</td>
                 </tr>
-              )}
-            </Fragment>
-          ))}
-        </tbody>
-      </table>
 
-      <dl className="stats">
-        <div>
+                {openSkips === rule.ruleId && (
+                  <tr className="sub-row">
+                    <td colSpan={6}>
+                      <ul className="sample-list">
+                        {rule.skippedDetails.map((skipped) => (
+                          <li key={`${skipped.path}-${skipped.reason}`}>
+                            <span className="path-text" title={skipped.path}>
+                              {skipped.path}
+                            </span>
+                            <span className="muted">{skipped.reason}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </td>
+                  </tr>
+                )}
+
+                {openRule === rule.ruleId && (
+                  <tr className="sub-row">
+                    <td colSpan={6}>
+                      {itemsLoading ? (
+                        <p className="muted">正在读取条目…</p>
+                      ) : (
+                        <>
+                          <div className="table-wrap">
+                            <table className="table">
+                              <thead>
+                                <tr>
+                                  <th>路径</th>
+                                  <th>类型</th>
+                                  <th>占盘大小</th>
+                                  <th>修改时间</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {items.length === 0 && (
+                                  <tr>
+                                    <td colSpan={4} className="muted">
+                                      这条规则没有清单条目
+                                    </td>
+                                  </tr>
+                                )}
+                                {items.map((item) => (
+                                  <tr key={item.itemId}>
+                                    <td className="path-cell" title={item.path}>
+                                      {item.path}
+                                    </td>
+                                    <td className="td-nowrap">{item.isDir ? "目录" : "文件"}</td>
+                                    <td className="td-num">{formatSize(item.allocated)}</td>
+                                    <td className="td-num">{formatTime(item.lastWrite)}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                          <div className="pager">
+                            <button
+                              type="button"
+                              className="btn btn-subtle"
+                              disabled={page === 0}
+                              onClick={() => setPage(page - 1)}
+                            >
+                              上一页
+                            </button>
+                            <span className="muted td-num">
+                              共 {rule.items.toLocaleString()} 条，第 {page + 1} /{" "}
+                              {pageCount(rule)} 页
+                            </span>
+                            <button
+                              type="button"
+                              className="btn btn-subtle"
+                              disabled={page + 1 >= pageCount(rule)}
+                              onClick={() => setPage(page + 1)}
+                            >
+                              下一页
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <dl className="stats-grid" style={{ marginTop: 14 }}>
+        <div className="stat-tile">
           <dt>逻辑大小</dt>
           <dd>{formatSize(totalLogical)}</dd>
         </div>
-        <div>
+        <div className="stat-tile">
           <dt>占盘大小</dt>
           <dd>{formatSize(totalAllocated)}</dd>
         </div>
-        <div>
+        <div className="stat-tile">
           <dt>预计可回收</dt>
           <dd>{formatSize(totalAllocated)}</dd>
         </div>
         {report && (
-          <div>
+          <div className="stat-tile">
             <dt>执行后空闲变化</dt>
             <dd>{signedSize(report.freeAfter - report.freeBefore)}</dd>
           </div>
         )}
       </dl>
-      <p className="muted">硬链接或被占用的文件可能不会释放空间。</p>
+      <p className="muted" style={{ marginTop: 8, marginBottom: 0 }}>
+        硬链接或被占用的文件可能不会释放空间。
+      </p>
 
       {hasIrreversible && !report && (
-        <label className="checkbox-line">
+        <label className="confirm-box">
           <input
             type="checkbox"
+            className="checkbox-input"
             checked={acknowledged}
             onChange={(event) => setAcknowledged(event.target.checked)}
           />
-          我了解这些文件将被永久删除
+          <span>我了解这些文件将被永久删除</span>
         </label>
       )}
 
-      <div className="actions">
+      <div className="actions" style={{ marginTop: 14 }}>
         {!report && (
           <button
             type="button"
-            className="button-primary"
+            className={hasIrreversible ? "btn btn-danger-solid" : "btn btn-primary"}
             disabled={!canExecute}
             onClick={execute}
           >
@@ -290,19 +323,23 @@ export function PlanPreview({
           </button>
         )}
         {running && (
-          <button type="button" onClick={cancel}>
+          <button type="button" className="btn btn-subtle" onClick={cancel}>
             取消
           </button>
         )}
       </div>
 
-      {error && <p className="warn">{error}</p>}
+      {error && (
+        <div style={{ marginTop: 12 }}>
+          <AlertBanner tone="danger">{error}</AlertBanner>
+        </div>
+      )}
 
       {Object.keys(progress).length > 0 && !report && (
-        <div className="summary">
+        <div className="summary-box">
           <p className="summary-title">执行进度</p>
           {Object.values(progress).map((entry) => (
-            <p key={entry.ruleId} className="muted">
+            <p key={entry.ruleId} className="muted td-num" style={{ margin: "4px 0 0" }}>
               {nameOf(entry.ruleId)}：已删除 {entry.deletedFiles.toLocaleString()} 个文件（
               {formatSize(entry.freedAllocated)}），跳过 {entry.skipped.toLocaleString()} 个
               {entry.done ? "，已完成" : "，进行中"}
@@ -312,53 +349,57 @@ export function PlanPreview({
       )}
 
       {report && (
-        <div className="summary">
+        <div className="summary-box">
           <p className="summary-title">执行结果</p>
-          {report.aborted && <p className="warn">中止原因：{report.aborted}</p>}
-          {report.cancelled && <p className="warn">这次清理被取消，已删除的文件不可恢复。</p>}
-          <p className="muted">
+          {report.aborted && <AlertBanner tone="danger">中止原因：{report.aborted}</AlertBanner>}
+          {report.cancelled && (
+            <AlertBanner tone="warn">这次清理被取消，已删除的文件不可恢复。</AlertBanner>
+          )}
+          <p className="muted td-num" style={{ margin: "6px 0 10px" }}>
             执行前剩余 {formatSize(report.freeBefore)}，执行后剩余{" "}
             {formatSize(report.freeAfter)}。
           </p>
           {hasQuarantine && (
-            <p className="muted">
+            <AlertBanner tone="info">
               移入隔离区的条目可以在「隔离区」页查看、还原或彻底删除。
-            </p>
+            </AlertBanner>
           )}
 
-          <table className="table">
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>删除文件</th>
-                <th>删除目录</th>
-                <th>释放空间</th>
-                <th>跳过</th>
-              </tr>
-            </thead>
-            <tbody>
-              {report.rules.length === 0 && (
+          <div className="table-wrap" style={{ marginTop: 10 }}>
+            <table className="table">
+              <thead>
                 <tr>
-                  <td colSpan={5} className="muted">
-                    没有删除任何条目
-                  </td>
+                  <th>名称</th>
+                  <th>删除文件</th>
+                  <th>删除目录</th>
+                  <th>释放空间</th>
+                  <th>跳过</th>
                 </tr>
-              )}
-              {report.rules.map((rule) => (
-                <tr key={rule.ruleId}>
-                  <td>{nameOf(rule.ruleId)}</td>
-                  <td>{rule.deletedFiles.toLocaleString()}</td>
-                  <td>{rule.deletedDirs.toLocaleString()}</td>
-                  <td>{formatSize(rule.freedAllocated)}</td>
-                  <td>{rule.skipped.toLocaleString()}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {report.rules.length === 0 && (
+                  <tr>
+                    <td colSpan={5} className="muted">
+                      没有删除任何条目
+                    </td>
+                  </tr>
+                )}
+                {report.rules.map((rule) => (
+                  <tr key={rule.ruleId}>
+                    <td>{nameOf(rule.ruleId)}</td>
+                    <td className="td-num">{rule.deletedFiles.toLocaleString()}</td>
+                    <td className="td-num">{rule.deletedDirs.toLocaleString()}</td>
+                    <td className="td-num">{formatSize(rule.freedAllocated)}</td>
+                    <td className="td-num">{rule.skipped.toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
           {report.skipped.length > 0 && (
             <>
-              <p className="muted">
+              <p className="muted" style={{ marginTop: 10, marginBottom: 4 }}>
                 跳过原因（显示 {skippedShown} 条，共 {report.skippedTotal.toLocaleString()} 条）：
               </p>
               <ul className="sample-list">
@@ -392,7 +433,7 @@ function skippedCell(
   return (
     <button
       type="button"
-      className="link"
+      className="btn-link"
       onClick={() => setOpenSkips(openSkips === rule.ruleId ? null : rule.ruleId)}
     >
       {openSkips === rule.ruleId ? "收起" : `跳过 ${rule.skippedAtBuild} 项`}

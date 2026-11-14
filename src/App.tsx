@@ -1,70 +1,43 @@
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import { appInfo, quarantineOverdue } from "./api";
+import {
+  BrandMark,
+  IconClean,
+  IconHistory,
+  IconMigrate,
+  IconOverview,
+  IconQuarantine,
+  IconSpace,
+} from "./components/Icons";
+import { AlertBanner, StatusBadge } from "./components/Ui";
 import { formatSize } from "./format";
-import type { AppInfo, QuarantineBatch } from "./types";
 import { CleanPage } from "./pages/Clean";
 import { HistoryPage } from "./pages/History";
 import { MigratePage } from "./pages/Migrate";
 import { OverviewPage } from "./pages/Overview";
 import { QuarantinePage } from "./pages/Quarantine";
 import { SpacePage } from "./pages/Space";
+import type { AppInfo, QuarantineBatch } from "./types";
 
-const NAV = [
-  { id: "overview", label: "总览" },
-  { id: "clean", label: "清理" },
-  { id: "space", label: "空间分析" },
-  { id: "quarantine", label: "隔离区" },
-  { id: "migrate", label: "迁移" },
-  { id: "history", label: "历史" },
-] as const;
+type PageId = "overview" | "clean" | "space" | "quarantine" | "migrate" | "history";
 
-type PageId = (typeof NAV)[number]["id"];
+const NAV: { id: PageId; label: string; icon: ReactNode }[] = [
+  { id: "overview", label: "总览", icon: <IconOverview /> },
+  { id: "clean", label: "清理", icon: <IconClean /> },
+  { id: "space", label: "空间分析", icon: <IconSpace /> },
+  { id: "quarantine", label: "隔离区", icon: <IconQuarantine /> },
+  { id: "migrate", label: "迁移", icon: <IconMigrate /> },
+  { id: "history", label: "历史", icon: <IconHistory /> },
+];
 
-function renderPage(
-  page: PageId,
-  onQuarantineChanged: () => void,
-  migrateSource: { sourceId: number | null; go: (nodeId: number) => void; done: () => void },
-) {
-  switch (page) {
-    case "overview":
-      return <OverviewPage />;
-    case "clean":
-      return <CleanPage />;
-    case "space":
-      return <SpacePage onMigrate={migrateSource.go} />;
-    case "quarantine":
-      // 隔离区里处理过批次之后，顶部的超期横幅要跟着刷新。
-      return <QuarantinePage onChanged={onQuarantineChanged} />;
-    case "migrate":
-      // 空间分析页点“迁移到其他盘…”时把节点 ID 带过来，只传 ID，路径由后端解析。
-      return (
-        <MigratePage
-          initialSourceId={migrateSource.sourceId}
-          onSourceHandled={migrateSource.done}
-        />
-      );
-    case "history":
-      return <HistoryPage />;
-  }
-}
-
-function App() {
+export default function App() {
   const [page, setPage] = useState<PageId>("overview");
-  const [info, setInfo] = useState<AppInfo | null>(null);
+  const [app, setApp] = useState<AppInfo | null>(null);
   const [overdue, setOverdue] = useState<QuarantineBatch[]>([]);
-  // 从空间分析页带过来的待迁移目录。
-  const [migrateSourceId, setMigrateSourceId] = useState<number | null>(null);
+  // 从空间分析页点“迁移到其他盘…”时，把选中目录的节点 ID 传给迁移页。
+  const [migrateSource, setMigrateSource] = useState<number | null>(null);
 
-  const migrateSource = {
-    sourceId: migrateSourceId,
-    go: (nodeId: number) => {
-      setMigrateSourceId(nodeId);
-      setPage("migrate");
-    },
-    done: () => setMigrateSourceId(null),
-  };
-
-  // 放太久的批次只提示，不自动删除：删不删由用户决定。
   const refreshOverdue = () => {
     quarantineOverdue()
       .then(setOverdue)
@@ -72,54 +45,99 @@ function App() {
   };
 
   useEffect(() => {
-    // 权限徽标只用于展示，取不到时保持“普通权限”。
     appInfo()
-      .then(setInfo)
-      .catch(() => setInfo(null));
-
+      .then(setApp)
+      .catch(() => setApp(null));
     refreshOverdue();
   }, []);
 
+  const openMigrateForNode = (nodeId: number) => {
+    setMigrateSource(nodeId);
+    setPage("migrate");
+  };
+
   return (
-    <div className="app">
-      <header className="topbar">
-        <span className="brand">CClear</span>
-        <span className="version">版本 {info?.version ?? "—"}</span>
-        <span className={info?.isAdmin ? "badge badge-admin" : "badge"}>
-          {info?.isAdmin ? "管理员" : "普通权限"}
-        </span>
-      </header>
-
-      {overdue.length > 0 && (
-        <div className="banner">
-          <span>
-            隔离区有 {overdue.length} 个批次存放超过 7 天，共{" "}
-            {formatSize(overdue.reduce((total, batch) => total + batch.size, 0))}，需要你手动处理。
-          </span>
-          <button type="button" className="link" onClick={() => setPage("quarantine")}>
-            去处理
-          </button>
+    <div className="app-shell">
+      <aside className="sidebar" aria-label="主导航">
+        <div className="sidebar-brand">
+          <BrandMark className="sidebar-brand-icon" />
+          <div className="sidebar-brand-text">
+            <span className="brand-name">CClear</span>
+            <span className="brand-sub">C 盘安全清理与迁移</span>
+          </div>
         </div>
-      )}
 
-      <div className="layout">
-        <nav className="sidebar">
+        <nav className="nav-list" aria-label="功能分区">
           {NAV.map((item) => (
             <button
               key={item.id}
               type="button"
-              className={item.id === page ? "nav-item nav-item-active" : "nav-item"}
+              className={page === item.id ? "nav-item nav-item-active" : "nav-item"}
+              aria-current={page === item.id ? "page" : undefined}
               onClick={() => setPage(item.id)}
             >
-              {item.label}
+              <span className="nav-icon">{item.icon}</span>
+              <span className="nav-label">{item.label}</span>
+              {item.id === "quarantine" && overdue.length > 0 && (
+                <span className="nav-pill" title={`有 ${overdue.length} 个超期批次`}>
+                  {overdue.length}
+                </span>
+              )}
             </button>
           ))}
         </nav>
 
-        <main className="content">{renderPage(page, refreshOverdue, migrateSource)}</main>
+        {app && (
+          <div className="sidebar-footer">
+            <div className="sidebar-meta-row">
+              <span>版本</span>
+              <span className="td-num">v{app.version}</span>
+            </div>
+            <div className="sidebar-meta-row">
+              <span>权限</span>
+              <StatusBadge tone={app.isAdmin ? "caution" : "neutral"}>
+                {app.isAdmin ? "管理员" : "普通权限"}
+              </StatusBadge>
+            </div>
+          </div>
+        )}
+      </aside>
+
+      <div className="main-stage">
+        <main className="content">
+          {overdue.length > 0 && page !== "quarantine" && (
+            <AlertBanner
+              tone="warn"
+              actions={
+                <button
+                  type="button"
+                  className="btn btn-subtle"
+                  onClick={() => setPage("quarantine")}
+                >
+                  去隔离区处理
+                </button>
+              }
+            >
+              <span>
+                隔离区有 {overdue.length} 个批次存放超过 7 天，共{" "}
+                {formatSize(overdue.reduce((total, batch) => total + batch.size, 0))}，需要你手动处理。
+              </span>
+            </AlertBanner>
+          )}
+
+          {page === "overview" && <OverviewPage />}
+          {page === "clean" && <CleanPage />}
+          {page === "space" && <SpacePage onMigrate={openMigrateForNode} />}
+          {page === "quarantine" && <QuarantinePage onChanged={refreshOverdue} />}
+          {page === "migrate" && (
+            <MigratePage
+              initialSourceId={migrateSource}
+              onSourceHandled={() => setMigrateSource(null)}
+            />
+          )}
+          {page === "history" && <HistoryPage />}
+        </main>
       </div>
     </div>
   );
 }
-
-export default App;

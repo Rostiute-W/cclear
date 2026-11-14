@@ -8,11 +8,27 @@ import {
   quarantineSetVolume,
   quarantineVolumes,
 } from "../api";
+import { IconQuarantine } from "../components/Icons";
+import { AdminTag, AlertBanner, EmptyState, StatusBadge, type SemanticTone } from "../components/Ui";
 import { formatSize, formatTime } from "../format";
-import type { QuarantineBatch, QuarantineVolumes } from "../types";
+import type { QuarantineBatch, QuarantineStage, QuarantineVolumes } from "../types";
 
 // 超过这个天数的批次在页面上单独提醒。
 const OVERDUE_DAYS = 7;
+
+const STAGE_TONES: Record<QuarantineStage, SemanticTone> = {
+  planned: "neutral",
+  copying: "info",
+  copiedVerified: "info",
+  deletingSource: "caution",
+  committed: "safe",
+  restoring: "info",
+  restored: "safe",
+  purging: "danger",
+  purged: "neutral",
+  aborted: "neutral",
+  needsAttention: "caution",
+};
 
 export function QuarantinePage({ onChanged }: { onChanged: () => void }) {
   const [volumes, setVolumes] = useState<QuarantineVolumes | null>(null);
@@ -101,21 +117,35 @@ export function QuarantinePage({ onChanged }: { onChanged: () => void }) {
   };
 
   return (
-    <section>
-      <h2>隔离区</h2>
+    <section className="page-section">
+      <div className="page-header">
+        <div>
+          <h2 className="page-title">隔离区</h2>
+          <p className="page-subtitle">残留清理的条目先存于非系统盘隔离区，可按批次还原或彻底清除</p>
+        </div>
+      </div>
 
-      {error && <p className="warn">{error}</p>}
-      {message && <p className="muted">{message}</p>}
+      {error && <AlertBanner tone="danger">{error}</AlertBanner>}
+      {message && <AlertBanner tone="success">{message}</AlertBanner>}
 
       <div className="card">
-        <h3>保存位置</h3>
+        <div className="card-header">
+          <h3 className="card-title">保存位置</h3>
+          {volumes?.currentRoot && (
+            <StatusBadge tone="safe">
+              当前隔离区：{volumes.currentRoot}（剩余 {formatSize(volumes.currentFree)}）
+            </StatusBadge>
+          )}
+        </div>
+
         {!volumes && <p className="muted">正在读取可用卷…</p>}
 
         {volumes && (
           <>
-            <div className="volume-row">
-              <span className="volume-name">隔离区卷</span>
+            <div className="field-row">
+              <span className="field-label">隔离区卷</span>
               <select
+                className="select-input"
                 value={currentVolume(volumes)}
                 disabled={busy || volumes.candidates.length === 0}
                 onChange={(event) => onSelectVolume(event.target.value)}
@@ -129,102 +159,133 @@ export function QuarantinePage({ onChanged }: { onChanged: () => void }) {
             </div>
 
             {volumes.candidates.length === 0 && (
-              <p className="warn">
-                没有可用的卷：隔离区不能用系统盘，需要一块格式化为 NTFS 的本地固定盘。
-              </p>
+              <div style={{ marginTop: 12 }}>
+                <AlertBanner tone="warn">
+                  没有可用的卷：隔离区不能用系统盘，需要一块格式化为 NTFS 的本地固定盘。
+                </AlertBanner>
+              </div>
             )}
 
             {volumes.currentRoot ? (
-              <p className="muted">
+              <p className="muted" style={{ marginTop: 10, marginBottom: 0 }}>
                 当前隔离区：{volumes.currentRoot}（剩余 {formatSize(volumes.currentFree)}）
               </p>
             ) : (
-              <p className="warn">还没有设置隔离区位置，隔离类清理会被跳过。</p>
+              <div style={{ marginTop: 12 }}>
+                <AlertBanner tone="warn">还没有设置隔离区位置，隔离类清理会被跳过。</AlertBanner>
+              </div>
             )}
           </>
         )}
       </div>
 
       <div className="card">
-        <h3>批次</h3>
+        <div className="card-header">
+          <h3 className="card-title">批次</h3>
+          <span className="muted td-num">共 {batches.length} 个批次</span>
+        </div>
 
         {batches.length === 0 ? (
-          <p className="muted">隔离区里还没有批次。</p>
+          <EmptyState
+            icon={<IconQuarantine />}
+            title="隔离区里还没有批次"
+            description="在「清理」页将残留项移入隔离区后，可在这里按批次还原或彻底删除。"
+          />
         ) : (
           <>
             {batches.some((batch) => batch.ageDays > OVERDUE_DAYS) && (
-              <p className="warn">
-                有批次存放超过 {OVERDUE_DAYS} 天，需要你决定还原还是彻底删除。
-              </p>
+              <div style={{ marginBottom: 12 }}>
+                <AlertBanner tone="warn">
+                  有批次存放超过 {OVERDUE_DAYS} 天，需要你决定还原还是彻底删除。
+                </AlertBanner>
+              </div>
             )}
 
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>时间</th>
-                  <th>来源规则</th>
-                  <th>条目</th>
-                  <th>大小</th>
-                  <th>状态</th>
-                  <th>存放天数</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {batches.map((batch) => (
-                  <tr key={batch.batchId}>
-                    <td>{formatTime(batch.createdAt)}</td>
-                    <td>{batch.ruleName}</td>
-                    <td>{batch.items.toLocaleString()}</td>
-                    <td>{formatSize(batch.size)}</td>
-                    <td>
-                      <span className="status-badge">{batch.stageLabel}</span>
-                      {batch.requiresAdmin && (
-                        <span className="status-badge">需要管理员</span>
-                      )}
-                      {batch.note && <div className="muted">{batch.note}</div>}
-                    </td>
-                    <td>{batch.ageDays}</td>
-                    <td>
-                      <div className="actions">
-                        <button
-                          type="button"
-                          disabled={busy || !canRestore(batch)}
-                          onClick={() => onRestore(batch)}
-                        >
-                          还原
-                        </button>
-                        <button
-                          type="button"
-                          disabled={busy || !canPurge(batch)}
-                          onClick={() => onPurge(batch)}
-                        >
-                          彻底删除
-                        </button>
-                        {batch.stage === "needsAttention" && (
-                          <>
-                            <button
-                              type="button"
-                              disabled={busy}
-                              onClick={() => onResolve(batch, "continue")}
-                            >
-                              处理异常：继续
-                            </button>
-                            <button
-                              type="button"
-                              disabled={busy}
-                              onClick={() => onResolve(batch, "abandon")}
-                            >
-                              处理异常：放弃
-                            </button>
-                          </>
-                        )}
-                      </div>
-                    </td>
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>来源规则</th>
+                    <th>条目</th>
+                    <th>大小</th>
+                    <th>状态</th>
+                    <th>存放天数</th>
+                    <th>操作</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {batches.map((batch) => (
+                    <tr key={batch.batchId}>
+                      <td className="td-num">{formatTime(batch.createdAt)}</td>
+                      <td>{batch.ruleName}</td>
+                      <td className="td-num">{batch.items.toLocaleString()}</td>
+                      <td className="td-num">{formatSize(batch.size)}</td>
+                      <td>
+                        <div className="actions">
+                          <StatusBadge tone={STAGE_TONES[batch.stage]}>
+                            {batch.stageLabel}
+                          </StatusBadge>
+                          {batch.requiresAdmin && <AdminTag />}
+                        </div>
+                        {batch.note && (
+                          <div className="muted" style={{ marginTop: 4 }}>
+                            {batch.note}
+                          </div>
+                        )}
+                      </td>
+                      <td className="td-num">
+                        {batch.ageDays > OVERDUE_DAYS ? (
+                          <StatusBadge tone="caution">{batch.ageDays} 天</StatusBadge>
+                        ) : (
+                          batch.ageDays
+                        )}
+                      </td>
+                      <td>
+                        <div className="actions">
+                          <button
+                            type="button"
+                            className="btn btn-primary"
+                            disabled={busy || !canRestore(batch)}
+                            onClick={() => onRestore(batch)}
+                          >
+                            还原
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-danger-outline"
+                            disabled={busy || !canPurge(batch)}
+                            onClick={() => onPurge(batch)}
+                          >
+                            彻底删除
+                          </button>
+                          {batch.stage === "needsAttention" && (
+                            <>
+                              <button
+                                type="button"
+                                className="btn btn-subtle"
+                                disabled={busy}
+                                onClick={() => onResolve(batch, "continue")}
+                              >
+                                处理异常：继续
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-subtle"
+                                disabled={busy}
+                                onClick={() => onResolve(batch, "abandon")}
+                              >
+                                处理异常：放弃
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </>
         )}
       </div>

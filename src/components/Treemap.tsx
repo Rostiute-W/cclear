@@ -10,16 +10,16 @@ const MAX_CELLS = 60;
 const MIN_HEIGHT = 320;
 const MAX_HEIGHT = 560;
 
-// 相邻格子的底色，按顺序取，保证相邻区域颜色不同。
+// 颜色读自 CSS 主题变量，亮色与深色模式下都能保持文字对比度。
 const FILLS = [
-  "#cfe0fb",
-  "#d8ece0",
-  "#fbe3c4",
-  "#e5dcf7",
-  "#fbd9d5",
-  "#d3ecf4",
-  "#eaeecb",
-  "#f3dcec",
+  "var(--tree-0)",
+  "var(--tree-1)",
+  "var(--tree-2)",
+  "var(--tree-3)",
+  "var(--tree-4)",
+  "var(--tree-5)",
+  "var(--tree-6)",
+  "var(--tree-7)",
 ];
 
 interface TreemapProps {
@@ -90,16 +90,16 @@ export function Treemap({ nodes, onEnter }: TreemapProps) {
                   y={rect.y0}
                   width={cellWidth}
                   height={cellHeight}
-                  rx={3}
+                  rx={4}
                   fill={FILLS[index % FILLS.length]}
                 />
                 <title>{`${rect.cell.name}\n${formatSize(rect.cell.value)}`}</title>
                 {cellWidth > 64 && cellHeight > 34 && (
                   <>
-                    <text x={rect.x0 + 6} y={rect.y0 + 17} className="treemap-label">
+                    <text x={rect.x0 + 7} y={rect.y0 + 18} className="treemap-label">
                       {shorten(rect.cell.name, cellWidth)}
                     </text>
-                    <text x={rect.x0 + 6} y={rect.y0 + 31} className="treemap-size">
+                    <text x={rect.x0 + 7} y={rect.y0 + 33} className="treemap-size">
                       {formatSize(rect.cell.value)}
                     </text>
                   </>
@@ -149,7 +149,7 @@ function layout(nodes: DirNode[], width: number, height: number): Rect[] {
   const laid = treemap<CellDatum>()
     .tile(treemapSquarify)
     .size([width, height])
-    .paddingInner(2)
+    .paddingInner(3)
     .paddingOuter(2)(root);
   // 所有格子都在第一层，treemap 会为每个子节点填上矩形坐标。
   const cells = (laid.children ?? []) as HierarchyRectangularNode<CellDatum>[];
@@ -165,7 +165,7 @@ function layout(nodes: DirNode[], width: number, height: number): Rect[] {
 
 // SVG 里没法自动省略，按可用宽度粗略截断字符。
 function shorten(name: string, cellWidth: number): string {
-  const maxChars = Math.floor((cellWidth - 12) / 8);
+  const maxChars = Math.floor((cellWidth - 14) / 8);
   if (name.length <= maxChars) {
     return name;
   }
