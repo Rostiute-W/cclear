@@ -102,6 +102,19 @@ pub enum Record {
         /// 这一步做了什么，或者为什么失败。
         detail: String,
     },
+    /// 目录迁移（junction）的状态变化。
+    JunctionStage {
+        /// Unix 秒，方便按时间排序和显示。
+        at: i64,
+        /// 迁移记录 ID。
+        id: String,
+        /// 源目录路径。
+        source: String,
+        /// 迁移阶段的中文名，界面直接显示。
+        stage: String,
+        /// 这一步做了什么，或者为什么停下。
+        detail: String,
+    },
 }
 
 /// 日志出口。执行器只认这个接口，日志写失败就立刻中止。
@@ -410,7 +423,8 @@ fn apply(
         Record::SpecialAction { .. }
         | Record::CommandRun { .. }
         | Record::QuarantineStage { .. }
-        | Record::MigrationStage { .. } => {}
+        | Record::MigrationStage { .. }
+        | Record::JunctionStage { .. } => {}
     }
 }
 
@@ -425,7 +439,8 @@ fn record_plan_id(record: &Record) -> Option<Uuid> {
         Record::SpecialAction { .. }
         | Record::CommandRun { .. }
         | Record::QuarantineStage { .. }
-        | Record::MigrationStage { .. } => None,
+        | Record::MigrationStage { .. }
+        | Record::JunctionStage { .. } => None,
     }
 }
 
@@ -500,7 +515,8 @@ fn apply_detail(detail: &mut PlanDetail, record: Record) {
         Record::SpecialAction { .. }
         | Record::CommandRun { .. }
         | Record::QuarantineStage { .. }
-        | Record::MigrationStage { .. } => {}
+        | Record::MigrationStage { .. }
+        | Record::JunctionStage { .. } => {}
     }
 }
 

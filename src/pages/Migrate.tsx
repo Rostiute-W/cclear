@@ -1,6 +1,14 @@
-// 迁移页：把开发工具的缓存目录按官方方式改到其他盘，并按冻结清单清理旧目录。
+// 迁移页：把开发工具的缓存目录按官方方式改到其他盘，并按冻结清单清理旧目录；
+// 也负责纯数据目录的 junction 迁移与迁回。
 import { useEffect, useState } from "react";
 import {
+  junctionCheck,
+  junctionContinue,
+  junctionDeleteBackup,
+  junctionDiscardTarget,
+  junctionReturn,
+  junctionStart,
+  junctionState,
   migrationCleanupOld,
   migrationInspect,
   migrationRevert,
@@ -9,7 +17,16 @@ import {
 } from "../api";
 import { PlanPreview } from "../components/PlanPreview";
 import { formatSize } from "../format";
-import type { MigrationMode, MigrationToolState, MigrationsState, PlanSummary } from "../types";
+import type {
+  DirMigration,
+  DirMigrationStage,
+  DirMigrationsState,
+  JunctionCheck,
+  MigrationMode,
+  MigrationToolState,
+  MigrationsState,
+  PlanSummary,
+} from "../types";
 
 // 清理旧目录用的临时规则不在内置规则目录里，预览里给它一个中文名。
 const OLD_CACHE_RULE_NAME = "旧缓存目录";
@@ -17,7 +34,27 @@ const OLD_CACHE_RULE_NAME = "旧缓存目录";
 // 迁移过的工具才谈得上撤销。
 const REVERTIBLE_STAGES = ["verified", "cleanupPlanned", "cleaned"];
 
-export function MigratePage() {
+// 目录迁移的步骤时间线，顺序和 Rust 端状态机一致。
+const DIR_STEPS: readonly [DirMigrationStage, string][] = [
+  ["precheck", "资格检查"],
+  ["copying", "复制到目标卷"],
+  ["verified", "复制校验"],
+  ["sourceRenamed", "源目录改名成备份"],
+  ["junctionCreated", "创建 junction"],
+  ["validated", "经链接校验"],
+  ["awaitingUserTest", "等待实测确认"],
+  ["backupDeleted", "删除备份"],
+  ["done", "完成"],
+];
+
+export function MigratePage({
+  initialSourceId,
+  onSourceHandled,
+}: {
+  // 空间分析页带过来的待迁移目录节点 ID。null 表示本次没有选目录。
+  initialSourceId: number | null;
+  onSourceHandled: () => void;
+}) {
   const [state, setState] = useState<MigrationsState | null>(null);
   const [volume, setVolume] = useState("");
   const [mode, setMode] = useState<MigrationMode>("migrate");
@@ -28,6 +65,9 @@ export function MigratePage() {
   const [message, setMessage] = useState<string | null>(null);
   // 一次只展开一份清理清单：同一时间只允许一次清理类操作。
   const [plan, setPlan] = useState<PlanSummary | null>(null);
+  // 目录迁移：记录和当前选中目录的资格检查结果。
+  const [dirs, setDirs] = useState<DirMigrationsState | null>(null);
+  const [dirCheck, setDirCheck] = useState<JunctionCheck | null>(null);
 
   const reload = () => {
     migrationsList()
@@ -41,9 +81,25 @@ export function MigratePage() {
         );
       })
       .catch((reason) => setError(String(reason)));
+
+    junctionState()
+      .then(setDirs)
+      .catch((reason) => setError(String(reason)));
   };
 
   useEffect(reload, []);
+
+  // 空间分析页选了目录之后，只拿节点 ID 去问后端能不能迁移。
+  useEffect(() => {
+    if (initialSourceId === null) {
+      setDirCheck(null);
+      return;
+    }
+
+    junctionCheck(initialSourceId)
+      .then(setDirCheck)
+      .catch((reason) => setError(String(reason)));
+  }, [initialSourceId]);
 
   const run = async (action: () => Promise<string>) => {
     setBusy(true);
@@ -101,6 +157,71 @@ export function MigratePage() {
       const result = await migrationRevert(tool.tool);
       setPlan(null);
       return `${result.label}：${result.note}`;
+    });
+  };
+
+  const onDirStart = (check: JunctionCheck) => {
+    if (!volume) {
+      setError("请先选择目标盘");
+      return;
+    }
+    if (
+      !window.confirm(
+        `把 ${check.path} 迁移到 ${volume}？迁移期间请先退出正在使用这个目录的程序。` +
+          "迁移完成之后请打开相关应用确认正常，再删除备份。",
+      )
+    ) {
+      return;
+    }
+
+    void run(async () => {
+      const record = await junctionStart(check.sourceId, volume);
+      onSourceHandled();
+      return `${record.source}：${record.note}`;
+    });
+  };
+
+  const onDirContinue = (record: DirMigration) => {
+    void run(async () => {
+      const next = await junctionContinue(record.id);
+      return `${next.source}：${next.note}`;
+    });
+  };
+
+  const onDirReturn = (record: DirMigration) => {
+    if (
+      !window.confirm(
+        `把 ${record.source} 迁回本机？迁回以目标里的最新数据为准，来源盘空间不足时会拒绝。`,
+      )
+    ) {
+      return;
+    }
+
+    void run(async () => {
+      const next = await junctionReturn(record.id);
+      return `${next.source}：${next.note}`;
+    });
+  };
+
+  const onDirDeleteBackup = (record: DirMigration) => {
+    if (!window.confirm(`删除备份 ${record.backup}？删除之后不能再用它恢复这次迁移。`)) {
+      return;
+    }
+
+    void run(async () => {
+      const next = await junctionDeleteBackup(record.id);
+      return `${next.source}：${next.note}`;
+    });
+  };
+
+  const onDirDiscardTarget = (record: DirMigration) => {
+    if (!window.confirm(`删除目标里的旧副本 ${record.target}？迁回之后它已经不再被使用。`)) {
+      return;
+    }
+
+    void run(async () => {
+      const next = await junctionDiscardTarget(record.id);
+      return `${next.source}：${next.note}`;
     });
   };
 
@@ -259,6 +380,133 @@ export function MigratePage() {
         </p>
       </div>
 
+      <div className="card">
+        <h3>目录迁移</h3>
+
+        <p className="muted">
+          只迁移纯数据目录：把目录复制到其他盘，在原位置留下 junction，原路径照常可访问。
+          备份和目标里的旧副本都要你确认之后才删除。
+        </p>
+
+        {!dirCheck && (
+          <p className="muted">
+            在“空间分析”页选一个目录，点“迁移到其他盘…”，这里会显示资格检查结果。
+          </p>
+        )}
+
+        {dirCheck && (
+          <>
+            <div className="volume-row">
+              <span className="volume-name">待迁移目录</span>
+              <span className="path-text" title={dirCheck.path}>
+                {dirCheck.path}
+              </span>
+              <span className="muted">（占盘 {formatSize(dirCheck.allocated)}）</span>
+            </div>
+
+            {dirCheck.eligible ? (
+              <p className="muted">资格检查通过：没有链接、程序文件、加密文件或云占位符。</p>
+            ) : (
+              <ul className="warn">
+                {dirCheck.reasons.map((reason) => (
+                  <li key={reason}>{reason}</li>
+                ))}
+              </ul>
+            )}
+
+            <div className="actions">
+              <button
+                type="button"
+                disabled={busy || planRunning || !dirCheck.eligible || !volume}
+                onClick={() => onDirStart(dirCheck)}
+              >
+                开始迁移
+              </button>
+              <button
+                type="button"
+                className="link"
+                disabled={busy}
+                onClick={() => {
+                  setDirCheck(null);
+                  onSourceHandled();
+                }}
+              >
+                取消
+              </button>
+            </div>
+          </>
+        )}
+
+        {dirs && dirs.records.length > 0 && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>目录</th>
+                <th>状态</th>
+                <th>步骤</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {dirs.records.map((record) => (
+                <tr key={record.id}>
+                  <td>
+                    <div className="path-text" title={record.source}>
+                      {record.source}
+                    </div>
+                    <div className="muted">目标：{record.target}</div>
+                    <div className="muted">备份：{record.backup}</div>
+                  </td>
+                  <td>
+                    <span className="status-badge">{record.stageLabel}</span>
+                    {record.note && <div className="muted">{record.note}</div>}
+                  </td>
+                  <td>{timeline(record.stage)}</td>
+                  <td>
+                    <div className="actions">
+                      <button
+                        type="button"
+                        disabled={busy || planRunning || !record.resumable}
+                        onClick={() => onDirContinue(record)}
+                      >
+                        继续
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy || planRunning || !record.canDeleteBackup}
+                        onClick={() => onDirDeleteBackup(record)}
+                      >
+                        确认删除备份
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy || planRunning || !record.hasJunction}
+                        onClick={() => onDirReturn(record)}
+                      >
+                        迁回
+                      </button>
+                      <button
+                        type="button"
+                        // 只有迁回之后目标里的数据才是“旧副本”，迁移成功后它仍是活的数据。
+                        disabled={
+                          busy ||
+                          planRunning ||
+                          record.stage !== "returned" ||
+                          !record.targetExists
+                        }
+                        onClick={() => onDirDiscardTarget(record)}
+                      >
+                        删除旧副本
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
       {plan && (
         <PlanPreview
           planId={plan.planId}
@@ -272,5 +520,29 @@ export function MigratePage() {
         />
       )}
     </section>
+  );
+}
+
+/// 目录迁移的步骤时间线。中断和回滚不在上面的步骤里，单独说明。
+function timeline(stage: DirMigrationStage) {
+  if (stage === "needsAttention" || stage === "failed" || stage === "returned") {
+    const text =
+      stage === "returned" ? "已迁回，原位置恢复成普通目录" : stage === "failed" ? "已回滚" : "需要处理";
+    return <span className="muted">{text}</span>;
+  }
+
+  const current = DIR_STEPS.findIndex(([key]) => key === stage);
+
+  return (
+    <ol className="steps">
+      {DIR_STEPS.map(([key, label], at) => (
+        <li
+          key={key}
+          className={at === current ? "step step-active" : at < current ? "step step-done" : "step"}
+        >
+          {label}
+        </li>
+      ))}
+    </ol>
   );
 }

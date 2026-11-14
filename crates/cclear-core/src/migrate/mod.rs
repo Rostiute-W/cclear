@@ -7,6 +7,7 @@
 //! 状态机持久化在 `<LocalAppData>\CClear\migrations.json`：旧配置值必须能在进程被结束
 //! 之后仍然读得到，否则就撤不回去了。
 
+pub mod junction;
 pub mod tools;
 
 use std::ffi::OsString;
@@ -1008,38 +1009,66 @@ fn write_log(journal: &mut dyn JournalSink, migration: &Migration) -> Result<(),
 }
 
 /// 迁移记录文件的全部内容。
+///
+/// 工具缓存迁移和目录迁移共用同一个文件：两者都是“先把状态记下来再动手”的迁移，
+/// 分开存会让界面上的两个迁移页各自漏掉对方的进度。
 #[derive(Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Store {
+pub(crate) struct Store {
     #[serde(default)]
     tools: Vec<Migration>,
+    #[serde(default)]
+    pub(crate) directories: Vec<junction::DirMigration>,
 }
 
-/// 迁移记录文件的位置。
-fn store_path() -> Result<PathBuf, MigrateError> {
-    known_folder(KnownFolder::LocalAppData)
-        .map(|path| path.join(STORE_DIR).join(STORE_FILE))
-        .map_err(|error| {
-            MigrateError::Io(io::Error::other(format!(
-                "无法定位本地应用数据目录：{error}"
-            )))
-        })
+/// 迁移记录文件的位置。给了目录就用目录，否则用系统的 `%LOCALAPPDATA%\CClear`。
+///
+/// 测试只能操作临时目录，所以目录必须可注入。
+pub(crate) fn store_file(dir: Option<&Path>) -> Result<PathBuf, MigrateError> {
+    match dir {
+        Some(dir) => Ok(dir.join(STORE_FILE)),
+        None => known_folder(KnownFolder::LocalAppData)
+            .map(|path| path.join(STORE_DIR).join(STORE_FILE))
+            .map_err(|error| {
+                MigrateError::Io(io::Error::other(format!(
+                    "无法定位本地应用数据目录：{error}"
+                )))
+            }),
+    }
 }
 
-/// 读全部迁移记录。还没有记录时返回空列表。
-fn load_all() -> Result<Vec<Migration>, MigrateError> {
-    let path = store_path()?;
+/// 读迁移记录。还没有记录时返回空结构。
+pub(crate) fn load_store(dir: Option<&Path>) -> Result<Store, MigrateError> {
+    let path = store_file(dir)?;
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Store::default()),
         Err(error) => return Err(MigrateError::Io(error)),
     };
 
-    // 记录里存着旧配置值，坏了不能当成“没迁移过”：否则用户既撤不回去，也不知道发生了什么。
-    let store: Store = serde_json::from_str(&text)
-        .map_err(|error| MigrateError::Store(format!("{}：{error}", path.display())))?;
+    // 记录里存着旧配置值和未完成的迁移，坏了不能当成“没迁移过”：否则用户既撤不回去，
+    // 也不知道发生了什么。
+    serde_json::from_str(&text)
+        .map_err(|error| MigrateError::Store(format!("{}：{error}", path.display())))
+}
 
-    Ok(store.tools)
+/// 写回全部迁移记录。
+pub(crate) fn save_store(dir: Option<&Path>, store: &Store) -> Result<(), MigrateError> {
+    let path = store_file(dir)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let json = serde_json::to_vec_pretty(store)
+        .map_err(|error| MigrateError::Io(io::Error::other(error)))?;
+    std::fs::write(&path, json)?;
+
+    Ok(())
+}
+
+/// 读全部工具的迁移记录。
+fn load_all() -> Result<Vec<Migration>, MigrateError> {
+    Ok(load_store(None)?.tools)
 }
 
 /// 读一个工具的迁移记录。
@@ -1047,22 +1076,13 @@ fn load_one(tool: &str) -> Result<Option<Migration>, MigrateError> {
     Ok(load_all()?.into_iter().find(|item| item.tool == tool))
 }
 
-/// 保存一个工具的迁移记录，其他工具的记录原样保留。
+/// 保存一个工具的迁移记录，其他工具和目录迁移的记录原样保留。
 fn save(migration: &Migration) -> Result<(), MigrateError> {
-    let mut tools = load_all()?;
-    tools.retain(|item| item.tool != migration.tool);
-    tools.push(migration.clone());
+    let mut store = load_store(None)?;
+    store.tools.retain(|item| item.tool != migration.tool);
+    store.tools.push(migration.clone());
 
-    let path = store_path()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-
-    let json = serde_json::to_vec_pretty(&Store { tools })
-        .map_err(|error| MigrateError::Io(io::Error::other(error)))?;
-    std::fs::write(&path, json)?;
-
-    Ok(())
+    save_store(None, &store)
 }
 
 /// 系统目录映射。一次操作只解析一次，避免反复查 Known Folder。

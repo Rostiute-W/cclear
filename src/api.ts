@@ -5,12 +5,15 @@ import type {
   CandidateInfo,
   CommandProgress,
   CommandReport,
+  DirMigration,
+  DirMigrationsState,
   DirNode,
   ElevatedResult,
   EnvState,
   ExecProgress,
   ExecReport,
   FileEntry,
+  JunctionCheck,
   LockReport,
   MaintenanceProgress,
   MigrationCleanupPlan,
@@ -241,6 +244,35 @@ export function migrationCleanupOld(tool: MigrationTool): Promise<MigrationClean
 
 export function migrationRevert(tool: MigrationTool): Promise<MigrationResult> {
   return invoke<MigrationResult>("migration_revert", { tool });
+}
+
+// 目录迁移：只传扫描节点 ID 和目标卷根，源路径从上次扫描结果里取。
+export function junctionState(): Promise<DirMigrationsState> {
+  return invoke<DirMigrationsState>("junction_state");
+}
+
+export function junctionCheck(sourceId: number): Promise<JunctionCheck> {
+  return invoke<JunctionCheck>("junction_check", { sourceId });
+}
+
+export function junctionStart(sourceId: number, volumeRoot: string): Promise<DirMigration> {
+  return invoke<DirMigration>("junction_start", { sourceId, volumeRoot });
+}
+
+export function junctionContinue(id: string): Promise<DirMigration> {
+  return invoke<DirMigration>("junction_continue", { id });
+}
+
+export function junctionReturn(id: string): Promise<DirMigration> {
+  return invoke<DirMigration>("junction_return", { id });
+}
+
+export function junctionDeleteBackup(id: string): Promise<DirMigration> {
+  return invoke<DirMigration>("junction_delete_backup", { id });
+}
+
+export function junctionDiscardTarget(id: string): Promise<DirMigration> {
+  return invoke<DirMigration>("junction_discard_target", { id });
 }
 
 type ScanListener = (progress: ScanProgress) => void;

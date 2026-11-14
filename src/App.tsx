@@ -20,19 +20,29 @@ const NAV = [
 
 type PageId = (typeof NAV)[number]["id"];
 
-function renderPage(page: PageId, onQuarantineChanged: () => void) {
+function renderPage(
+  page: PageId,
+  onQuarantineChanged: () => void,
+  migrateSource: { sourceId: number | null; go: (nodeId: number) => void; done: () => void },
+) {
   switch (page) {
     case "overview":
       return <OverviewPage />;
     case "clean":
       return <CleanPage />;
     case "space":
-      return <SpacePage />;
+      return <SpacePage onMigrate={migrateSource.go} />;
     case "quarantine":
       // 隔离区里处理过批次之后，顶部的超期横幅要跟着刷新。
       return <QuarantinePage onChanged={onQuarantineChanged} />;
     case "migrate":
-      return <MigratePage />;
+      // 空间分析页点“迁移到其他盘…”时把节点 ID 带过来，只传 ID，路径由后端解析。
+      return (
+        <MigratePage
+          initialSourceId={migrateSource.sourceId}
+          onSourceHandled={migrateSource.done}
+        />
+      );
     case "history":
       return <HistoryPage />;
   }
@@ -42,6 +52,17 @@ function App() {
   const [page, setPage] = useState<PageId>("overview");
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [overdue, setOverdue] = useState<QuarantineBatch[]>([]);
+  // 从空间分析页带过来的待迁移目录。
+  const [migrateSourceId, setMigrateSourceId] = useState<number | null>(null);
+
+  const migrateSource = {
+    sourceId: migrateSourceId,
+    go: (nodeId: number) => {
+      setMigrateSourceId(nodeId);
+      setPage("migrate");
+    },
+    done: () => setMigrateSourceId(null),
+  };
 
   // 放太久的批次只提示，不自动删除：删不删由用户决定。
   const refreshOverdue = () => {
@@ -95,7 +116,7 @@ function App() {
           ))}
         </nav>
 
-        <main className="content">{renderPage(page, refreshOverdue)}</main>
+        <main className="content">{renderPage(page, refreshOverdue, migrateSource)}</main>
       </div>
     </div>
   );

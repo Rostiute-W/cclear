@@ -448,6 +448,39 @@ button:disabled {
   text-overflow: ellipsis;
 }
 
+/* 目录迁移的步骤时间线：已经走过的步骤变绿，当前步骤加粗。 */
+.steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  color: #8a929c;
+}
+
+.step::before {
+  content: "○ ";
+}
+
+.step-done {
+  color: #1a6b3c;
+}
+
+.step-done::before {
+  content: "● ";
+}
+
+.step-active {
+  color: #0b5cad;
+  font-weight: 600;
+}
+
+.step-active::before {
+  content: "► ";
+}
+
 .env-group {
   margin: 12px 0 4px;
   color: #67707b;
