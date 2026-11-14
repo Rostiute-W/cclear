@@ -2,8 +2,10 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
+  CandidateInfo,
   DirNode,
   FileEntry,
+  RuleInfo,
   ScanProgress,
   ScanRoot,
   ScanSummary,
@@ -12,6 +14,14 @@ import type {
 
 export function appInfo(): Promise<AppInfo> {
   return invoke<AppInfo>("app_info");
+}
+
+export function rulesCatalog(): Promise<RuleInfo[]> {
+  return invoke<RuleInfo[]>("rules_catalog");
+}
+
+export function rulesEvaluate(): Promise<CandidateInfo[]> {
+  return invoke<CandidateInfo[]>("rules_evaluate");
 }
 
 export function volumeInfo(): Promise<VolumeInfo[]> {
