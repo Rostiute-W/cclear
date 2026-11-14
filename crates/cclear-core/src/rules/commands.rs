@@ -10,7 +10,8 @@ use crate::exec::command::{CmdOutcome, resolve_tool, run};
 use crate::journal::{JournalSink, Record, unix_now};
 use crate::model::SizeInfo;
 use crate::rules::catalog::CommandId;
-use crate::win::{dirinfo, volume};
+use crate::rules::resolve::measure_paths;
+use crate::win::volume;
 
 /// 查询缓存路径的超时。查询只读工具配置，正常几百毫秒。
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -121,8 +122,8 @@ pub enum CommandCheck {
     NotPresent,
     /// 查不到缓存路径，或者缓存在 C 盘以外，这条规则不能执行。
     Unusable(String),
-    /// 可以调用命令清理这些路径。
-    Ready { paths: Vec<PathBuf>, size: SizeInfo },
+    /// 可以调用命令清理这些路径。大小由调用方按同一套并行枚举统计。
+    Ready { paths: Vec<PathBuf> },
 }
 
 /// 一次命令执行的结果。
@@ -145,7 +146,7 @@ pub fn spec(id: CommandId) -> Option<&'static CommandSpec> {
         .map(|(_, spec)| spec)
 }
 
-/// 评估一条命令规则：工具在不在、缓存在不在 C 盘、缓存多大。
+/// 评估一条命令规则：工具在不在、缓存在不在 C 盘。
 pub fn check(id: CommandId) -> CommandCheck {
     let Some(spec) = spec(id) else {
         return CommandCheck::Unusable("没有为这条规则配置清理命令".to_string());
@@ -156,10 +157,7 @@ pub fn check(id: CommandId) -> CommandCheck {
     }
 
     match cache_paths(spec) {
-        Ok(paths) => {
-            let size = total_size(&paths);
-            CommandCheck::Ready { paths, size }
-        }
+        Ok(paths) => CommandCheck::Ready { paths },
         Err(reason) => CommandCheck::Unusable(reason),
     }
 }
@@ -222,10 +220,10 @@ pub fn execute(
 
     // 清理前重新解析一次路径：评估到执行之间工具配置可能已经变了。
     let paths = cache_paths(spec)?;
-    let size_before = total_size(&paths);
+    let size_before = measure_paths(&paths);
 
     let outcome = run_steps(&tool, spec.clear_steps, spec.timeout);
-    let size_after = total_size(&paths);
+    let size_after = measure_paths(&paths);
 
     let record = Record::CommandRun {
         at: unix_now(),
@@ -293,7 +291,7 @@ fn cache_paths(spec: &'static CommandSpec) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
-/// 缓存路径必须在 C 盘。按卷序列号比较，盘符变化或目录重定向到别的盘都能认出来。
+/// 缓存路径必须在 C 盘。按路径本身（跟随链接后）所在的卷比较，盘符变化或目录重定向到别的盘都能认出来。
 fn drive_check(path: &Path) -> Result<(), String> {
     let Some(system) = volume::system_volume_serial() else {
         return Err("无法读取系统盘的卷序列号".to_string());
@@ -351,65 +349,6 @@ fn looks_like_path(text: &str) -> bool {
         ['\\', '\\', _] => true,
         _ => false,
     }
-}
-
-/// 多个缓存路径的合计大小。
-fn total_size(paths: &[PathBuf]) -> SizeInfo {
-    let mut total = SizeInfo::default();
-
-    for path in paths {
-        let size = dir_size(path);
-        total.logical += size.logical;
-        total.allocated += size.allocated;
-        total.files += size.files;
-        total.dirs += size.dirs;
-    }
-
-    total
-}
-
-/// 目录的占盘大小。读不到的部分按 0 计：统计只用于展示和前后对比。
-fn dir_size(path: &Path) -> SizeInfo {
-    let Ok(handle) = dirinfo::open_dir(path) else {
-        return SizeInfo::default();
-    };
-
-    let mut size = SizeInfo {
-        dirs: 1,
-        ..SizeInfo::default()
-    };
-    let mut subdirs = Vec::new();
-
-    let _ = dirinfo::for_each_entry(&handle, |entry| {
-        if entry.is_dir {
-            // junction 和符号链接不进，否则会把别的卷算进来。
-            if !entry.is_reparse() {
-                subdirs.push(entry.name);
-            }
-            return;
-        }
-
-        if entry.is_reparse() {
-            return;
-        }
-
-        size.logical += entry.logical;
-        size.allocated += entry.allocated;
-        size.files += 1;
-    });
-
-    // 句柄先释放，避免深层目录同时占用大量句柄。
-    drop(handle);
-
-    for name in subdirs {
-        let sub = dir_size(&path.join(name));
-        size.logical += sub.logical;
-        size.allocated += sub.allocated;
-        size.files += sub.files;
-        size.dirs += sub.dirs;
-    }
-
-    size
 }
 
 /// 命令输出末尾，stdout 和 stderr 各取一段。

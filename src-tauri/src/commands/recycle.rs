@@ -5,6 +5,9 @@
 use cclear_core::journal::{FileJournal, JournalSink, Record, unix_now};
 use cclear_core::special::recycle_bin::{empty_c, query_c};
 use serde::Serialize;
+use tauri::State;
+
+use crate::state::AppState;
 
 /// C 盘回收站当前的内容。
 #[derive(Serialize)]
@@ -29,8 +32,16 @@ pub async fn recycle_bin_query() -> Result<RecycleBinDto, String> {
 pub async fn recycle_bin_empty(
     expected_items: i64,
     expected_bytes: i64,
+    state: State<'_, AppState>,
 ) -> Result<RecycleBinDto, String> {
+    // 清单执行、命令执行和清空回收站共用一把锁，同一时间只允许一次清理类操作。
+    let _exec = state.start_exec()?;
+
     tauri::async_runtime::spawn_blocking(move || {
+        // 日志先打开：打不开就什么都不动，否则清空之后既没法记录也恢复不了。
+        let mut journal = FileJournal::new()
+            .map_err(|error| format!("操作日志无法写入，未清空回收站：{error}"))?;
+
         let (items, bytes) = query_c()?;
         if items != expected_items || bytes != expected_bytes {
             return Err("回收站内容已变化，请重新确认".to_string());
@@ -38,14 +49,12 @@ pub async fn recycle_bin_empty(
 
         empty_c()?;
 
-        // 已经清空了，日志写不进去也必须如实报告，不能让这次操作没有记录。
-        let mut journal = FileJournal::new()
-            .map_err(|error| format!("回收站已清空，但操作日志写入失败：{error}"))?;
         let record = Record::SpecialAction {
             at: unix_now(),
             action: "emptyRecycleBin".to_string(),
             detail: format!("清空 C 盘回收站：{items} 项，{bytes} 字节"),
         };
+        // 已经清空了，日志写不进去也必须如实报告，不能让这次操作没有记录。
         journal
             .append(&record)
             .map_err(|error| format!("回收站已清空，但操作日志写入失败：{error}"))?;

@@ -29,9 +29,19 @@ interface PlanPreviewProps {
   summary: PlanSummary;
   // 执行结束后通知调用方，清理页据此重新评估。
   onFinished?: () => void;
+  // 执行状态变化时通知调用方，清理页据此禁用其他执行按钮。
+  onRunningChange?: (running: boolean) => void;
+  // 其他清理类操作正在进行时，这里不能开始清理。
+  blocked?: boolean;
 }
 
-export function PlanPreview({ planId, summary, onFinished }: PlanPreviewProps) {
+export function PlanPreview({
+  planId,
+  summary,
+  onFinished,
+  onRunningChange,
+  blocked,
+}: PlanPreviewProps) {
   // 清单里只有规则 ID，名称取自内置规则目录；取不到就退回显示 ID。
   const [ruleNames, setRuleNames] = useState<Map<string, string>>(new Map());
   const [openRule, setOpenRule] = useState<string | null>(null);
@@ -74,6 +84,7 @@ export function PlanPreview({ planId, summary, onFinished }: PlanPreviewProps) {
 
   const execute = () => {
     setRunning(true);
+    onRunningChange?.(true);
     setError(null);
     setProgress({});
 
@@ -86,6 +97,7 @@ export function PlanPreview({ planId, summary, onFinished }: PlanPreviewProps) {
       .catch((reason) => setError(String(reason)))
       .finally(() => {
         setRunning(false);
+        onRunningChange?.(false);
         // 清理已经结束，界面上的候选统计需要重新评估。
         onFinished?.();
       });
@@ -105,7 +117,7 @@ export function PlanPreview({ planId, summary, onFinished }: PlanPreviewProps) {
   const hasIrreversible = summary.rules.some(
     (rule) => rule.recovery === "irreversibleFile",
   );
-  const canExecute = !running && !report && (!hasIrreversible || acknowledged);
+  const canExecute = !running && !blocked && !report && (!hasIrreversible || acknowledged);
   // 跳过明细可能被后端截断，起点要如实说明。
   const skippedShown = report ? report.skipped.length : 0;
 

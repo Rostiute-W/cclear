@@ -177,7 +177,8 @@ function finishLabel(detail: PlanDetail): string {
 }
 
 // “规则”列：列出前几条名称，超出部分只报数量。
-function ruleSummary(plan: PlanHistoryEntry, nameOf: (ruleId: string) => string): string {  if (plan.rules.length === 0) {
+function ruleSummary(plan: PlanHistoryEntry, nameOf: (ruleId: string) => string): string {
+  if (plan.rules.length === 0) {
     return "—";
   }
 

@@ -11,8 +11,8 @@ use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO,
-    FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo,
     GetFileInformationByHandleEx, OPEN_EXISTING, SYNCHRONIZE,
 };
 use windows::core::{HRESULT, PCWSTR};
@@ -72,6 +72,36 @@ pub fn open_dir(path: &Path) -> io::Result<OwnedHandle> {
                 None,
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+    };
+
+    let handle = handle.map_err(io::Error::from)?;
+    // SAFETY: 句柄刚由 CreateFileW 成功返回，所有权转移给 OwnedHandle，由它负责关闭。
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
+}
+
+/// 打开路径本身所在的卷：跟随 reparse point，只申请读属性。
+///
+/// 判断卷不能用 `open_dir`：它带 `FILE_FLAG_OPEN_REPARSE_POINT`，读到的是链接本身
+/// 所在的卷，而不是链接指向的卷。只申请 `FILE_READ_ATTRIBUTES`，不是这个目录的
+/// 所有者也能读到卷信息。
+pub fn open_following_links(path: &Path) -> io::Result<OwnedHandle> {
+    let mut wide: Vec<u16> = to_verbatim(path).as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    let handle = {
+        // SAFETY: wide 是以 NUL 结尾的宽字符串且在调用期间存活；不传安全属性和模板句柄；
+        // 共享模式放开读/写/删，避免因为别人正在写文件而读不到。
+        unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                FILE_READ_ATTRIBUTES.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
                 None,
             )
         }

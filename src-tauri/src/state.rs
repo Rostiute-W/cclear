@@ -89,8 +89,10 @@ impl AppState {
         self.plans.lock().unwrap().get(&plan_id).cloned()
     }
 
-    /// 登记一次清理执行，返回取消开关。
-    pub fn start_exec(&self) -> Result<Arc<AtomicBool>, String> {
+    /// 登记一次清理执行。已经有清理在进行时返回错误。
+    ///
+    /// 返回的守卫代表这次执行，离开作用域时自动释放执行锁。
+    pub fn start_exec(&self) -> Result<ExecLock<'_>, String> {
         if self.exec_running.swap(true, Ordering::SeqCst) {
             return Err("已经有一次清理在进行，请等待结束或先取消".to_string());
         }
@@ -98,11 +100,14 @@ impl AppState {
         let cancel = Arc::new(AtomicBool::new(false));
         *self.exec_cancel.lock().unwrap() = Some(cancel.clone());
 
-        Ok(cancel)
+        Ok(ExecLock {
+            state: self,
+            cancel,
+        })
     }
 
     /// 执行结束（无论成功、中止还是取消）后清掉运行标记。
-    pub fn finish_exec(&self) {
+    fn finish_exec(&self) {
         *self.exec_cancel.lock().unwrap() = None;
         self.exec_running.store(false, Ordering::SeqCst);
     }
@@ -112,5 +117,27 @@ impl AppState {
         if let Some(flag) = self.exec_cancel.lock().unwrap().as_ref() {
             flag.store(true, Ordering::SeqCst);
         }
+    }
+}
+
+/// 一次清理执行的守卫。清单执行、命令执行和清空回收站共用同一把锁。
+///
+/// 用守卫而不是手动调用 `finish_exec`：失败或 panic 展开时锁也会还回去，
+/// 否则之后所有清理类操作都会被拒绝。
+pub struct ExecLock<'a> {
+    state: &'a AppState,
+    cancel: Arc<AtomicBool>,
+}
+
+impl ExecLock<'_> {
+    /// 取消开关。执行器按它判断是否要中止。
+    pub fn cancel(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for ExecLock<'_> {
+    fn drop(&mut self) {
+        self.state.finish_exec();
     }
 }

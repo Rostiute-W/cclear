@@ -208,13 +208,14 @@ pub async fn plan_execute(
     state: State<'_, AppState>,
 ) -> Result<ExecReportDto, String> {
     let plan = stored_plan(&plan_id, &state)?;
-    let cancel = state.start_exec()?;
+    // 命令执行、清空回收站和清单执行共用这把锁，同一时间只允许一次清理类操作。
+    let exec = state.start_exec()?;
+    let cancel = exec.cancel();
 
     let result = tauri::async_runtime::spawn_blocking(move || {
         run_execution(plan, &rule_ids, on_progress, cancel)
     })
     .await;
-    state.finish_exec();
 
     match result {
         Ok(report) => Ok(report_dto(report)),

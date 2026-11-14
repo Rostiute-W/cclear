@@ -1,7 +1,7 @@
 //! 卷信息：固定盘的容量、文件系统与系统盘判定。
 
 use std::os::windows::ffi::OsStrExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use windows::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows::Win32::Storage::FileSystem::{
@@ -137,12 +137,22 @@ pub fn free_space(path: &Path) -> u64 {
     if queried.is_err() { 0 } else { available }
 }
 
-/// 任意路径所在卷的序列号。只看盘符根目录，路径本身不存在也能判断。
+/// 任意路径所在卷的序列号。
+///
+/// 打开的是路径本身并跟随链接，所以 C 盘上的 junction 指向 D 盘时，得到的是 D 盘的序列号。
+/// 路径不存在时向上找最近一个存在的祖先目录，同样按它最终所在的卷判断。
 pub fn path_volume_serial(path: &Path) -> Option<u64> {
-    let root = volume_root(path)?;
-    let handle = dirinfo::open_dir(&root).ok()?;
+    let mut candidate = Some(path);
 
-    dirinfo::volume_serial(&handle).ok()
+    while let Some(current) = candidate {
+        // 打开失败说明这一级不存在（或连读属性都不允许），退到上一级再试。
+        if let Ok(handle) = dirinfo::open_following_links(current) {
+            return dirinfo::volume_serial(&handle).ok();
+        }
+        candidate = current.parent();
+    }
+
+    None
 }
 
 /// 系统盘（Windows 所在卷）的序列号。判断缓存是否在系统盘时按它比较。
@@ -150,18 +160,6 @@ pub fn system_volume_serial() -> Option<u64> {
     let windows = known_folder(KnownFolder::Windows).ok()?;
 
     path_volume_serial(&windows)
-}
-
-/// 路径所在的卷根，例如 `C:\`。相对路径没有盘符，返回 None。
-fn volume_root(path: &Path) -> Option<PathBuf> {
-    let Component::Prefix(prefix) = path.components().next()? else {
-        return None;
-    };
-
-    let mut root = PathBuf::from(prefix.as_os_str());
-    root.push("\\");
-
-    Some(root)
 }
 
 /// 系统盘所在的卷根，例如 `C:\`。
