@@ -47,6 +47,7 @@ pub fn run() {
             commands::migrate::migration_start,
             commands::migrate::migration_cleanup_old,
             commands::migrate::migration_revert,
+            commands::migrate::migration_confirm_backup,
             commands::migrate::junction_state,
             commands::migrate::junction_check,
             commands::migrate::junction_start,

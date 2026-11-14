@@ -22,7 +22,7 @@ use windows::Win32::Storage::FileSystem::{
 
 use crate::guard::{self, DirHandle, Forbidden, GuardError, OpenIntent};
 use crate::journal::{JournalSink, Record, unix_now};
-use crate::migrate::{candidate_volumes, load_store, save_store};
+use crate::migrate::{BACKUP_UNCONFIRMED, candidate_volumes, load_store, save_store};
 use crate::model::{FileIdentity, KnownRoot, Recovery};
 use crate::plan::{FrozenPlan, build_plan_at};
 use crate::quarantine::{copy_tree_verified, hash_hex};
@@ -62,6 +62,9 @@ pub enum JunctionError {
 
     #[error("迁移记录读不出来，请先手工检查：{0}")]
     Store(String),
+
+    #[error("{0}")]
+    BackupUnconfirmed(String),
 
     #[error("没有这条目录迁移记录")]
     Missing,
@@ -342,6 +345,23 @@ impl JunctionMigration {
         load_store(Some(&dir)).ok().and_then(|store| store.notice)
     }
 
+    /// 记录是从 `.bak` 退回读出来的、用户还没确认时，会动文件或建删链接的入口先拒绝。
+    ///
+    /// 和工具迁移读的是同一份 `migrations.json`，用同一个 `from_backup` 判断，
+    /// 所以两个迁移页看到的是同一个结论。
+    fn refuse_without_backup(&self) -> Result<(), JunctionError> {
+        let dir = self.store_dir()?;
+        let store =
+            load_store(Some(&dir)).map_err(|error| JunctionError::Store(error.to_string()))?;
+        if store.from_backup {
+            return Err(JunctionError::BackupUnconfirmed(
+                BACKUP_UNCONFIRMED.to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// 按 ID 取一条记录。
     pub fn get(&self, id: &str) -> Result<DirMigration, JunctionError> {
         self.load_one(id)
@@ -385,6 +405,9 @@ impl JunctionMigration {
         volume_root: &str,
         journal: &mut dyn JournalSink,
     ) -> Result<DirMigration, JunctionError> {
+        // 记录是从备份退回读出来的话，复制和改名都不能开始。
+        self.refuse_without_backup()?;
+
         let reasons = self.check_eligibility(source);
         if !reasons.is_empty() {
             return Err(JunctionError::NotEligible(reasons.join("；")));
@@ -539,10 +562,21 @@ impl JunctionMigration {
         id: &str,
         journal: &mut dyn JournalSink,
     ) -> Result<DirMigration, JunctionError> {
+        // 继续会建链接并改写状态，先挡住未确认的备份。
+        self.refuse_without_backup()?;
+
         let mut record = self.load_one(id)?;
         let source = record.source_path();
         let target = record.target_path();
         let backup = record.backup_path();
+
+        // 迁回中途留下的临时目录还在，说明停在迁回这一步：这时“继续”只会在迁回现场上
+        // 再建一次 junction，两份数据反而说不清。界面上已经这样挡，后端也要一致地拒绝。
+        if record.return_temp_path().exists() {
+            return Err(JunctionError::WrongStage {
+                stage: record.stage.label(),
+            });
+        }
 
         // 链接已经建好：数据在校验那一刻就已经在目标里，重新确认一遍就能交给用户实测。
         if record.stage == DirStage::NeedsAttention
@@ -598,8 +632,8 @@ impl JunctionMigration {
 
     /// 复核一个已经建好的 junction：指向记录的迁移目标、条目对应得上、抽查文件内容一致。
     ///
-    /// 条目只要求“备份里有的，目标里也有同样的类型”，不比较大小和时间：迁移之后
-    /// 用户可能已经在原路径改过文件，那些改动只存在于目标里。
+    /// 条目只要求“备份里有的，目标里也有同样的类型”；大小只在修改时间和备份一致时才比，
+    /// 因为迁移之后用户可能已经在原路径改过文件，那些改动只存在于目标里。
     fn verify_junction(&self, record: &DirMigration) -> Result<(), JunctionError> {
         let source = record.source_path();
         let target = record.target_path();
@@ -626,26 +660,37 @@ impl JunctionMigration {
                 if found.map(|item| &item.rel) != Some(&entry.rel)
                     || found.map(|item| item.is_dir) != Some(entry.is_dir)
                 {
-                    return Err(JunctionError::Verify(target));
+                    return Err(JunctionError::Verify(target.clone()));
+                }
+
+                // 修改时间还是迁移时那个，说明这个文件没被改过，大小也应当一样；
+                // 时间一样而大小不同只可能是内容被截断或替换过。
+                if let Some(found) = found
+                    && !entry.is_dir
+                    && found.mtime == entry.mtime
+                    && found.size != entry.size
+                {
+                    return Err(JunctionError::Verify(target.clone()));
                 }
             }
-        }
 
-        // 和迁移时一样抽查前几个文件：经 junction 读回的内容必须和直接读目标一致。
-        for entry in files
-            .iter()
-            .filter(|entry| !entry.is_dir)
-            .take(VALIDATE_SAMPLE)
-        {
-            let through_link = join_parts(&source, &entry.rel);
-            let direct = join_parts(&target, &entry.rel);
+            // 抽查前几个文件的内容：比的是备份里的文件和目标里的文件，两个不同的物理文件。
+            // 经 junction 读回读到的就是目标里的那一份，拿它和目标比什么也证明不了。
+            for entry in expected
+                .iter()
+                .filter(|entry| !entry.is_dir)
+                .take(VALIDATE_SAMPLE)
+            {
+                let copy = join_parts(&backup, &entry.rel);
+                let live = join_parts(&target, &entry.rel);
 
-            let through_hash =
-                hash_hex(&through_link).map_err(|error| JunctionError::Copy(error.to_string()))?;
-            let direct_hash =
-                hash_hex(&direct).map_err(|error| JunctionError::Copy(error.to_string()))?;
-            if through_hash != direct_hash {
-                return Err(JunctionError::Verify(through_link));
+                let copy_hash =
+                    hash_hex(&copy).map_err(|error| JunctionError::Copy(error.to_string()))?;
+                let live_hash =
+                    hash_hex(&live).map_err(|error| JunctionError::Copy(error.to_string()))?;
+                if copy_hash != live_hash {
+                    return Err(JunctionError::Verify(live));
+                }
             }
         }
 
@@ -695,6 +740,10 @@ impl JunctionMigration {
         id: &str,
         journal: &mut dyn JournalSink,
     ) -> Result<DirMigration, JunctionError> {
+        // 这里会先删掉备份目录、再写记录：未确认的备份必须在动手之前挡住，
+        // 否则用户会看到“备份没了、状态还没变”。
+        self.refuse_without_backup()?;
+
         let mut record = self.load_one(id)?;
         let backup = record.backup_path();
         // 先把“迁回过”记下来：下面会把状态改成 BackupDeleted，改完就判断不出来了。
@@ -751,6 +800,9 @@ impl JunctionMigration {
         id: &str,
         journal: &mut dyn JournalSink,
     ) -> Result<DirMigration, JunctionError> {
+        // 迁回会复制整棵目录并删链接，先挡住未确认的备份。
+        self.refuse_without_backup()?;
+
         let mut record = self.load_one(id)?;
         let source = record.source_path();
         let target = record.target_path();
@@ -819,26 +871,23 @@ impl JunctionMigration {
         }
 
         // 4. 删链接本身。目标对不上说明这个链接不是 CClear 建的，宁可不删。
-        let parent_path = parent_of(&source)?;
-        let source_name = file_name_of(&source)?;
-        let parent = guard::open_anchor(&parent_path, &self.forbidden)?;
-        let returning_name = file_name_of(&returning)?;
+        //
+        // 从这里开始状态已经是“正在迁回”，任何失败都要经 abort_return 收尾：直接用 ?
+        // 返回会把记录停在 Returning 上，界面既不能继续也不能迁回。
+        let opened = match self.open_return_parts(&source, &returning) {
+            Ok(parts) => parts,
+            Err(error) => {
+                return self.abort_return(&mut record, previous, &returning, error, journal);
+            }
+        };
+        let (parent, source_name, returning_name, expect) = opened;
 
-        let opened = guard::open_rel(
-            &parent,
-            std::slice::from_ref(&returning_name.to_os_string()),
-            OpenIntent::Inspect,
-            &self.forbidden,
-        )?;
-        let expect = opened.expect();
-        drop(opened);
-
-        if let Err(error) = guard::remove_junction(&parent, source_name, &target) {
+        if let Err(error) = guard::remove_junction(&parent, &source_name, &target) {
             return self.abort_return(&mut record, previous, &returning, error.into(), journal);
         }
 
         // 5. 把迁回的目录改名回原名。改名失败时不能让原位置空着。
-        if let Err(error) = guard::rename_child(&parent, returning_name, source_name, &expect) {
+        if let Err(error) = guard::rename_child(&parent, &returning_name, &source_name, &expect) {
             return self.handle_rename_failure(&mut record, previous, error, journal);
         }
 
@@ -862,17 +911,41 @@ impl JunctionMigration {
         error: JunctionError,
         journal: &mut dyn JournalSink,
     ) -> Result<DirMigration, JunctionError> {
-        // 删不掉也要把真正的失败原因报出去，不能让它被清理错误盖掉。
-        let _ = self.delete_tree(returning);
+        // 删不掉也要把真正的失败原因报出去，不能让它被清理错误盖掉；
+        // 说明里必须如实写清临时目录还在，并把完整路径给出来，用户才知道去哪清理。
+        let note = match self.delete_tree(returning) {
+            Ok(()) => format!("迁回没有完成，已删除临时目录，数据没有变化：{error}"),
+            Err(cleanup) => format!(
+                "迁回没有完成，临时目录 {} 没能删除，数据没有变化，请手工清理：{error}；{cleanup}",
+                returning.display()
+            ),
+        };
 
-        self.set_stage(
-            record,
-            previous,
-            &format!("迁回没有完成，已删除临时目录，数据没有变化：{error}"),
-            journal,
-        )?;
+        self.set_stage(record, previous, &note, journal)?;
 
         Err(error)
+    }
+
+    /// 打开迁回需要的父目录、原位置名字和临时目录条目。失败时由调用方走 [`Self::abort_return`]。
+    fn open_return_parts(
+        &self,
+        source: &Path,
+        returning: &Path,
+    ) -> Result<(DirHandle, OsString, OsString, guard::Expect), JunctionError> {
+        let parent = guard::open_anchor(&parent_of(source)?, &self.forbidden)?;
+        let source_name = file_name_of(source)?.to_os_string();
+        let returning_name = file_name_of(returning)?.to_os_string();
+
+        let opened = guard::open_rel(
+            &parent,
+            std::slice::from_ref(&returning_name),
+            OpenIntent::Inspect,
+            &self.forbidden,
+        )?;
+        let expect = opened.expect();
+        drop(opened);
+
+        Ok((parent, source_name, returning_name, expect))
     }
 
     /// 链接已经删掉、目录改名却失败：先把 junction 建回去，建不回来就把临时目录留给用户。
@@ -889,10 +962,28 @@ impl JunctionMigration {
         let source = record.source_path();
         let target = record.target_path();
         let returning = return_path(&source, &record.id);
-        let parent = guard::open_anchor(&parent_of(&source)?, &self.forbidden)?;
-        let source_name = file_name_of(&source)?;
 
-        match guard::create_junction(&parent, source_name, &target) {
+        // 链接已经删掉，这一步再打不开父目录就没法重建 junction：同样交给 abort_return
+        // 收尾，状态落在 NeedsAttention，界面上的“继续”还能把链接补回来。
+        let opened = parent_of(&source).and_then(|path| {
+            let name = file_name_of(&source)?.to_os_string();
+            let parent = guard::open_anchor(&path, &self.forbidden)?;
+            Ok((parent, name))
+        });
+        let (parent, source_name) = match opened {
+            Ok(parts) => parts,
+            Err(error) => {
+                return self.abort_return(
+                    record,
+                    DirStage::NeedsAttention,
+                    &returning,
+                    error,
+                    journal,
+                );
+            }
+        };
+
+        match guard::create_junction(&parent, &source_name, &target) {
             Ok(()) => {
                 let _ = self.delete_tree(&returning);
                 self.set_stage(
@@ -924,6 +1015,9 @@ impl JunctionMigration {
         id: &str,
         journal: &mut dyn JournalSink,
     ) -> Result<DirMigration, JunctionError> {
+        // 会删掉目标里的旧副本，必须在动手之前挡住未确认的备份。
+        self.refuse_without_backup()?;
+
         let mut record = self.load_one(id)?;
         if record.stage != DirStage::Returned {
             return Err(JunctionError::WrongStage {
@@ -1054,10 +1148,7 @@ impl JunctionMigration {
             // 迁回中途被中断：链接还在就删临时目录，链接已经没了就把临时目录改名回去。
             DirStage::Returning => return self.recover_returning(record, journal),
             // 链接可能已经建好：继续还是迁回都要用户决定，不能自己动。
-            DirStage::JunctionCreated
-            | DirStage::Validated
-            | DirStage::AwaitingUserTest
-            | DirStage::BackupDeleted => {
+            DirStage::JunctionCreated | DirStage::Validated | DirStage::BackupDeleted => {
                 self.set_stage(
                     &mut record,
                     DirStage::NeedsAttention,
@@ -1065,6 +1156,9 @@ impl JunctionMigration {
                     journal,
                 )?;
             }
+            // AwaitingUserTest 本身就是稳定的等待状态：它等的是用户打开应用实测，
+            // 改成 NeedsAttention 只会让“确认删除备份”前面多一道没意义的人工处理。
+            // Returning 由上面单独处理，其余状态不需要恢复。
             _ => return Ok(None),
         }
 

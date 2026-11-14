@@ -10,6 +10,7 @@ import {
   junctionStart,
   junctionState,
   migrationCleanupOld,
+  migrationConfirmBackup,
   migrationInspect,
   migrationRevert,
   migrationStart,
@@ -246,6 +247,24 @@ export function MigratePage({
     ),
   );
 
+  // 记录是从备份退回来的：确认之前后端拒绝任何写入，所以这里必须给出确认按钮。
+  const needsConfirm = state?.storeNeedsConfirm === true || dirs?.storeNeedsConfirm === true;
+
+  const onConfirmBackup = () => {
+    if (
+      !window.confirm(
+        "迁移记录主文件读不出来，现在用的是备份。确认之后会用备份内容覆盖主文件，可以吗？",
+      )
+    ) {
+      return;
+    }
+
+    void run(async () => {
+      await migrationConfirmBackup();
+      return "已确认使用备份，迁移记录可以正常保存了";
+    });
+  };
+
   return (
     <section>
       <h2>迁移</h2>
@@ -260,6 +279,20 @@ export function MigratePage({
             <li key={note}>{note}</li>
           ))}
         </ul>
+      )}
+
+      {/* 确认之前后端不写记录：先核对状态，再决定用不用这份备份。 */}
+      {needsConfirm && (
+        <div className="card">
+          <p className="warn">
+            迁移记录是从备份读出来的：确认使用备份之前，迁移和撤销都不会写回记录。
+          </p>
+          <div className="actions">
+            <button type="button" disabled={busy} onClick={onConfirmBackup}>
+              确认使用备份
+            </button>
+          </div>
+        </div>
       )}
 
       <div className="card">

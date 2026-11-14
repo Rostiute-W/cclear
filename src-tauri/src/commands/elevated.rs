@@ -2,6 +2,7 @@
 //!
 //! 前端只传规则 ID；执行哪个内置操作、系统路径在哪，都由核心库和 helper 决定。
 
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 use cclear_core::elevation::{HelperResult, SystemOp, run_elevated};
@@ -51,8 +52,14 @@ pub async fn elevated_execute(
         let roots = RootMap::system().map_err(|error| error.to_string())?;
         let procs = running_processes();
         let mut ops = Vec::with_capacity(rule_ids.len());
+        // 同一条规则可能被重复选中：helper 里执行两次会做两遍同样的隔离，先去重。
+        let mut seen = HashSet::new();
 
         for rule_id in &rule_ids {
+            if !seen.insert(rule_id.as_str()) {
+                continue;
+            }
+
             let rule = find(rule_id).ok_or_else(|| "没有这条清理规则".to_string())?;
             if !rule.admin {
                 return Err("这条规则不需要管理员权限，请在清理页直接执行".to_string());

@@ -14,6 +14,7 @@ fn main() {
             "migration_start",
             "migration_cleanup_old",
             "migration_revert",
+            "migration_confirm_backup",
             "junction_state",
             "junction_check",
             "junction_start",

@@ -71,6 +71,8 @@ pub fn build_plan(
     let now_ticks = system_time_ticks(now);
     let mut items: Vec<FrozenItem> = Vec::new();
     let mut plan_rules = Vec::with_capacity(rules.len());
+    // 进程映像的文件身份只在这里解析一次，逐条规则、逐个文件都不用再打开映像。
+    let images = RunningImages::new(procs);
 
     for rule in rules {
         if !plannable(rule) {
@@ -89,6 +91,7 @@ pub fn build_plan(
                 skipped: &mut skipped_at_build,
                 total: &mut total,
                 seen: &mut seen,
+                images: &images,
             };
 
             match &rule.target {
@@ -98,7 +101,7 @@ pub fn build_plan(
                 }
                 _ => {
                     let anchors = resolve_anchors(rule, roots);
-                    walk_anchors(&anchors, rule, forbidden, procs, now_ticks, &mut state);
+                    walk_anchors(&anchors, rule, forbidden, now_ticks, &mut state);
                     anchors
                 }
             }
@@ -183,6 +186,7 @@ pub fn build_plan_selected(
     now: SystemTime,
 ) -> FrozenPlan {
     let now_ticks = system_time_ticks(now);
+    let images = RunningImages::new(procs);
 
     let mut items: Vec<FrozenItem> = Vec::new();
     let mut skipped: Vec<(PathBuf, String)> = Vec::new();
@@ -208,7 +212,7 @@ pub fn build_plan_selected(
             extensions: options.extensions,
             keep_dirs: options.keep_dirs,
             forbidden,
-            procs,
+            images: &images,
             now_ticks,
             seen: &mut seen,
             items: &mut items,
@@ -246,6 +250,8 @@ struct PlanBuildState<'a> {
     skipped: &'a mut Vec<(PathBuf, String)>,
     total: &'a mut SizeInfo,
     seen: &'a mut HashSet<FileIdentity>,
+    /// 正在运行的进程映像，整次清单生成只解析一次。
+    images: &'a RunningImages,
 }
 
 /// 按路径模板的锚点逐棵遍历，把条目收进清单。
@@ -253,7 +259,6 @@ fn walk_anchors(
     anchors: &[PathBuf],
     rule: &Rule,
     forbidden: &Forbidden,
-    procs: &[ProcInfo],
     now_ticks: u64,
     state: &mut PlanBuildState,
 ) {
@@ -262,7 +267,9 @@ fn walk_anchors(
         skipped,
         total,
         seen,
+        images,
     } = state;
+    let images = *images;
     let selector = selector_of(rule);
 
     for (index, anchor_path) in anchors.iter().enumerate() {
@@ -284,7 +291,7 @@ fn walk_anchors(
             extensions: &[],
             keep_dirs: true,
             forbidden,
-            procs,
+            images,
             now_ticks,
             seen,
             items,
@@ -316,7 +323,9 @@ fn expand_adapter(
         skipped,
         total,
         seen,
+        images,
     } = state;
+    let images = *images;
     let now_ticks = system_time_ticks(now);
 
     // 预览和执行之间状态可能已经变了，这时一个条目都不生成。
@@ -364,7 +373,7 @@ fn expand_adapter(
                 extensions: &[],
                 keep_dirs: false,
                 forbidden,
-                procs,
+                images,
                 now_ticks,
                 seen,
                 items,
@@ -396,7 +405,7 @@ fn expand_adapter(
 
         // 正在运行的程序文件不能动，这一条和目录分支的口径一致。
         let path = join_all(&item.anchor, &item.rel);
-        if is_running_image(&path, procs) {
+        if images.contains(entry.identity, &path) {
             skipped.push((path, "正在运行的程序文件".to_string()));
             continue;
         }
@@ -465,7 +474,7 @@ struct Walker<'a> {
     /// 子目录是否也进清单。适配器展开的子树只收文件，目录交给用户自己处理。
     keep_dirs: bool,
     forbidden: &'a Forbidden,
-    procs: &'a [ProcInfo],
+    images: &'a RunningImages,
     now_ticks: u64,
     seen: &'a mut HashSet<FileIdentity>,
     items: &'a mut Vec<FrozenItem>,
@@ -567,7 +576,7 @@ impl Walker<'_> {
             }
 
             let path = dir_path.join(&file.entry.name);
-            if self.is_running_process(&path) {
+            if self.is_running_process(file.identity, &path) {
                 self.skipped.push((path, "正在运行的程序文件".to_string()));
                 continue;
             }
@@ -628,20 +637,61 @@ impl Walker<'_> {
     }
 
     /// 文件的完整路径是否就是某个正在运行的进程映像。
-    fn is_running_process(&self, path: &Path) -> bool {
-        is_running_image(path, self.procs)
+    fn is_running_process(&self, identity: FileIdentity, path: &Path) -> bool {
+        self.images.contains(identity, path)
     }
 }
 
-/// 文件的完整路径是否就是某个正在运行的进程映像。目录和单文件两条分支共用它。
-fn is_running_image(path: &Path, procs: &[ProcInfo]) -> bool {
-    let text = path.to_string_lossy();
+/// 正在运行的程序映像，按文件身份判断。
+///
+/// 同一个文件可以有多个硬链接名字（本机就有一对 `xxx.exe` / `xxx.exe.old-*`），
+/// 只比路径会漏掉其中一个名字，所以能打开映像文件时按“卷序列号 + 文件 ID”比较。
+struct RunningImages {
+    /// 能打开映像文件时记下的身份。
+    identities: HashSet<FileIdentity>,
+    /// 打不开的映像（受保护进程等）只能退回按路径比较。
+    paths: Vec<PathBuf>,
+}
 
-    procs.iter().any(|proc| {
-        proc.image_path
-            .as_ref()
-            .is_some_and(|image| crate::win::equals_ignore_case(&image.to_string_lossy(), &text))
-    })
+impl RunningImages {
+    fn new(procs: &[ProcInfo]) -> Self {
+        let mut identities = HashSet::new();
+        let mut paths = Vec::new();
+
+        for proc in procs {
+            let Some(image) = proc.image_path.as_ref() else {
+                continue;
+            };
+
+            match file_identity(image) {
+                Some(identity) => {
+                    identities.insert(identity);
+                }
+                None => paths.push(image.clone()),
+            }
+        }
+
+        Self { identities, paths }
+    }
+
+    /// `identity` 是 `path` 的文件身份。硬链接的另一个名字也能认出来。
+    fn contains(&self, identity: FileIdentity, path: &Path) -> bool {
+        if self.identities.contains(&identity) {
+            return true;
+        }
+
+        let text = path.to_string_lossy();
+        self.paths
+            .iter()
+            .any(|image| crate::win::equals_ignore_case(&image.to_string_lossy(), &text))
+    }
+}
+
+/// 取一个路径的文件身份，跟随链接。打不开时返回 None。
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    let handle = crate::win::dirinfo::open_following_links(path).ok()?;
+
+    crate::guard::path::identity_of(&handle).ok()
 }
 
 /// 拼出锚点下的完整路径，只用于记录和展示，不参与文件操作。
