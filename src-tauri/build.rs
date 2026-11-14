@@ -4,6 +4,7 @@ fn main() {
             "app_info",
             "candidate_locks",
             "open_candidate_in_explorer",
+            "command_execute",
             "env_state",
             "plan_build",
             "plan_items",

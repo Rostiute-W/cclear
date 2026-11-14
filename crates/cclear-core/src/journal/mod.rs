@@ -68,6 +68,19 @@ pub enum Record {
         /// 结果说明，写清楚做了什么、影响多少内容。
         detail: String,
     },
+    /// 开发工具官方清理命令的执行记录。命令不走冻结清单，只记结果。
+    CommandRun {
+        /// Unix 秒，方便按时间排序和显示。
+        at: i64,
+        rule_id: String,
+        /// 退出码。命令没跑起来时为 None。
+        exit_code: Option<i32>,
+        /// 等待超时。超时后命令仍在运行，这里只停止等待。
+        timed_out: bool,
+        /// 执行前后的缓存占盘大小，用来判断命令是否真的清掉了东西。
+        allocated_before: u64,
+        allocated_after: u64,
+    },
 }
 
 /// 日志出口。执行器只认这个接口，日志写失败就立刻中止。
@@ -368,12 +381,12 @@ fn apply(
             summary.finished = true;
             summary.cancelled = cancelled;
         }
-        // 特殊操作不属于任何计划，不会走到这里。
-        Record::SpecialAction { .. } => {}
+        // 特殊操作和官方命令不属于任何计划，不会走到这里。
+        Record::SpecialAction { .. } | Record::CommandRun { .. } => {}
     }
 }
 
-/// 记录所属的计划 ID。回收站这类特殊操作不属于任何计划，返回 None。
+/// 记录所属的计划 ID。回收站和官方命令这类操作不属于任何计划，返回 None。
 fn record_plan_id(record: &Record) -> Option<Uuid> {
     match record {
         Record::PlanStarted { plan_id, .. }
@@ -381,7 +394,7 @@ fn record_plan_id(record: &Record) -> Option<Uuid> {
         | Record::ItemSkipped { plan_id, .. }
         | Record::RuleSkipped { plan_id, .. }
         | Record::PlanFinished { plan_id, .. } => Some(*plan_id),
-        Record::SpecialAction { .. } => None,
+        Record::SpecialAction { .. } | Record::CommandRun { .. } => None,
     }
 }
 
@@ -452,8 +465,8 @@ fn apply_detail(detail: &mut PlanDetail, record: Record) {
             detail.finished = true;
             detail.cancelled = cancelled;
         }
-        // 特殊操作不属于任何计划，不会走到这里。
-        Record::SpecialAction { .. } => {}
+        // 特殊操作和官方命令不属于任何计划，不会走到这里。
+        Record::SpecialAction { .. } | Record::CommandRun { .. } => {}
     }
 }
 

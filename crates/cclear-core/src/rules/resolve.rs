@@ -7,7 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{CoreError, Result};
 use crate::model::{FileIdentity, KnownRoot, Phase, SizeInfo, Tier};
-use crate::rules::catalog::{ENABLED_PHASES, Rule, SelectKind, Selector, Target, catalog};
+use crate::rules::catalog::{
+    CommandId, ENABLED_PHASES, Rule, SelectKind, Selector, Target, catalog,
+};
+use crate::rules::commands::{self, CommandCheck};
 use crate::rules::forbidden;
 use crate::scan::{FileCount, HARD_LINK_SHARDS, HardLinkSet, classify_file};
 use crate::win::process::ProcInfo;
@@ -141,7 +144,10 @@ pub struct Candidate {
     pub executable: bool,
 }
 
-/// 解析规则锚点：只返回实际存在的目录。适配器、命令、特殊和系统操作由后续任务实现，这里返回空。
+/// 解析规则锚点：只返回实际存在的目录。
+///
+/// 命令、适配器、特殊和系统操作没有可删除的锚点，返回空；命令类规则的
+/// 缓存路径单独由 `rules::commands` 查询，不参与按清单执行。
 pub fn resolve_anchors(rule: &Rule, roots: &RootMap) -> Vec<PathBuf> {
     match &rule.target {
         Target::Paths { root, rels, .. } => {
@@ -220,6 +226,11 @@ fn plain_dirs_below(start: &Path, rel: &str) -> bool {
 
 /// 评估一条规则。
 pub fn evaluate(rule: &Rule, roots: &RootMap, procs: &[ProcInfo], now: SystemTime) -> Candidate {
+    // 命令类规则不看目录，改成查工具和缓存路径，单独走一条评估。
+    if let Target::Command(id) = &rule.target {
+        return evaluate_command(rule, *id);
+    }
+
     let mut candidate = Candidate {
         rule_id: rule.id,
         status: CandidateStatus::NotPresent,
@@ -232,7 +243,7 @@ pub fn evaluate(rule: &Rule, roots: &RootMap, procs: &[ProcInfo], now: SystemTim
     // 这些目标的具体逻辑属于后续任务，现在只能报“阶段未开放”。
     if matches!(
         rule.target,
-        Target::Adapter(_) | Target::Command(_) | Target::Special(_) | Target::System(_)
+        Target::Adapter(_) | Target::Special(_) | Target::System(_)
     ) {
         candidate.status = CandidateStatus::PhaseLocked(rule.phase);
         return candidate;
@@ -275,6 +286,41 @@ pub fn evaluate(rule: &Rule, roots: &RootMap, procs: &[ProcInfo], now: SystemTim
     candidate.executable = matches!(rule.tier, Tier::Safe | Tier::Caution | Tier::Leftover)
         && ENABLED_PHASES.contains(&rule.phase)
         && candidate.status == CandidateStatus::Ready;
+
+    candidate
+}
+
+/// 命令类规则的评估：工具装没装、缓存在不在 C 盘、缓存多大。
+///
+/// 这里会启动工具查询缓存路径，正常几百毫秒；查询失败只让这条规则不可执行。
+fn evaluate_command(rule: &Rule, id: CommandId) -> Candidate {
+    let mut candidate = Candidate {
+        rule_id: rule.id,
+        status: CandidateStatus::NotPresent,
+        anchors: Vec::new(),
+        size: SizeInfo::default(),
+        samples: Vec::new(),
+        executable: false,
+    };
+
+    if !ENABLED_PHASES.contains(&rule.phase) {
+        candidate.status = CandidateStatus::PhaseLocked(rule.phase);
+        return candidate;
+    }
+
+    match commands::check(id) {
+        CommandCheck::NotPresent => candidate.status = CandidateStatus::NotPresent,
+        CommandCheck::Unusable(reason) => candidate.status = CandidateStatus::Insufficient(reason),
+        CommandCheck::Ready { paths, size } => {
+            candidate.anchors = paths;
+            candidate.size = size;
+            candidate.status = CandidateStatus::Ready;
+        }
+    }
+
+    // 阶段已经在上面确认过，这里只按分级和当前状态判断能不能执行。
+    candidate.executable = candidate.status == CandidateStatus::Ready
+        && matches!(rule.tier, Tier::Safe | Tier::Caution | Tier::Leftover);
 
     candidate
 }

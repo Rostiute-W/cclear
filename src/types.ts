@@ -97,6 +97,14 @@ export interface RuleInfo {
   processes: string[];
   warning: string | null;
   targetKind: TargetKind;
+  // 命令类规则的工具信息，其他规则为 null。
+  command: CommandInfo | null;
+}
+
+// 命令类规则调用的工具和二次确认要求，确认文案按它写。
+export interface CommandInfo {
+  tool: string;
+  needsSecondConfirm: boolean;
 }
 
 export interface CandidateInfo {
@@ -265,4 +273,26 @@ export interface PlanDetailRule {
 export interface RecycleBinInfo {
   items: number;
   bytes: number;
+}
+
+// 命令执行的进度。命令没有分项进度，只有开始和结束两个阶段。
+export interface CommandProgress {
+  stage: "running" | "done";
+}
+
+// 一次官方命令执行的结果。大小是命令执行前后的缓存占盘大小。
+export interface CommandReport {
+  ruleId: string;
+  // 退出码。命令没跑起来时为 null。
+  exitCode: number | null;
+  // 等待超时。超时后命令仍在运行，进程没有被终止。
+  timedOut: boolean;
+  logicalBefore: number;
+  allocatedBefore: number;
+  logicalAfter: number;
+  allocatedAfter: number;
+  // 命令输出末尾，失败时用来看原因。
+  output: string;
+  // 命令已执行但日志写入失败时的提示。
+  logError: string | null;
 }
