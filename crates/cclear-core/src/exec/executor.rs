@@ -217,7 +217,7 @@ impl ExecContext<'_> {
         };
 
         // 规则开始前重新查一次进程：预览之后应用可能又被打开了。
-        let running = running_required_processes(rule_id, (self.procs_now)());
+        let running = running_required_processes(plan_rule, (self.procs_now)());
         if !running.is_empty() {
             let reason = format!("相关程序正在运行：{}", running.join("、"));
             if !self.skip_rule(rule_id, &reason) {
@@ -480,14 +480,24 @@ fn delete_item(
 }
 
 /// 规则要求退出的进程里，当前正在运行的那些。
-fn running_required_processes(rule_id: &str, procs: Vec<ProcInfo>) -> Vec<&'static str> {
-    let Some(rule) = find(rule_id) else {
-        return Vec::new();
+///
+/// 进程名优先取清单里带过来的（迁移清理这类临时规则不在规则目录里），
+/// 清单没带时再按规则 ID 查规则目录。
+fn running_required_processes(plan_rule: &PlanRule, procs: Vec<ProcInfo>) -> Vec<String> {
+    let required: Vec<String> = if plan_rule.processes.is_empty() {
+        find(plan_rule.rule_id)
+            .map(|rule| rule.processes.iter().map(|name| name.to_string()).collect())
+            .unwrap_or_default()
+    } else {
+        plan_rule
+            .processes
+            .iter()
+            .map(|name| name.to_string())
+            .collect()
     };
 
-    rule.processes
-        .iter()
-        .copied()
+    required
+        .into_iter()
         .filter(|required| {
             procs
                 .iter()

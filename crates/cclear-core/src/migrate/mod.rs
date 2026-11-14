@@ -11,17 +11,18 @@ pub mod junction;
 pub mod tools;
 
 use std::ffi::OsString;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::exec::command::{resolve_tool, run, run_with_env};
 use crate::guard::{self, DirHandle, Forbidden, GuardError};
 use crate::journal::{JournalSink, Record, unix_now};
-use crate::model::Recovery;
+use crate::model::{KnownRoot, Recovery};
 use crate::plan::{FrozenPlan, build_plan_at};
 use crate::quarantine::copy_tree_verified;
 use crate::rules::commands::{output_text, parse_paths};
@@ -81,6 +82,15 @@ pub enum MigrateError {
 
     #[error("这个工具还没有迁移成功的记录，不能做这一步")]
     NotMigrated,
+
+    #[error("{0} 还有一次没有撤销的迁移记录（{1}），请先撤销再重新迁移")]
+    PendingMigration(String, &'static str),
+
+    #[error("{0} 无法查询自己的缓存位置，只支持“迁移旧缓存”，不能选“允许重建”")]
+    RebuildUnsupported(String),
+
+    #[error("旧缓存目录的位置不适合自动清理：{0}")]
+    BadOldPath(String),
 
     #[error("{0} 的缓存目录已经在这个位置，不需要再迁移")]
     AlreadyMigrated(String),
@@ -156,6 +166,8 @@ pub enum Stage {
     Cleaned,
     /// 已经撤销，恢复旧配置。
     Reverted,
+    /// 中断在需要人决定的位置，界面提供“撤销”让人重试恢复旧配置。
+    NeedsAttention,
 }
 
 impl Stage {
@@ -169,6 +181,7 @@ impl Stage {
             Stage::CleanupPlanned => "cleanupPlanned",
             Stage::Cleaned => "cleaned",
             Stage::Reverted => "reverted",
+            Stage::NeedsAttention => "needsAttention",
         }
     }
 
@@ -182,7 +195,21 @@ impl Stage {
             Stage::CleanupPlanned => "已生成旧目录清理清单",
             Stage::Cleaned => "旧目录已清理",
             Stage::Reverted => "已撤销，恢复旧配置",
+            Stage::NeedsAttention => "需要处理",
         }
+    }
+
+    /// 配置是否还停在已经改过、没有恢复的位置。
+    fn pending(self) -> bool {
+        matches!(
+            self,
+            Stage::Planned
+                | Stage::Configured
+                | Stage::Verified
+                | Stage::CleanupPlanned
+                | Stage::Cleaned
+                | Stage::NeedsAttention
+        )
     }
 }
 
@@ -261,27 +288,715 @@ impl ToolState {
     }
 }
 
+/// 用户级环境变量的读写。线上写注册表，测试用注入的内存表。
+///
+/// 只有环境变量类配置走这里；npm 的 npmrc 通过 npm 自己的命令读写，测试不会走到。
+pub trait EnvStore {
+    fn read(&self, name: &str) -> Option<String>;
+    fn write(&self, name: &str, value: &str) -> Result<(), String>;
+    fn delete(&self, name: &str) -> Result<(), String>;
+
+    /// 写完用户环境变量后广播一次，让之后新启动的进程读到新值。失败不影响配置本身。
+    fn broadcast(&self) {}
+}
+
+/// 线上的环境变量读写：用户级注册表。
+struct RegistryStore;
+
+impl EnvStore for RegistryStore {
+    fn read(&self, name: &str) -> Option<String> {
+        registry::read_env_string(name)
+    }
+
+    fn write(&self, name: &str, value: &str) -> Result<(), String> {
+        registry::write_env_string(name, value).map_err(|error| error.to_string())
+    }
+
+    fn delete(&self, name: &str) -> Result<(), String> {
+        registry::delete_env_string(name).map_err(|error| error.to_string())
+    }
+
+    fn broadcast(&self) {
+        let _ = registry::broadcast_environment_change();
+    }
+}
+
+/// 迁移流程依赖的外部环境：系统目录、候选卷、用户级配置和记录位置。
+///
+/// 线上用 [`Env::system`] 取真实环境；测试用 [`Env::for_test`] 把根目录、卷、配置读写
+/// 和记录目录都换成临时目录里的版本，既不会写真实注册表，也不会碰真实缓存。
+pub struct Env {
+    roots: RootMap,
+    volumes: Vec<VolumeInfo>,
+    /// 迁移记录所在目录。None 表示 `%LOCALAPPDATA%\CClear`。
+    store_dir: Option<PathBuf>,
+    store: Box<dyn EnvStore>,
+}
+
+impl Env {
+    /// 线上用法：真实 Known Folder、真实候选卷、注册表。
+    pub fn system() -> Result<Self, MigrateError> {
+        Ok(Self {
+            roots: root_map()?,
+            volumes: candidate_volumes(),
+            store_dir: None,
+            store: Box::new(RegistryStore),
+        })
+    }
+
+    /// 测试用法：记录文件放在 `dir` 下，卷和配置读写都由调用方注入。
+    pub fn for_test(
+        roots: RootMap,
+        dir: PathBuf,
+        volumes: Vec<VolumeInfo>,
+        store: Box<dyn EnvStore>,
+    ) -> Self {
+        Self {
+            roots,
+            volumes,
+            store_dir: Some(dir),
+            store,
+        }
+    }
+
+    /// 全部工具的状态，界面表格用它。
+    pub fn list(&self) -> Result<Vec<ToolState>, MigrateError> {
+        let migrations = self.load_all()?;
+        let procs = running_processes();
+
+        Ok(tools::all()
+            .iter()
+            .map(|spec| self.tool_state(spec, &migrations, &procs))
+            .collect())
+    }
+
+    /// 单个工具的详情。开始迁移之前界面用它拿最新的进程警告。
+    pub fn inspect(&self, tool: ToolId) -> Result<ToolState, MigrateError> {
+        let spec =
+            tools::spec(tool).ok_or_else(|| MigrateError::UnknownTool(tool.key().to_string()))?;
+        let migrations = self.load_all()?;
+        let procs = running_processes();
+
+        Ok(self.tool_state(spec, &migrations, &procs))
+    }
+
+    /// 开始迁移：记录旧配置 → 复制（可选）→ 写新配置 → 新进程验证。
+    ///
+    /// 验证不通过时自动恢复旧配置并返回错误，不会把工具留在一个“配置改了但没生效”的状态上。
+    pub fn start(
+        &self,
+        tool: ToolId,
+        volume_root: &str,
+        mode: Mode,
+        journal: &mut dyn JournalSink,
+    ) -> Result<Migration, MigrateError> {
+        let spec =
+            tools::spec(tool).ok_or_else(|| MigrateError::UnknownTool(tool.key().to_string()))?;
+
+        // 上一次迁移还没撤销时不能开始新的一次：既会覆盖旧值让用户撤不回去，
+        // 也会在两次复制之间留下说不清的状态。
+        if let Some(existing) = self.load_one(tool.key())?
+            && existing.stage.pending()
+        {
+            return Err(MigrateError::PendingMigration(
+                spec.label.to_string(),
+                existing.stage.label(),
+            ));
+        }
+
+        if mode == Mode::Rebuild && !spec.supports_rebuild {
+            return Err(MigrateError::RebuildUnsupported(spec.label.to_string()));
+        }
+
+        let volume = self
+            .volumes
+            .iter()
+            .find(|info| equals_ignore_case(&info.root.to_string_lossy(), volume_root))
+            .ok_or_else(|| MigrateError::BadVolume(volume_root.to_string()))?;
+        let base = volume.root.join(DATA_DIR_NAME);
+
+        // 要改配置就得先找到工具：npm 用命令写 npmrc，其余工具用命令验证新位置。
+        // 找不到工具就别动配置，否则改完没法验证，等于把用户丢在不确定的状态里。
+        if needs_program(spec) && resolve_tool(spec.program).is_none() {
+            return Err(MigrateError::MissingTool(spec.program.to_string()));
+        }
+
+        let current: Vec<(PathBuf, String)> = spec
+            .entries
+            .iter()
+            .map(|entry| self.current_path(spec, entry))
+            .collect();
+
+        // 所有配置项都已经指向目标目录时没有任何可迁移的内容。
+        // 这一条必须在写记录之前：否则会把正在使用的缓存目录记成“旧目录”，
+        // 之后的清理清单就会直接指向当前生效的缓存。
+        let already_there = spec
+            .entries
+            .iter()
+            .enumerate()
+            .all(|(index, entry)| same_dir(&current[index].0, &target_of(&base, entry)));
+        if already_there {
+            return Err(MigrateError::AlreadyMigrated(spec.label.to_string()));
+        }
+
+        // 清理清单是按锚点整棵枚举的：旧目录选成盘符根、用户目录或新缓存目录本身，
+        // 清单就会指向系统目录或活的缓存，所以这类路径一律不允许迁移。
+        for (path, _) in &current {
+            if let Some(reason) = self.overbroad_reason(path, &base) {
+                return Err(MigrateError::BadOldPath(reason));
+            }
+        }
+
+        // 旧值里带 %VAR% 的配置写回去会变成字面量（REG_SZ 不再展开），
+        // 这种情况宁可不迁移，也不能留下一个撤不干净的配置。
+        let old_values: Vec<OldValue> = spec
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| self.old_value(entry, &current[index]))
+            .collect();
+        let expandable = expanded_names(&old_values);
+        if !expandable.is_empty() {
+            return Err(MigrateError::ExpandableConfig(expandable.join("、")));
+        }
+
+        let mut migration = Migration {
+            tool: tool.key().to_string(),
+            stage: Stage::Planned,
+            mode,
+            volume_root: volume.root.to_string_lossy().into_owned(),
+            target: base.to_string_lossy().into_owned(),
+            old_paths: current
+                .iter()
+                .map(|(path, _)| path.to_string_lossy().into_owned())
+                .collect(),
+            old_values,
+            note: "已记录旧配置".to_string(),
+            updated_at: unix_now(),
+        };
+
+        // 复制阶段配置还没改：失败只影响这次迁移，现有配置和上一次的记录都不动。
+        if mode == Mode::Migrate {
+            for (index, entry) in spec.entries.iter().enumerate() {
+                let target = target_of(&base, entry);
+                let (old, _) = &current[index];
+                copy_cache(old, &target).map_err(|error| {
+                    MigrateError::Copy(format!("{}：{error}", target.display()))
+                })?;
+            }
+        } else {
+            for entry in spec.entries {
+                std::fs::create_dir_all(target_of(&base, entry))?;
+            }
+        }
+
+        // 复制完成之后、写配置之前才落盘旧值：复制失败时不能把上一次的迁移记录
+        // 覆盖成“已记录旧配置”，否则用户就看不到之前那次的有效状态了。
+        self.save(&migration)?;
+        write_log(journal, &migration)?;
+
+        // 写配置。写失败就把已经写进去的恢复掉，不留下半套配置。
+        if let Err(error) = self.write_config(spec, &base) {
+            let restored = self.restore(spec, &migration.old_values);
+            migration.stage = if restored.is_ok() {
+                Stage::Failed
+            } else {
+                Stage::NeedsAttention
+            };
+            migration.note = failure_note("写新配置失败", &error.to_string(), &restored);
+            self.record_failure(&migration, journal);
+            return Err(error);
+        }
+
+        migration.stage = Stage::Configured;
+        migration.note = "已写入新配置，正在验证".to_string();
+        self.save(&migration)?;
+        write_log(journal, &migration)?;
+
+        // 验证：另起一个进程，环境块是当前环境加新变量。
+        match verify(spec, &base) {
+            Ok(()) => {
+                migration.stage = Stage::Verified;
+                migration.note = format!(
+                    "新缓存位置已经生效：{}。请重启 IDE 和终端，旧目录可以在你确认后单独清理",
+                    base.display()
+                );
+                self.save(&migration)?;
+                write_log(journal, &migration)?;
+                Ok(migration)
+            }
+            Err(error) => {
+                let restored = self.restore(spec, &migration.old_values);
+                migration.stage = if restored.is_ok() {
+                    Stage::Failed
+                } else {
+                    Stage::NeedsAttention
+                };
+                migration.note = failure_note("验证失败", &error.to_string(), &restored);
+                self.record_failure(&migration, journal);
+                Err(error)
+            }
+        }
+    }
+
+    /// 为清理旧缓存目录生成冻结清单。
+    ///
+    /// 这里只生成清单：真正的删除由用户在预览页确认后交给执行器，按清单逐项复核。
+    /// 旧目录本身会留成一个空目录。
+    pub fn cleanup_plan(
+        &self,
+        tool: ToolId,
+        journal: &mut dyn JournalSink,
+    ) -> Result<FrozenPlan, MigrateError> {
+        let spec =
+            tools::spec(tool).ok_or_else(|| MigrateError::UnknownTool(tool.key().to_string()))?;
+        let mut migration = self
+            .load_one(tool.key())?
+            .ok_or(MigrateError::NotMigrated)?;
+
+        // 只有验证成功过的工具才有“可以清理的旧目录”。
+        if !matches!(
+            migration.stage,
+            Stage::Verified | Stage::CleanupPlanned | Stage::Cleaned
+        ) {
+            return Err(MigrateError::NotMigrated);
+        }
+
+        let forbidden = Forbidden::from_rules(&self.roots);
+        let current = self.current_paths(spec);
+        let base = PathBuf::from(&migration.target);
+
+        // 正在使用的目录（当前生效目录、目标目录）以及它们的上级和下级都不算旧目录：
+        // 清单会整棵枚举锚点，锚点选到上级就会指向活的缓存。
+        // 盘符根和 Known Folder 也要再挡一次：记录可能是旧版本写下的。
+        let anchors: Vec<PathBuf> = migration
+            .old_paths
+            .iter()
+            .map(PathBuf::from)
+            .filter(|path| dirinfo::is_plain_dir(path))
+            .filter(|path| !in_use(path, spec, &migration, &current))
+            .filter(|path| self.overbroad_reason(path, &base).is_none())
+            .collect();
+
+        let mut plan = build_plan_at(
+            OLD_CACHE_RULE_ID,
+            Recovery::IrreversibleFile,
+            &anchors,
+            &forbidden,
+            &running_processes(),
+            SystemTime::now(),
+        );
+        // 清单带上这个工具的进程名：执行器执行前会再查一遍，进程还在就不再往下删。
+        for rule in &mut plan.rules {
+            rule.processes = spec.processes.to_vec();
+        }
+
+        if plan.items.is_empty() {
+            // 把清单构建时记下的原因带出去：读不到目录、路径里出现链接都会让清单为空。
+            let reason = plan
+                .rules
+                .first()
+                .and_then(|rule| rule.skipped_at_build.first())
+                .map(|(path, reason)| format!("{}：{reason}", path.display()))
+                .unwrap_or_else(|| "旧目录可能已经被清理过".to_string());
+
+            return Err(MigrateError::NothingToClean(reason));
+        }
+
+        let count = plan.items.len();
+        migration.stage = Stage::CleanupPlanned;
+        migration.note = format!("已生成旧缓存清理清单，共 {count} 个条目，确认后才会删除");
+        migration.updated_at = unix_now();
+        self.save(&migration)?;
+        write_log(journal, &migration)?;
+
+        Ok(plan)
+    }
+
+    /// 撤销：恢复旧配置。旧目录已经清理掉的工具会自己重建缓存。
+    pub fn revert(
+        &self,
+        tool: ToolId,
+        journal: &mut dyn JournalSink,
+    ) -> Result<Migration, MigrateError> {
+        let spec =
+            tools::spec(tool).ok_or_else(|| MigrateError::UnknownTool(tool.key().to_string()))?;
+        let mut migration = self
+            .load_one(tool.key())?
+            .ok_or(MigrateError::NotMigrated)?;
+
+        // 记录里的旧值就够恢复了：留空的项表示原来没有这个配置，恢复时删掉。
+        // 中断在 Planned/Configured/Failed 时也一样，配置要么没写、要么已经恢复过。
+        self.restore(spec, &migration.old_values)?;
+
+        migration.stage = Stage::Reverted;
+        migration.note = "已恢复旧配置；旧缓存目录已经清理的工具会自己重建缓存".to_string();
+        migration.updated_at = unix_now();
+        self.save(&migration)?;
+        write_log(journal, &migration)?;
+
+        Ok(migration)
+    }
+
+    /// 启动时把验证之前被中断的迁移收尾：恢复旧配置，并记下结果。
+    ///
+    /// 单条记录失败只影响它自己：记成 `NeedsAttention`，界面上仍然保留撤销按钮。
+    pub fn recover_tools(
+        &self,
+        journal: &mut dyn JournalSink,
+    ) -> Result<Vec<Migration>, MigrateError> {
+        let mut recovered = Vec::new();
+
+        for mut migration in self.load_all()? {
+            if !matches!(migration.stage, Stage::Planned | Stage::Configured) {
+                continue;
+            }
+
+            let Some(spec) = ToolId::parse(&migration.tool).and_then(tools::spec) else {
+                continue;
+            };
+
+            match self.restore(spec, &migration.old_values) {
+                Ok(()) => {
+                    migration.stage = Stage::Failed;
+                    migration.note = "上次迁移在验证前被中断，已恢复原配置".to_string();
+                }
+                Err(error) => {
+                    migration.stage = Stage::NeedsAttention;
+                    migration.note = format!(
+                        "上次迁移在验证前被中断，恢复原配置失败，请手工检查，也可以点“撤销”重试：{error}"
+                    );
+                }
+            }
+            migration.updated_at = unix_now();
+
+            // 保存失败不能报成“已恢复”：把错误写进说明，调用方会把它显示在迁移页。
+            if let Err(error) = self.save(&migration) {
+                migration.note = format!(
+                    "{}；但这条结果没能写回迁移记录（下次启动可能还会再恢复一次）：{error}",
+                    migration.note
+                );
+            } else {
+                // 日志写失败不影响已经恢复好的配置，不再额外打扰用户。
+                let _ = write_log(journal, &migration);
+            }
+            recovered.push(migration);
+        }
+
+        Ok(recovered)
+    }
+
+    /// 按工具汇总当前状态。
+    fn tool_state(
+        &self,
+        spec: &'static ToolSpec,
+        migrations: &[Migration],
+        procs: &[ProcInfo],
+    ) -> ToolState {
+        let entries: Vec<EntryState> = spec
+            .entries
+            .iter()
+            .map(|entry| self.entry_state(spec, entry))
+            .collect();
+
+        let migration = migrations
+            .iter()
+            .find(|migration| migration.tool == spec.id.key())
+            .cloned();
+
+        // 旧目录只在迁移成功过之后才谈得上清理。
+        let cleanup_allowed = migration.as_ref().is_some_and(|migration| {
+            matches!(
+                migration.stage,
+                Stage::Verified | Stage::CleanupPlanned | Stage::Cleaned
+            )
+        });
+        let current: Vec<PathBuf> = entries.iter().map(|entry| entry.path.clone()).collect();
+        let base = migration
+            .as_ref()
+            .map(|migration| PathBuf::from(&migration.target));
+        let old_dirs = match (&migration, &base, cleanup_allowed) {
+            (Some(migration), Some(base), true) => migration
+                .old_paths
+                .iter()
+                .map(PathBuf::from)
+                .filter(|path| dirinfo::is_plain_dir(path))
+                // 空目录已经没有可清理的内容：清理计划会把旧目录留成空目录，
+                // 只看“目录还在”会让界面一直停在“已生成清理清单”。
+                .filter(|path| has_entries(path))
+                // 正在使用的目录绝不能当成旧目录，否则清理就是在删活的缓存。
+                .filter(|path| !in_use(path, spec, migration, &current))
+                // 盘符根和 Known Folder 也不能出现在清理按钮后面。
+                .filter(|path| self.overbroad_reason(path, base).is_none())
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        ToolState {
+            spec,
+            total_size: entries.iter().map(|entry| entry.size).sum(),
+            on_system_drive: entries.iter().any(|entry| entry.on_system_drive),
+            installed: resolve_tool(spec.program).is_some(),
+            running: spec
+                .processes
+                .iter()
+                .copied()
+                .filter(|name| {
+                    procs
+                        .iter()
+                        .any(|proc| equals_ignore_case(&proc.name, name))
+                })
+                .collect(),
+            entries,
+            migration,
+            old_dirs,
+        }
+    }
+
+    /// 各配置项当前生效的路径。
+    fn current_paths(&self, spec: &ToolSpec) -> Vec<PathBuf> {
+        spec.entries
+            .iter()
+            .map(|entry| self.current_path(spec, entry).0)
+            .collect()
+    }
+
+    /// 一项配置的当前状态。
+    fn entry_state(&self, spec: &ToolSpec, entry: &CacheEntry) -> EntryState {
+        let (path, source) = self.current_path(spec, entry);
+        let exists = dirinfo::is_plain_dir(&path);
+
+        EntryState {
+            name: config_name(entry).to_string(),
+            // 目录不存在就不去枚举它：不存在的路径统计出来只会是 0，白跑一趟。
+            size: if exists {
+                measure_paths(std::slice::from_ref(&path)).allocated
+            } else {
+                0
+            },
+            on_system_drive: on_system_drive(&path),
+            path,
+            source,
+            exists,
+        }
+    }
+
+    /// 当前生效的路径和它的来源。
+    fn current_path(&self, spec: &ToolSpec, entry: &CacheEntry) -> (PathBuf, String) {
+        let default = default_path(entry, &self.roots);
+
+        let Some(var) = entry.env_var else {
+            return self.npm_cache_dir(spec, default);
+        };
+
+        if let Some(text) = self.store.read(var) {
+            return (PathBuf::from(text), SOURCE_ENV.to_string());
+        }
+        // 注册表里没有、本进程里有：多半是这次会话里临时设的，重启后就不生效了。
+        if let Some(text) = std::env::var_os(var) {
+            return (PathBuf::from(text), SOURCE_PROCESS_ENV.to_string());
+        }
+
+        (default, SOURCE_DEFAULT.to_string())
+    }
+
+    /// npm 的缓存位置在用户级 npmrc 里，只能问 npm 本身。
+    fn npm_cache_dir(&self, spec: &ToolSpec, default: PathBuf) -> (PathBuf, String) {
+        let Some(tool) = resolve_tool(spec.program) else {
+            return (default, format!("{SOURCE_DEFAULT}（没有找到 npm）"));
+        };
+
+        let outcome = run(&tool, &["config", "get", "cache"], COMMAND_TIMEOUT);
+        if outcome.timed_out || outcome.exit_code != Some(0) {
+            return (
+                default,
+                format!(
+                    "{SOURCE_DEFAULT}（读取 npm 配置失败：{}）",
+                    output_text(&outcome)
+                ),
+            );
+        }
+
+        let Some(path) = parse_paths(&outcome.stdout_tail).into_iter().next() else {
+            return (
+                default,
+                format!("{SOURCE_DEFAULT}（没有从 npm 读到缓存路径）"),
+            );
+        };
+
+        if equals_ignore_case(&path.to_string_lossy(), &default.to_string_lossy()) {
+            return (path, SOURCE_DEFAULT.to_string());
+        }
+        // npm 先看环境变量 npm_config_cache，再读 npmrc。
+        let from_env = self.store.read("npm_config_cache").is_some()
+            || std::env::var_os("npm_config_cache").is_some();
+        if from_env {
+            return (path, SOURCE_ENV.to_string());
+        }
+
+        (path, SOURCE_NPMRC.to_string())
+    }
+
+    /// 写配置之前记下旧值。
+    fn old_value(&self, entry: &CacheEntry, current: &(PathBuf, String)) -> OldValue {
+        let value = match entry.env_var {
+            Some(var) => self.store.read(var),
+            // npm 的旧配置在 npmrc 里：和默认值不同才算“原来有配置”，撤销时要写回去。
+            None => match current.1.as_str() {
+                SOURCE_NPMRC => Some(current.0.to_string_lossy().into_owned()),
+                _ => None,
+            },
+        };
+
+        OldValue {
+            name: config_name(entry).to_string(),
+            value,
+        }
+    }
+
+    /// 旧路径是不是范围太宽。返回原因表示这条路径不能作为清理旧目录的锚点。
+    ///
+    /// `base` 是新缓存目录的根（`<卷>:\CClearData`）：清理清单按锚点整棵枚举，
+    /// 锚点选成盘符根、系统目录或与它重叠时，清单会指向整个盘或正在使用的缓存。
+    fn overbroad_reason(&self, old: &Path, base: &Path) -> Option<String> {
+        if is_drive_root(old) {
+            return Some(format!("{} 是盘符根目录，清理会指向整个盘", old.display()));
+        }
+
+        for known in self.known_paths() {
+            if same_path(old, &known) || is_under(&known, old) {
+                return Some(format!(
+                    "{} 是系统目录 {} 本身或它的上级目录",
+                    old.display(),
+                    known.display()
+                ));
+            }
+        }
+
+        // 与 `<卷>:\CClearData` 重叠：它本身、它的上级和它下面的路径都不是旧目录。
+        // 目标盘上的其他目录（例如 `D:\dev\uv-cache`）不受影响。
+        if overlaps(old, base) {
+            return Some(format!("{} 与新的缓存目录重叠", old.display()));
+        }
+
+        None
+    }
+
+    /// 需要避开的系统目录。盘符根由 [`is_drive_root`] 单独判断。
+    fn known_paths(&self) -> Vec<PathBuf> {
+        [
+            KnownRoot::Profile,
+            KnownRoot::LocalAppData,
+            KnownRoot::RoamingAppData,
+            KnownRoot::Documents,
+            KnownRoot::Downloads,
+            KnownRoot::ProgramData,
+            KnownRoot::Windows,
+            KnownRoot::SystemDrive,
+        ]
+        .into_iter()
+        .filter_map(|root| self.roots.get(root).map(Path::to_path_buf))
+        .collect()
+    }
+
+    /// 写入新配置。用户环境变量写完广播一次，让之后新启动的进程能读到。
+    fn write_config(&self, spec: &ToolSpec, base: &Path) -> Result<(), MigrateError> {
+        for entry in spec.entries {
+            let target = target_of(base, entry);
+
+            match entry.env_var {
+                Some(var) => {
+                    self.store
+                        .write(var, &target.to_string_lossy())
+                        .map_err(|error| {
+                            MigrateError::Io(io::Error::other(format!(
+                                "写环境变量 {var} 失败：{error}"
+                            )))
+                        })?;
+                }
+                None => set_npm_cache(spec, &target)?,
+            }
+        }
+
+        if spec.entries.iter().any(|entry| entry.env_var.is_some()) {
+            self.store.broadcast();
+        }
+
+        Ok(())
+    }
+
+    /// 恢复旧配置。撤销、验证失败和启动恢复都走这里。
+    fn restore(&self, spec: &ToolSpec, old_values: &[OldValue]) -> Result<(), MigrateError> {
+        let mut failures: Vec<String> = Vec::new();
+
+        for entry in spec.entries.iter().rev() {
+            let name = config_name(entry);
+            let Some(old) = old_values.iter().find(|value| value.name == name) else {
+                continue;
+            };
+
+            let result = match entry.env_var {
+                Some(var) => match &old.value {
+                    Some(text) => self.store.write(var, text),
+                    // 旧值为空表示原来没有这个变量，恢复时把它删掉。
+                    None => self.store.delete(var),
+                },
+                None => restore_npm_cache(spec, old.value.as_deref()),
+            };
+
+            if let Err(reason) = result {
+                failures.push(format!("{name}：{reason}"));
+            }
+        }
+
+        if spec.entries.iter().any(|entry| entry.env_var.is_some()) {
+            self.store.broadcast();
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(MigrateError::RestoreFailed(failures.join("；")))
+        }
+    }
+
+    /// 失败状态也要落盘和记日志，但保存失败不能再盖掉真正的错误。
+    fn record_failure(&self, migration: &Migration, journal: &mut dyn JournalSink) {
+        let _ = self.save(migration);
+        let _ = write_log(journal, migration);
+    }
+
+    fn load_all(&self) -> Result<Vec<Migration>, MigrateError> {
+        Ok(self.load_store()?.tools)
+    }
+
+    /// 读一个工具的迁移记录。
+    fn load_one(&self, tool: &str) -> Result<Option<Migration>, MigrateError> {
+        Ok(self.load_all()?.into_iter().find(|item| item.tool == tool))
+    }
+
+    /// 保存一个工具的迁移记录，其他工具和目录迁移的记录原样保留。
+    fn save(&self, migration: &Migration) -> Result<(), MigrateError> {
+        let mut store = self.load_store()?;
+        store.tools.retain(|item| item.tool != migration.tool);
+        store.tools.push(migration.clone());
+
+        save_store(self.store_dir.as_deref(), &store)
+    }
+
+    fn load_store(&self) -> Result<Store, MigrateError> {
+        load_store(self.store_dir.as_deref())
+    }
+}
+
 /// 全部工具的状态，界面表格用它。
 pub fn list() -> Result<Vec<ToolState>, MigrateError> {
-    let roots = root_map()?;
-    let migrations = load_all()?;
-    let procs = running_processes();
-
-    Ok(tools::all()
-        .iter()
-        .map(|spec| tool_state(spec, &migrations, &procs, &roots))
-        .collect())
+    Env::system()?.list()
 }
 
 /// 单个工具的详情。开始迁移之前界面用它拿最新的进程警告。
 pub fn inspect(tool: ToolId) -> Result<ToolState, MigrateError> {
-    let spec =
-        tools::spec(tool).ok_or_else(|| MigrateError::UnknownTool(tool.key().to_string()))?;
-    let roots = root_map()?;
-    let migrations = load_all()?;
-    let procs = running_processes();
-
-    Ok(tool_state(spec, &migrations, &procs, &roots))
+    Env::system()?.inspect(tool)
 }
 
 /// 可以作为缓存盘的目标卷：本地固定 NTFS 盘，排除系统盘。
@@ -297,275 +1012,40 @@ pub fn candidate_volumes() -> Vec<VolumeInfo> {
     volumes
 }
 
-/// 开始迁移：记录旧配置 → 复制（可选）→ 写新配置 → 新进程验证。
-///
-/// 验证不通过时自动恢复旧配置并返回错误，不会把工具留在一个“配置改了但没生效”的状态上。
+/// 开始迁移。验证不通过时自动恢复旧配置并返回错误。
 pub fn start(
     tool: ToolId,
     volume_root: &str,
     mode: Mode,
     journal: &mut dyn JournalSink,
 ) -> Result<Migration, MigrateError> {
-    let spec =
-        tools::spec(tool).ok_or_else(|| MigrateError::UnknownTool(tool.key().to_string()))?;
-    let roots = root_map()?;
-
-    let volume = candidate_volumes()
-        .into_iter()
-        .find(|info| equals_ignore_case(&info.root.to_string_lossy(), volume_root))
-        .ok_or_else(|| MigrateError::BadVolume(volume_root.to_string()))?;
-    let base = volume.root.join(DATA_DIR_NAME);
-
-    // 要改配置就得先找到工具：npm 用命令写 npmrc，其余工具用命令验证新位置。
-    // 找不到工具就别动配置，否则改完没法验证，等于把用户丢在不确定的状态里。
-    if needs_program(spec) && resolve_tool(spec.program).is_none() {
-        return Err(MigrateError::MissingTool(spec.program.to_string()));
-    }
-
-    let current: Vec<(PathBuf, String)> = spec
-        .entries
-        .iter()
-        .map(|entry| current_path(spec, entry, &roots))
-        .collect();
-
-    // 所有配置项都已经指向目标目录时没有任何可迁移的内容。
-    // 这一条必须在写记录之前：否则会把正在使用的缓存目录记成“旧目录”，
-    // 之后的清理清单就会直接指向当前生效的缓存。
-    let already_there = spec
-        .entries
-        .iter()
-        .enumerate()
-        .all(|(index, entry)| same_dir(&current[index].0, &target_of(&base, entry)));
-    if already_there {
-        return Err(MigrateError::AlreadyMigrated(spec.label.to_string()));
-    }
-
-    // 旧值里带 %VAR% 的配置写回去会变成字面量（REG_SZ 不再展开），
-    // 这种情况宁可不迁移，也不能留下一个撤不干净的配置。
-    let old_values: Vec<OldValue> = spec
-        .entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| old_value(entry, &current[index]))
-        .collect();
-    let expandable = expanded_names(&old_values);
-    if !expandable.is_empty() {
-        return Err(MigrateError::ExpandableConfig(expandable.join("、")));
-    }
-
-    let mut migration = Migration {
-        tool: tool.key().to_string(),
-        stage: Stage::Planned,
-        mode,
-        volume_root: volume.root.to_string_lossy().into_owned(),
-        target: base.to_string_lossy().into_owned(),
-        old_paths: current
-            .iter()
-            .map(|(path, _)| path.to_string_lossy().into_owned())
-            .collect(),
-        old_values,
-        note: "已记录旧配置".to_string(),
-        updated_at: unix_now(),
-    };
-
-    // 复制阶段配置还没改：失败只影响这次迁移，现有配置和上一次的记录都不动。
-    if mode == Mode::Migrate {
-        for (index, entry) in spec.entries.iter().enumerate() {
-            let target = target_of(&base, entry);
-            let (old, _) = &current[index];
-            copy_cache(old, &target)
-                .map_err(|error| MigrateError::Copy(format!("{}：{error}", target.display())))?;
-        }
-    } else {
-        for entry in spec.entries {
-            std::fs::create_dir_all(target_of(&base, entry))?;
-        }
-    }
-
-    // 复制完成之后、写配置之前才落盘旧值：复制失败时不能把上一次的迁移记录
-    // 覆盖成“已记录旧配置”，否则用户就看不到之前那次的有效状态了。
-    save(&migration)?;
-    write_log(journal, &migration)?;
-
-    // 写配置。写失败就把已经写进去的恢复掉，不留下半套配置。
-    if let Err(error) = write_config(spec, &base) {
-        let restored = restore(spec, &migration.old_values);
-        migration.stage = Stage::Failed;
-        migration.note = failure_note("写新配置失败", &error.to_string(), &restored);
-        record_failure(&migration, journal);
-        return Err(error);
-    }
-
-    migration.stage = Stage::Configured;
-    migration.note = "已写入新配置，正在验证".to_string();
-    save(&migration)?;
-    write_log(journal, &migration)?;
-
-    // 验证：另起一个进程，环境块是当前环境加新变量。
-    match verify(spec, &base) {
-        Ok(()) => {
-            migration.stage = Stage::Verified;
-            migration.note = format!(
-                "新缓存位置已经生效：{}。请重启 IDE 和终端，旧目录可以在你确认后单独清理",
-                base.display()
-            );
-            save(&migration)?;
-            write_log(journal, &migration)?;
-            Ok(migration)
-        }
-        Err(error) => {
-            let restored = restore(spec, &migration.old_values);
-            migration.stage = Stage::Failed;
-            migration.note = failure_note("验证失败", &error.to_string(), &restored);
-            record_failure(&migration, journal);
-            Err(error)
-        }
-    }
+    Env::system()?.start(tool, volume_root, mode, journal)
 }
 
 /// 为清理旧缓存目录生成冻结清单。
-///
-/// 这里只生成清单：真正的删除由用户在预览页确认后交给执行器，按清单逐项复核。
-/// 旧目录本身会留成一个空目录。
 pub fn cleanup_plan(
     tool: ToolId,
     journal: &mut dyn JournalSink,
 ) -> Result<FrozenPlan, MigrateError> {
-    let spec =
-        tools::spec(tool).ok_or_else(|| MigrateError::UnknownTool(tool.key().to_string()))?;
-    let mut migration = load_one(tool.key())?.ok_or(MigrateError::NotMigrated)?;
-
-    // 只有验证成功过的工具才有“可以清理的旧目录”。
-    if !matches!(
-        migration.stage,
-        Stage::Verified | Stage::CleanupPlanned | Stage::Cleaned
-    ) {
-        return Err(MigrateError::NotMigrated);
-    }
-
-    let roots = root_map()?;
-    let forbidden = Forbidden::from_rules(&roots);
-    let current = current_paths(spec, &roots);
-
-    // 正在使用的目录（当前生效目录和目标目录）一律不算旧目录，否则清单会指向活的缓存。
-    let anchors: Vec<PathBuf> = migration
-        .old_paths
-        .iter()
-        .map(PathBuf::from)
-        .filter(|path| dirinfo::is_plain_dir(path))
-        .filter(|path| !in_use(path, spec, &migration, &current))
-        .collect();
-
-    let plan = build_plan_at(
-        OLD_CACHE_RULE_ID,
-        Recovery::IrreversibleFile,
-        &anchors,
-        &forbidden,
-        &running_processes(),
-        SystemTime::now(),
-    );
-    if plan.items.is_empty() {
-        // 把清单构建时记下的原因带出去：读不到目录、路径里出现链接都会让清单为空。
-        let reason = plan
-            .rules
-            .first()
-            .and_then(|rule| rule.skipped_at_build.first())
-            .map(|(path, reason)| format!("{}：{reason}", path.display()))
-            .unwrap_or_else(|| "旧目录可能已经被清理过".to_string());
-
-        return Err(MigrateError::NothingToClean(reason));
-    }
-
-    let count = plan.items.len();
-    migration.stage = Stage::CleanupPlanned;
-    migration.note = format!("已生成旧缓存清理清单，共 {count} 个条目，确认后才会删除");
-    migration.updated_at = unix_now();
-    save(&migration)?;
-    write_log(journal, &migration)?;
-
-    Ok(plan)
+    Env::system()?.cleanup_plan(tool, journal)
 }
 
-/// 撤销：恢复旧配置。旧目录已经清理掉的工具会自己重建缓存。
+/// 撤销：恢复旧配置。
 pub fn revert(tool: ToolId, journal: &mut dyn JournalSink) -> Result<Migration, MigrateError> {
-    let spec =
-        tools::spec(tool).ok_or_else(|| MigrateError::UnknownTool(tool.key().to_string()))?;
-    let mut migration = load_one(tool.key())?.ok_or(MigrateError::NotMigrated)?;
-
-    restore(spec, &migration.old_values)?;
-
-    migration.stage = Stage::Reverted;
-    migration.note = "已恢复旧配置；旧缓存目录已经清理的工具会自己重建缓存".to_string();
-    migration.updated_at = unix_now();
-    save(&migration)?;
-    write_log(journal, &migration)?;
-
-    Ok(migration)
+    Env::system()?.revert(tool, journal)
 }
 
-/// 按工具汇总当前状态。
-fn tool_state(
-    spec: &'static ToolSpec,
-    migrations: &[Migration],
-    procs: &[ProcInfo],
-    roots: &RootMap,
-) -> ToolState {
-    let entries: Vec<EntryState> = spec
-        .entries
-        .iter()
-        .map(|entry| entry_state(spec, entry, roots))
-        .collect();
-
-    let migration = migrations
-        .iter()
-        .find(|migration| migration.tool == spec.id.key())
-        .cloned();
-
-    // 旧目录只在迁移成功过之后才谈得上清理。
-    let cleanup_allowed = migration.as_ref().is_some_and(|migration| {
-        matches!(
-            migration.stage,
-            Stage::Verified | Stage::CleanupPlanned | Stage::Cleaned
-        )
-    });
-    let current: Vec<PathBuf> = entries.iter().map(|entry| entry.path.clone()).collect();
-    let old_dirs = match (&migration, cleanup_allowed) {
-        (Some(migration), true) => migration
-            .old_paths
-            .iter()
-            .map(PathBuf::from)
-            .filter(|path| dirinfo::is_plain_dir(path))
-            // 空目录已经没有可清理的内容：清理计划会把旧目录留成空目录，
-            // 只看“目录还在”会让界面一直停在“已生成清理清单”。
-            .filter(|path| has_entries(path))
-            // 正在使用的目录绝不能当成旧目录，否则清理就是在删活的缓存。
-            .filter(|path| !in_use(path, spec, migration, &current))
-            .collect(),
-        _ => Vec::new(),
-    };
-
-    ToolState {
-        spec,
-        total_size: entries.iter().map(|entry| entry.size).sum(),
-        on_system_drive: entries.iter().any(|entry| entry.on_system_drive),
-        installed: resolve_tool(spec.program).is_some(),
-        running: spec
-            .processes
-            .iter()
-            .copied()
-            .filter(|name| {
-                procs
-                    .iter()
-                    .any(|proc| equals_ignore_case(&proc.name, name))
-            })
-            .collect(),
-        entries,
-        migration,
-        old_dirs,
-    }
+/// 启动恢复：把验证之前被中断的工具迁移收尾。
+pub fn recover_tools(journal: &mut dyn JournalSink) -> Result<Vec<Migration>, MigrateError> {
+    Env::system()?.recover_tools(journal)
 }
 
-/// 目录里是否还有条目。清理计划只删目录内的条目，旧目录会留成空目录，
+/// 最近一次读迁移记录时的提示：主文件坏掉而退回备份时，界面要能看见。
+pub fn store_notice() -> Option<String> {
+    load_store(None).ok().and_then(|store| store.notice)
+}
+
+/// 目录名是否还有条目。清理计划只删目录内的条目，旧目录会留成空目录，
 /// 空目录就等于“已经清理过”，界面上不该再提供清理按钮。
 fn has_entries(path: &Path) -> bool {
     let forbidden = Forbidden::empty();
@@ -581,99 +1061,92 @@ fn has_entries(path: &Path) -> bool {
     }
 }
 
-/// 这个路径是不是正在使用的缓存目录：当前生效目录，或者记录里的目标目录。
+/// 这个路径是不是正在使用的缓存目录：当前生效目录、记录里的目标目录，
+/// 以及它们的上级和下级。
 fn in_use(path: &Path, spec: &ToolSpec, migration: &Migration, current: &[PathBuf]) -> bool {
     let target = PathBuf::from(&migration.target);
 
-    current.iter().any(|known| same_dir(known, path))
-        || spec
-            .entries
-            .iter()
-            .any(|entry| same_dir(&target_of(&target, entry), path))
-}
-
-/// 各配置项当前生效的路径。
-fn current_paths(spec: &ToolSpec, roots: &RootMap) -> Vec<PathBuf> {
-    spec.entries
+    let live = current
         .iter()
-        .map(|entry| current_path(spec, entry, roots).0)
-        .collect()
+        .cloned()
+        .chain(std::iter::once(target.clone()))
+        .chain(spec.entries.iter().map(|entry| target_of(&target, entry)));
+
+    live.into_iter().any(|known| overlaps(path, &known))
 }
 
-/// 一项配置的当前状态。
-fn entry_state(spec: &ToolSpec, entry: &CacheEntry, roots: &RootMap) -> EntryState {
-    let (path, source) = current_path(spec, entry, roots);
-    let exists = dirinfo::is_plain_dir(&path);
+/// 两个路径是否重叠：相同、其中一个在另一个下面。逐组件比较，不区分大小写。
+fn overlaps(left: &Path, right: &Path) -> bool {
+    same_or_under(left, right) || same_or_under(right, left)
+}
 
-    EntryState {
-        name: config_name(entry).to_string(),
-        // 目录不存在就不去枚举它：不存在的路径统计出来只会是 0，白跑一趟。
-        size: if exists {
-            measure_paths(std::slice::from_ref(&path)).allocated
-        } else {
-            0
-        },
-        on_system_drive: on_system_drive(&path),
-        path,
-        source,
-        exists,
+/// `path` 是 `base` 本身或在它下面。
+fn same_or_under(path: &Path, base: &Path) -> bool {
+    same_path(path, base) || is_under(path, base)
+}
+
+/// 两个路径是否相同。按组件逐个比较，不区分大小写。
+///
+/// 不能直接比字符串：末尾多一个反斜杠（`D:\CClearData\` 和 `D:\CClearData`）
+/// 会让同一个目录被当成两个，范围检查就漏掉了。
+fn same_path(left: &Path, right: &Path) -> bool {
+    let mut left = left.components();
+    let mut right = right.components();
+
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(one), Some(other)) if component_equals(one, other) => {}
+            _ => return false,
+        }
     }
 }
 
-/// 当前生效的路径和它的来源。
-fn current_path(spec: &ToolSpec, entry: &CacheEntry, roots: &RootMap) -> (PathBuf, String) {
-    let default = default_path(entry, roots);
-
-    let Some(var) = entry.env_var else {
-        return npm_cache_dir(spec, default);
-    };
-
-    if let Some(text) = registry::read_env_string(var) {
-        return (PathBuf::from(text), SOURCE_ENV.to_string());
+/// 单个路径组件是否相同，比较走 `CompareStringOrdinal`。
+fn component_equals(left: Component<'_>, right: Component<'_>) -> bool {
+    match (left, right) {
+        (Component::Prefix(one), Component::Prefix(other)) => equals_ignore_case(
+            &one.as_os_str().to_string_lossy(),
+            &other.as_os_str().to_string_lossy(),
+        ),
+        (Component::Normal(one), Component::Normal(other)) => {
+            equals_ignore_case(&one.to_string_lossy(), &other.to_string_lossy())
+        }
+        (Component::RootDir, Component::RootDir) => true,
+        (Component::CurDir, Component::CurDir) => true,
+        (Component::ParentDir, Component::ParentDir) => true,
+        _ => false,
     }
-    // 注册表里没有、本进程里有：多半是这次会话里临时设的，重启后就不生效了。
-    if let Some(text) = std::env::var_os(var) {
-        return (PathBuf::from(text), SOURCE_PROCESS_ENV.to_string());
-    }
-
-    (default, SOURCE_DEFAULT.to_string())
 }
 
-/// npm 的缓存位置在用户级 npmrc 里，只能问 npm 本身。
-fn npm_cache_dir(spec: &ToolSpec, default: PathBuf) -> (PathBuf, String) {
-    let Some(tool) = resolve_tool(spec.program) else {
-        return (default, format!("{SOURCE_DEFAULT}（没有找到 npm）"));
-    };
+/// `path` 是否在 `base` 之下（不含 `base` 自己）。逐组件比较，不区分大小写。
+fn is_under(path: &Path, base: &Path) -> bool {
+    let mut parts = path.components();
 
-    let outcome = run(&tool, &["config", "get", "cache"], COMMAND_TIMEOUT);
-    if outcome.timed_out || outcome.exit_code != Some(0) {
-        return (
-            default,
-            format!(
-                "{SOURCE_DEFAULT}（读取 npm 配置失败：{}）",
-                output_text(&outcome)
-            ),
-        );
+    for expected in base.components() {
+        match parts.next() {
+            Some(actual) if component_equals(actual, expected) => {}
+            _ => return false,
+        }
     }
 
-    let Some(path) = parse_paths(&outcome.stdout_tail).into_iter().next() else {
-        return (
-            default,
-            format!("{SOURCE_DEFAULT}（没有从 npm 读到缓存路径）"),
-        );
-    };
+    parts.next().is_some()
+}
 
-    if equals_ignore_case(&path.to_string_lossy(), &default.to_string_lossy()) {
-        return (path, SOURCE_DEFAULT.to_string());
-    }
-    // npm 先看环境变量 npm_config_cache，再读 npmrc。
-    let from_env = registry::read_env_string("npm_config_cache").is_some()
-        || std::env::var_os("npm_config_cache").is_some();
-    if from_env {
-        return (path, SOURCE_ENV.to_string());
+/// 是否是盘符根目录，例如 `C:\`。清理清单绝不能以它为锚点。
+fn is_drive_root(path: &Path) -> bool {
+    let mut parts = path.components();
+
+    if !matches!(parts.next(), Some(Component::Prefix(_))) {
+        return false;
     }
 
-    (path, SOURCE_NPMRC.to_string())
+    matches!(parts.next(), None | Some(Component::RootDir)) && parts.next().is_none()
+}
+
+/// 配置项在界面和记录里的名字。
+fn config_name(entry: &CacheEntry) -> &'static str {
+    entry.env_var.unwrap_or("npm cache")
 }
 
 /// 没有配置时工具的默认位置。
@@ -692,28 +1165,6 @@ fn on_system_drive(path: &Path) -> bool {
     ) {
         (Some(system), Some(serial)) => serial == system,
         _ => false,
-    }
-}
-
-/// 配置项在界面和记录里的名字。
-fn config_name(entry: &CacheEntry) -> &'static str {
-    entry.env_var.unwrap_or("npm cache")
-}
-
-/// 写配置之前记下旧值。
-fn old_value(entry: &CacheEntry, current: &(PathBuf, String)) -> OldValue {
-    let value = match entry.env_var {
-        Some(var) => registry::read_env_string(var),
-        // npm 的旧配置在 npmrc 里：和默认值不同才算“原来有配置”，撤销时要写回去。
-        None => match current.1.as_str() {
-            SOURCE_NPMRC => Some(current.0.to_string_lossy().into_owned()),
-            _ => None,
-        },
-    };
-
-    OldValue {
-        name: config_name(entry).to_string(),
-        value,
     }
 }
 
@@ -785,29 +1236,6 @@ fn collect_files(
     Ok(())
 }
 
-/// 写入新配置。用户环境变量写完广播一次，让之后新启动的进程能读到。
-fn write_config(spec: &ToolSpec, base: &Path) -> Result<(), MigrateError> {
-    for entry in spec.entries {
-        let target = target_of(base, entry);
-
-        match entry.env_var {
-            Some(var) => {
-                registry::write_env_string(var, &target.to_string_lossy()).map_err(|error| {
-                    MigrateError::Io(io::Error::other(format!("写环境变量 {var} 失败：{error}")))
-                })?;
-            }
-            None => set_npm_cache(spec, &target)?,
-        }
-    }
-
-    if spec.entries.iter().any(|entry| entry.env_var.is_some()) {
-        // 广播只影响之后新启动的进程，失败也不影响配置本身，所以只记录不报错。
-        let _ = registry::broadcast_environment_change();
-    }
-
-    Ok(())
-}
-
 /// 用 npm 自己的命令改用户级 npmrc。
 fn set_npm_cache(spec: &ToolSpec, path: &Path) -> Result<(), MigrateError> {
     let tool = resolve_tool(spec.program)
@@ -828,42 +1256,6 @@ fn set_npm_cache(spec: &ToolSpec, path: &Path) -> Result<(), MigrateError> {
     }
 
     Ok(())
-}
-
-/// 恢复旧配置。撤销和验证失败都走这里。
-fn restore(spec: &ToolSpec, old_values: &[OldValue]) -> Result<(), MigrateError> {
-    let mut failures: Vec<String> = Vec::new();
-
-    for entry in spec.entries.iter().rev() {
-        let name = config_name(entry);
-        let Some(old) = old_values.iter().find(|value| value.name == name) else {
-            continue;
-        };
-
-        let result = match entry.env_var {
-            Some(var) => match &old.value {
-                Some(text) => {
-                    registry::write_env_string(var, text).map_err(|error| error.to_string())
-                }
-                None => registry::delete_env_string(var).map_err(|error| error.to_string()),
-            },
-            None => restore_npm_cache(spec, old.value.as_deref()),
-        };
-
-        if let Err(reason) = result {
-            failures.push(format!("{name}：{reason}"));
-        }
-    }
-
-    if spec.entries.iter().any(|entry| entry.env_var.is_some()) {
-        let _ = registry::broadcast_environment_change();
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(MigrateError::RestoreFailed(failures.join("；")))
-    }
 }
 
 /// 把 npm 的缓存配置写回旧值；原来没有配置就删掉这一项。
@@ -990,12 +1382,6 @@ fn failure_note(action: &str, reason: &str, restored: &Result<(), MigrateError>)
     }
 }
 
-/// 失败状态也要落盘和记日志，但保存失败不能再盖掉真正的错误。
-fn record_failure(migration: &Migration, journal: &mut dyn JournalSink) {
-    let _ = save(migration);
-    let _ = write_log(journal, migration);
-}
-
 /// 把一次状态变化写进操作日志。
 fn write_log(journal: &mut dyn JournalSink, migration: &Migration) -> Result<(), MigrateError> {
     journal
@@ -1019,6 +1405,9 @@ pub(crate) struct Store {
     tools: Vec<Migration>,
     #[serde(default)]
     pub(crate) directories: Vec<junction::DirMigration>,
+    /// 读取时主文件不可用、退回备份的说明。只用于本次读取，不写回文件。
+    #[serde(skip)]
+    pub(crate) notice: Option<String>,
 }
 
 /// 迁移记录文件的位置。给了目录就用目录，否则用系统的 `%LOCALAPPDATA%\CClear`。
@@ -1037,52 +1426,102 @@ pub(crate) fn store_file(dir: Option<&Path>) -> Result<PathBuf, MigrateError> {
     }
 }
 
-/// 读迁移记录。还没有记录时返回空结构。
+/// 上一版记录的副本。主文件读不出来时用它。
+fn backup_file(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+/// 读迁移记录。还没有记录时返回空结构；主文件坏掉时退回备份并留下提示。
 pub(crate) fn load_store(dir: Option<&Path>) -> Result<Store, MigrateError> {
     let path = store_file(dir)?;
-    let text = match std::fs::read_to_string(&path) {
+    let backup = backup_file(&path);
+
+    let store = match read_store(&path) {
+        // 主文件不存在：可能是第一次运行，也可能是上次替换没走完而只剩备份。
+        Ok(None) => match read_store(&backup)? {
+            Some(mut store) => {
+                store.notice = Some(format!(
+                    "迁移记录主文件不在了，已读取备份 {}；再做一次迁移或撤销就会写回主文件",
+                    backup.display()
+                ));
+                store
+            }
+            None => Store::default(),
+        },
+        Ok(Some(store)) => store,
+        // 主文件坏了不能当成“没迁移过”：用户既撤不回去，也不知道发生了什么。
+        Err(error) => match read_store(&backup) {
+            Ok(Some(mut store)) => {
+                store.notice = Some(format!(
+                    "迁移记录主文件读不出来（{error}），已读取备份 {}",
+                    backup.display()
+                ));
+                store
+            }
+            _ => return Err(error),
+        },
+    };
+
+    Ok(store)
+}
+
+/// 读一个记录文件。文件不存在时返回 `None`。
+fn read_store(path: &Path) -> Result<Option<Store>, MigrateError> {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Store::default()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(MigrateError::Io(error)),
     };
 
-    // 记录里存着旧配置值和未完成的迁移，坏了不能当成“没迁移过”：否则用户既撤不回去，
-    // 也不知道发生了什么。
     serde_json::from_str(&text)
+        .map(Some)
         .map_err(|error| MigrateError::Store(format!("{}：{error}", path.display())))
 }
 
 /// 写回全部迁移记录。
+///
+/// 先写同目录下的临时文件、刷盘，再用护栏原子替换主文件，并且把上一版留成 `.bak`：
+/// 中途崩溃时读到的要么是旧的完整内容，要么是新的完整内容，不会出现半截 JSON。
 pub(crate) fn save_store(dir: Option<&Path>, store: &Store) -> Result<(), MigrateError> {
     let path = store_file(dir)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| MigrateError::Store(format!("迁移记录没有所在目录：{}", path.display())))?;
+    std::fs::create_dir_all(parent)?;
 
     let json = serde_json::to_vec_pretty(store)
         .map_err(|error| MigrateError::Io(io::Error::other(error)))?;
-    std::fs::write(&path, json)?;
+
+    // 上一版留一份 .bak。写不进去不影响这次保存，主文件仍然是完整的。
+    //
+    // 只把“能读成合法记录”的主文件复制过去：主文件已经损坏、界面正在用 .bak 兜底时，
+    // 再保存一次会把损坏的字节覆盖进备份，等于把最后的可读副本也毁掉。
+    if read_store(&path).is_ok_and(|store| store.is_some())
+        && let Ok(previous) = std::fs::read(&path)
+    {
+        let _ = std::fs::write(backup_file(&path), previous);
+    }
+
+    let final_name = path
+        .file_name()
+        .ok_or_else(|| MigrateError::Store(format!("迁移记录没有文件名：{}", path.display())))?;
+    // 临时名字带随机后缀：上次崩溃留下的临时文件不会挡住这次写入。
+    let tmp_name = format!(
+        "{}.{}.tmp",
+        final_name.to_string_lossy(),
+        Uuid::new_v4().simple()
+    );
+
+    let anchor = guard::open_anchor(parent, &Forbidden::empty())?;
+
+    let mut file = guard::create_file_in(&anchor, std::ffi::OsStr::new(&tmp_name))?;
+    file.write_all(&json)?;
+    file.sync_all()?;
+    drop(file);
+
+    guard::replace_in_dir(&anchor, std::ffi::OsStr::new(&tmp_name), final_name)?;
 
     Ok(())
-}
-
-/// 读全部工具的迁移记录。
-fn load_all() -> Result<Vec<Migration>, MigrateError> {
-    Ok(load_store(None)?.tools)
-}
-
-/// 读一个工具的迁移记录。
-fn load_one(tool: &str) -> Result<Option<Migration>, MigrateError> {
-    Ok(load_all()?.into_iter().find(|item| item.tool == tool))
-}
-
-/// 保存一个工具的迁移记录，其他工具和目录迁移的记录原样保留。
-fn save(migration: &Migration) -> Result<(), MigrateError> {
-    let mut store = load_store(None)?;
-    store.tools.retain(|item| item.tool != migration.tool);
-    store.tools.push(migration.clone());
-
-    save_store(None, &store)
 }
 
 /// 系统目录映射。一次操作只解析一次，避免反复查 Known Folder。

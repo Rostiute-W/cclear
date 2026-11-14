@@ -55,6 +55,8 @@ pub struct ToolSpec {
     /// 会写这些缓存的进程，运行时界面要警告。
     pub processes: &'static [&'static str],
     pub entries: &'static [CacheEntry],
+    /// 是否支持“允许重建”。Gradle 无法查询自己的缓存位置，重建后没法验证是否生效。
+    pub supports_rebuild: bool,
     /// 需要用户特别注意的地方。
     pub warning: Option<&'static str>,
 }
@@ -73,6 +75,7 @@ static TOOLS: &[ToolSpec] = &[
             default_root: KnownRoot::LocalAppData,
             default_rel: "uv\\cache",
         }],
+        supports_rebuild: true,
         warning: None,
     },
     ToolSpec {
@@ -87,6 +90,7 @@ static TOOLS: &[ToolSpec] = &[
             default_root: KnownRoot::LocalAppData,
             default_rel: "pip\\Cache",
         }],
+        supports_rebuild: true,
         warning: None,
     },
     ToolSpec {
@@ -99,9 +103,10 @@ static TOOLS: &[ToolSpec] = &[
             // npm 的缓存位置存在用户级 npmrc 里，没有对应的用户环境变量。
             env_var: None,
             dir_name: "npm",
-            default_root: KnownRoot::RoamingAppData,
+            default_root: KnownRoot::LocalAppData,
             default_rel: "npm-cache",
         }],
+        supports_rebuild: true,
         warning: None,
     },
     ToolSpec {
@@ -124,6 +129,7 @@ static TOOLS: &[ToolSpec] = &[
                 default_rel: "NuGet\\v3-cache",
             },
         ],
+        supports_rebuild: true,
         warning: None,
     },
     ToolSpec {
@@ -131,7 +137,7 @@ static TOOLS: &[ToolSpec] = &[
         label: "Gradle",
         program: "gradle",
         // Gradle 没有查询自己目录的命令：`GRADLE_USER_HOME` 会整体接管 `.gradle`，
-        // 包括配置和 wrapper，验证只能确认目标目录确实存在。
+        // 包括配置和 wrapper，验证只能确认目标目录确实存在，所以不能选“允许重建”。
         validate_args: None,
         processes: &["java.exe", "javaw.exe", "gradle.exe"],
         entries: &[CacheEntry {
@@ -140,9 +146,10 @@ static TOOLS: &[ToolSpec] = &[
             default_root: KnownRoot::Profile,
             default_rel: ".gradle",
         }],
+        supports_rebuild: false,
         warning: Some(
-            "GRADLE_USER_HOME 会接管整个 .gradle 目录：里面的配置、wrapper 和构建缓存一起搬走，\
-             迁移后所有项目都用新位置，请确认目标盘空间足够",
+            "GRADLE_USER_HOME 会接管整个 .gradle 目录：配置、wrapper 和构建缓存一起搬走，\
+             Gradle 又无法查询自己的缓存位置，所以只支持“迁移旧缓存”，请确认目标盘空间足够",
         ),
     },
 ];

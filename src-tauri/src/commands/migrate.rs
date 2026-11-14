@@ -14,6 +14,8 @@ use cclear_core::journal::FileJournal;
 use cclear_core::migrate::junction::{self, DirMigration, DirStage, JunctionMigration};
 use cclear_core::migrate::tools::{self, ToolId};
 use cclear_core::migrate::{self, EntryState, Migration, Mode, ToolState};
+use cclear_core::rules::resolve::RootMap;
+use cclear_core::win::process::running_processes;
 use serde::Serialize;
 use tauri::State;
 
@@ -60,6 +62,8 @@ pub struct MigrationToolDto {
     pub installed: bool,
     /// 改配置或验证是否需要工具本身。Gradle 不需要。
     pub needs_program: bool,
+    /// 是否支持“允许重建”。Gradle 无法查询自己的缓存位置，只支持迁移。
+    pub supports_rebuild: bool,
     /// 需要特别注意的提示，例如 Gradle 会整体搬走 `.gradle`。
     pub warning: Option<String>,
 }
@@ -80,6 +84,10 @@ pub struct MigrationVolumeDto {
 pub struct MigrationsDto {
     pub tools: Vec<MigrationToolDto>,
     pub volumes: Vec<MigrationVolumeDto>,
+    /// 迁移记录主文件不可用、退回备份时的提示。
+    pub store_note: Option<String>,
+    /// 启动恢复的结果和错误。
+    pub recovery_notes: Vec<String>,
 }
 
 /// 一次迁移或撤销之后的结果。
@@ -131,6 +139,10 @@ pub struct DirMigrationDto {
 pub struct DirMigrationsDto {
     pub records: Vec<DirMigrationDto>,
     pub volumes: Vec<MigrationVolumeDto>,
+    /// 迁移记录主文件不可用、退回备份时的提示。
+    pub store_note: Option<String>,
+    /// 启动恢复的结果和错误。
+    pub recovery_notes: Vec<String>,
 }
 
 /// 一个目录的资格检查结果。
@@ -146,8 +158,11 @@ pub struct JunctionCheckDto {
 }
 
 #[tauri::command]
-pub async fn migrations_list() -> Result<MigrationsDto, String> {
-    tauri::async_runtime::spawn_blocking(|| -> Result<MigrationsDto, String> {
+pub async fn migrations_list(state: State<'_, AppState>) -> Result<MigrationsDto, String> {
+    // 恢复说明只是读一次内存里的列表，留在异步线程上没有阻塞风险。
+    let recovery_notes = state.recovery_notes();
+
+    tauri::async_runtime::spawn_blocking(move || -> Result<MigrationsDto, String> {
         let tools = migrate::list().map_err(|error| error.to_string())?;
 
         Ok(MigrationsDto {
@@ -156,6 +171,9 @@ pub async fn migrations_list() -> Result<MigrationsDto, String> {
                 .into_iter()
                 .map(volume_dto)
                 .collect(),
+            // 读记录文件是同步 I/O，和 junction_state 一样放到阻塞线程里做。
+            store_note: migrate::store_notice(),
+            recovery_notes,
         })
     })
     .await
@@ -256,8 +274,10 @@ fn parse_tool(tool: &str) -> Result<ToolId, String> {
 
 /// 目录迁移的状态和候选卷。
 #[tauri::command]
-pub async fn junction_state() -> Result<DirMigrationsDto, String> {
-    tauri::async_runtime::spawn_blocking(|| -> Result<DirMigrationsDto, String> {
+pub async fn junction_state(state: State<'_, AppState>) -> Result<DirMigrationsDto, String> {
+    let recovery_notes = state.recovery_notes();
+
+    tauri::async_runtime::spawn_blocking(move || -> Result<DirMigrationsDto, String> {
         let migration = open_junction()?;
         let records = migration
             .list()
@@ -272,6 +292,8 @@ pub async fn junction_state() -> Result<DirMigrationsDto, String> {
                 .into_iter()
                 .map(volume_dto)
                 .collect(),
+            store_note: migration.store_notice(),
+            recovery_notes,
         })
     })
     .await
@@ -388,12 +410,15 @@ pub async fn junction_delete_backup(
             .map_err(|error| format!("生成备份清理清单失败：{error}"))?;
 
         // 用户已经按下“确认删除备份”，这里不再走预览，直接执行这份清单。
+        // 禁区按真实规则解析，进程列表也在执行前再查一次：备份目录可能还被程序占着。
+        let roots = RootMap::system().map_err(|error| format!("无法解析系统目录：{error}"))?;
+        let forbidden = Forbidden::from_rules(&roots);
         let cancel = AtomicBool::new(false);
         let report = executor::execute(
             &plan,
             &[junction::BACKUP_RULE_ID],
-            &Forbidden::empty(),
-            &|| Vec::new(),
+            &forbidden,
+            &running_processes,
             &mut journal,
             &cancel,
             &|_| {},
@@ -434,22 +459,64 @@ pub async fn junction_discard_target(
     .map_err(|error| format!("删除目标副本失败：{error}"))?
 }
 
-/// 启动时把上次没有做完的目录迁移收到确定的状态上。
+/// 启动时把上次没有做完的目录迁移和工具迁移收到确定的状态上。
 ///
 /// 拿到执行锁才会动手：恢复要改名和删目录，不能和用户刚发起的操作抢同一个目录。
+/// 恢复结果和错误都记到状态里，迁移页会显示，不会只留在后台线程里。
 pub fn recover_on_startup(state: &AppState) {
     let Ok(_exec) = state.start_exec() else {
-        return;
-    };
-    let Ok(migration) = JunctionMigration::open() else {
-        return;
-    };
-    let Ok(mut journal) = FileJournal::new() else {
+        state.push_recovery_note(
+            "启动恢复没有执行：已经有一次清理在进行，请重新打开迁移页确认状态".to_string(),
+        );
         return;
     };
 
-    // 恢复失败只影响这一次启动的提示，不影响界面其他功能。
-    let _ = migration.recover_pending(&mut journal);
+    let Ok(mut journal) = FileJournal::new() else {
+        state.push_recovery_note("启动恢复没有执行：操作日志无法写入".to_string());
+        return;
+    };
+
+    recover_directories(state, &mut journal);
+    recover_tools(state, &mut journal);
+}
+
+/// 目录迁移的启动恢复。
+fn recover_directories(state: &AppState, journal: &mut FileJournal) {
+    let migration = match JunctionMigration::open() {
+        Ok(migration) => migration,
+        Err(error) => {
+            state.push_recovery_note(format!("目录迁移记录读不出来，启动恢复没有执行：{error}"));
+            return;
+        }
+    };
+
+    match migration.recover_pending(journal) {
+        Ok(report) => {
+            if !report.recovered.is_empty() {
+                state.push_recovery_note(format!(
+                    "已恢复 {} 条中断的目录迁移，请在目录迁移里确认每条记录的状态",
+                    report.recovered.len()
+                ));
+            }
+            // 连状态都写不进去的记录也要让人看见，不能悄悄跳过。
+            for failure in report.failures {
+                state.push_recovery_note(format!("目录迁移启动恢复失败：{failure}"));
+            }
+        }
+        Err(error) => state.push_recovery_note(format!("目录迁移启动恢复失败：{error}")),
+    }
+}
+
+/// 工具缓存迁移的启动恢复：验证之前被中断的记录恢复旧配置。
+fn recover_tools(state: &AppState, journal: &mut FileJournal) {
+    match migrate::recover_tools(journal) {
+        Ok(records) => {
+            for record in records {
+                state.push_recovery_note(format!("{}：{}", record.tool, record.note));
+            }
+        }
+        Err(error) => state.push_recovery_note(format!("工具缓存迁移启动恢复失败：{error}")),
+    }
 }
 
 fn open_junction() -> Result<JunctionMigration, String> {
@@ -474,10 +541,15 @@ fn scan_path(state: &AppState, source_id: u32) -> Result<(PathBuf, u64), String>
 fn dir_record_dto(migration: &JunctionMigration, record: &DirMigration) -> DirMigrationDto {
     let backup_exists = record.backup_path().exists();
     let target_exists = record.target_path().exists();
-    let resumable =
-        record.stage == DirStage::NeedsAttention && backup_exists && !record.source_path().exists();
+    let source_exists = record.source_path().exists();
+    let temp_exists = record.return_temp_path().exists();
     // 链接是否存在要回到磁盘上确认：NeedsAttention 也可能停在建链接失败的那一刻。
-    let has_junction = migration.source_is_junction(record);
+    let has_junction = record.stage.has_junction() && migration.source_is_junction(record);
+    // “继续”有两种现场：链接已经建好（重新校验即可），或者源已改名、链接还没建。
+    // 迁回中途留下的临时目录还在时不能当成后一种：那是迁回失败后的现场，需要人工判断。
+    let resumable = record.stage == DirStage::NeedsAttention
+        && target_exists
+        && (has_junction || (backup_exists && !source_exists && !temp_exists));
 
     DirMigrationDto {
         id: record.id.clone(),
@@ -491,8 +563,10 @@ fn dir_record_dto(migration: &JunctionMigration, record: &DirMigration) -> DirMi
         target_exists,
         has_junction,
         resumable,
-        // 已经迁回时源位置是普通目录，但备份仍然可以删；其余情况必须有链接才允许删备份。
-        can_delete_backup: backup_exists && (has_junction || record.stage == DirStage::Returned),
+        // 已经迁回时源位置是普通目录，但备份仍然可以删；
+        // 其余情况必须有链接，而且这条记录要经过经链接校验，才允许删备份。
+        can_delete_backup: backup_exists
+            && (record.stage == DirStage::Returned || (has_junction && record.verified)),
     }
 }
 
@@ -530,6 +604,7 @@ fn tool_dto(state: &ToolState) -> MigrationToolDto {
         processes: state.running.iter().map(|name| name.to_string()).collect(),
         installed: state.installed,
         needs_program: migrate::needs_program(state.spec),
+        supports_rebuild: state.spec.supports_rebuild,
         warning: state.spec.warning.map(str::to_string),
     }
 }

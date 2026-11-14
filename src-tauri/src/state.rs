@@ -24,6 +24,8 @@ pub struct AppState {
     /// 是否有清理正在执行。同一时间只允许一次，否则两份清单会互相干扰。
     exec_running: AtomicBool,
     exec_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    /// 启动恢复的结果和错误。迁移页读它显示，避免恢复失败只留在后台线程里。
+    recovery_notes: Mutex<Vec<String>>,
 }
 
 impl AppState {
@@ -117,6 +119,19 @@ impl AppState {
         if let Some(flag) = self.exec_cancel.lock().unwrap().as_ref() {
             flag.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// 记下一条启动恢复的结果。相同的说明只留一条，界面重复打开不会堆积。
+    pub fn push_recovery_note(&self, note: String) {
+        let mut notes = self.recovery_notes.lock().unwrap();
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+
+    /// 启动恢复留下的说明，界面在迁移页显示。
+    pub fn recovery_notes(&self) -> Vec<String> {
+        self.recovery_notes.lock().unwrap().clone()
     }
 }
 

@@ -23,9 +23,10 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::{
     FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_LocalAppData,
-    FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
-    FOLDERID_ProgramFilesX86, FOLDERID_RoamingAppData, FOLDERID_SkyDrive, FOLDERID_Videos,
-    FOLDERID_Windows, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
+    FOLDERID_LocalAppDataLow, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Profile,
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_RoamingAppData,
+    FOLDERID_SavedGames, FOLDERID_SkyDrive, FOLDERID_Videos, FOLDERID_Windows, KNOWN_FOLDER_FLAG,
+    SHGetKnownFolderPath,
 };
 use windows::core::{GUID, PCWSTR};
 
@@ -33,12 +34,15 @@ use windows::core::{GUID, PCWSTR};
 #[derive(Clone, Copy, Debug)]
 pub enum KnownFolder {
     LocalAppData,
+    LocalAppDataLow,
     RoamingAppData,
     Profile,
     Desktop,
     Documents,
     Downloads,
+    Music,
     Pictures,
+    SavedGames,
     Videos,
     ProgramData,
     Windows,
@@ -51,12 +55,15 @@ impl KnownFolder {
     fn folder_id(self) -> GUID {
         match self {
             KnownFolder::LocalAppData => FOLDERID_LocalAppData,
+            KnownFolder::LocalAppDataLow => FOLDERID_LocalAppDataLow,
             KnownFolder::RoamingAppData => FOLDERID_RoamingAppData,
             KnownFolder::Profile => FOLDERID_Profile,
             KnownFolder::Desktop => FOLDERID_Desktop,
             KnownFolder::Documents => FOLDERID_Documents,
             KnownFolder::Downloads => FOLDERID_Downloads,
+            KnownFolder::Music => FOLDERID_Music,
             KnownFolder::Pictures => FOLDERID_Pictures,
+            KnownFolder::SavedGames => FOLDERID_SavedGames,
             KnownFolder::Videos => FOLDERID_Videos,
             KnownFolder::ProgramData => FOLDERID_ProgramData,
             KnownFolder::Windows => FOLDERID_Windows,
