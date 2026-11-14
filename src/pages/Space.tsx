@@ -18,6 +18,7 @@ type Tab = "dirs" | "graph" | "files";
 
 export function SpacePage({ onMigrate }: { onMigrate: (nodeId: number) => void }) {
   const [summary, setSummary] = useState<ScanSummary | null>(null);
+  const [summaryLoading, setSummaryLoading] = useState(true);
   const [tab, setTab] = useState<Tab>("dirs");
   // 面包屑：从根目录逐级进入的节点，空数组表示还停在根层。
   const [trail, setTrail] = useState<DirNode[]>([]);
@@ -31,7 +32,8 @@ export function SpacePage({ onMigrate }: { onMigrate: (nodeId: number) => void }
   useEffect(() => {
     scanSummary()
       .then(setSummary)
-      .catch(() => setSummary(null));
+      .catch(() => setSummary(null))
+      .finally(() => setSummaryLoading(false));
   }, []);
 
   useEffect(() => {
@@ -52,6 +54,22 @@ export function SpacePage({ onMigrate }: { onMigrate: (nodeId: number) => void }
       .then(setFiles)
       .catch((reason) => setError(String(reason)));
   }, [summary, tab]);
+
+  if (summaryLoading) {
+    return (
+      <section className="page-section">
+        <div className="page-header">
+          <div>
+            <h2 className="page-title">空间分析</h2>
+            <p className="page-subtitle">逐级浏览目录占用与大文件分布</p>
+          </div>
+        </div>
+        <div className="card">
+          <p className="muted">正在加载扫描结果…</p>
+        </div>
+      </section>
+    );
+  }
 
   if (!summary) {
     return (

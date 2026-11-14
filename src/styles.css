@@ -992,6 +992,49 @@ button {
   white-space: nowrap;
 }
 
+/* 清理页规则表：保证名称列在 1100px 窗口下不折行，说明列自由换行 */
+.rule-table th,
+.rule-table td {
+  padding: 9px 6px;
+}
+
+.rule-table th:first-child,
+.rule-table td:first-child {
+  padding-left: 8px;
+}
+
+.rule-table th:last-child,
+.rule-table td:last-child {
+  padding-right: 8px;
+}
+
+.td-rule-name {
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.td-desc {
+  min-width: 100px;
+}
+
+.td-status {
+  min-width: 76px;
+  max-width: 120px;
+}
+
+.td-status .badge {
+  border-radius: 8px;
+  padding: 3px 8px;
+  white-space: normal;
+  text-align: left;
+  line-height: 1.35;
+  overflow-wrap: break-word;
+}
+
+.td-ops {
+  min-width: 104px;
+}
+
 .checkbox-input {
   width: 15px;
   height: 15px;

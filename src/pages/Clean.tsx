@@ -637,7 +637,7 @@ export function CleanPage() {
                 </div>
               ) : (
                 <div className="table-wrap">
-                  <table className="table">
+                  <table className="table rule-table">
                     <thead>
                       <tr>
                         <th>选择</th>
@@ -692,11 +692,11 @@ export function CleanPage() {
                                   />
                                 )}
                               </td>
-                              <td>{rule.name}</td>
+                              <td className="td-rule-name">{rule.name}</td>
                               <td className="td-num">
                                 {candidate ? formatSize(candidate.allocated) : "—"}
                               </td>
-                              <td className="td-nowrap">
+                              <td className="td-status">
                                 {badge ? (
                                   <StatusBadge tone={CANDIDATE_TONES[badge.kind]}>
                                     {badge.label}
@@ -705,7 +705,7 @@ export function CleanPage() {
                                   "—"
                                 )}
                               </td>
-                              <td>
+                              <td className="td-desc">
                                 <div className="actions" style={{ marginBottom: rule.admin ? 4 : 0 }}>
                                   <span>{rule.description}</span>
                                   {rule.admin && <AdminTag />}
@@ -713,7 +713,7 @@ export function CleanPage() {
                                 {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
                                 {note && <p className="muted" style={{ margin: "3px 0 0" }}>{note}</p>}
                               </td>
-                              <td>
+                              <td className="td-ops">
                                 <div className="actions">
                                   <button
                                     type="button"
@@ -835,22 +835,22 @@ export function CleanPage() {
                           <td className="td-nowrap">
                             <StatusBadge tone="danger">独立操作</StatusBadge>
                           </td>
-                          <td>{rule.name}</td>
+                          <td className="td-rule-name">{rule.name}</td>
                           <td className="td-num">{recycle ? formatSize(recycle.bytes) : "—"}</td>
                           <td className="td-nowrap">
                             {recycle ? (
-                              <StatusBadge tone="safe">
+                              <StatusBadge tone="neutral">
                                 {recycle.items.toLocaleString()} 项
                               </StatusBadge>
                             ) : (
                               <StatusBadge tone="neutral">读取失败</StatusBadge>
                             )}
                           </td>
-                          <td>
+                          <td className="td-desc">
                             <span>{rule.description}</span>
                             {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
                           </td>
-                          <td>
+                          <td className="td-ops">
                             <div className="actions">
                               <button
                                 type="button"

@@ -24,6 +24,7 @@ import type {
 
 export function OverviewPage() {
   const [volumes, setVolumes] = useState<VolumeInfo[]>([]);
+  const [volumesLoading, setVolumesLoading] = useState(true);
   const [roots, setRoots] = useState<ScanRoot[]>([]);
   const [summary, setSummary] = useState<ScanSummary | null>(null);
   const [progress, setProgress] = useState<ScanProgress | null>(currentScanProgress());
@@ -33,7 +34,8 @@ export function OverviewPage() {
   useEffect(() => {
     volumeInfo()
       .then(setVolumes)
-      .catch((reason) => setError(String(reason)));
+      .catch((reason) => setError(String(reason)))
+      .finally(() => setVolumesLoading(false));
     defaultScanRoots()
       .then(setRoots)
       .catch((reason) => setError(String(reason)));
@@ -107,7 +109,9 @@ export function OverviewPage() {
             )}
           </div>
 
-          {!systemVolume && <p className="muted">没有读到磁盘信息</p>}
+          {!systemVolume && (
+            <p className="muted">{volumesLoading ? "正在加载磁盘信息…" : "没有读到磁盘信息"}</p>
+          )}
 
           {systemVolume && (
             <div className="volume-hero">
@@ -334,7 +338,7 @@ export function OverviewPage() {
                         : "已关闭"}
                   </span>
                 </div>
-                {locationLines(env.pagefiles, "没有配置页面文件")}
+                {locationLines(env.pagefiles, "没有配置页面文件", "页面文件")}
               </div>
             </div>
 
@@ -343,8 +347,8 @@ export function OverviewPage() {
               <div className="env-lines">
                 {locationLines(env.knownFolders, "未知")}
                 {env.onedrive
-                  ? locationLines([env.onedrive], "")
-                  : emptyLine("没有配置 OneDrive")}
+                  ? locationLines([env.onedrive], "", "OneDrive")
+                  : emptyLine("没有配置", "OneDrive")}
               </div>
             </div>
 
@@ -369,43 +373,48 @@ export function OverviewPage() {
 }
 
 // 一组位置项：读不到时显示“未知”，没有配置时显示给定文案。
-function locationLines(locations: EnvLocation[] | null, emptyText: string) {
+// 后端把页面文件和 OneDrive 的条目 `name` 留空，这里用 `fallbackName` 补上行内标签。
+function locationLines(locations: EnvLocation[] | null, emptyText: string, fallbackName?: string) {
   if (locations === null) {
-    return emptyLine("未知");
+    return emptyLine("未知", fallbackName);
   }
 
   if (locations.length === 0) {
-    return emptyLine(emptyText);
+    return emptyLine(emptyText, fallbackName);
   }
 
-  return locations.map((location, index) => (
-    <div className="env-line" key={`${location.name ?? location.path ?? "未知"}-${index}`}>
-      {location.name && <span className="env-name">{location.name}</span>}
-      <span className="env-path" title={location.path ?? undefined}>
-        {location.path ?? "未知"}
-      </span>
-      {location.sizeBytes !== null && (
-        <span className="muted td-num">{formatSize(location.sizeBytes)}</span>
-      )}
-      <StatusBadge
-        tone={
-          location.onSystemDrive === true
-            ? "caution"
-            : location.onSystemDrive === false
-              ? "safe"
-              : "neutral"
-        }
-      >
-        {driveLabel(location.onSystemDrive)}
-      </StatusBadge>
-    </div>
-  ));
+  return locations.map((location, index) => {
+    const label = location.name ?? fallbackName;
+    return (
+      <div className="env-line" key={`${label ?? location.path ?? "未知"}-${index}`}>
+        {label && <span className="env-name">{label}</span>}
+        <span className="env-path" title={location.path ?? undefined}>
+          {location.path ?? "未知"}
+        </span>
+        {location.sizeBytes !== null && (
+          <span className="muted td-num">{formatSize(location.sizeBytes)}</span>
+        )}
+        <StatusBadge
+          tone={
+            location.onSystemDrive === true
+              ? "caution"
+              : location.onSystemDrive === false
+                ? "safe"
+                : "neutral"
+          }
+        >
+          {driveLabel(location.onSystemDrive)}
+        </StatusBadge>
+      </div>
+    );
+  });
 }
 
 // 一行说明文字，用于“未知”“没有配置”这类占位。
-function emptyLine(text: string) {
+function emptyLine(text: string, label?: string) {
   return (
     <div className="env-line">
+      {label && <span className="env-name">{label}</span>}
       <span className="muted">{text}</span>
     </div>
   );
