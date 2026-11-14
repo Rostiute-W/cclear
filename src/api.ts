@@ -247,6 +247,11 @@ export function migrationRevert(tool: MigrationTool): Promise<MigrationResult> {
   return invoke<MigrationResult>("migration_revert", { tool });
 }
 
+// 确认使用备份里的迁移记录：确认之后后端才允许把它写回主文件。
+export function migrationConfirmBackup(): Promise<void> {
+  return invoke<void>("migration_confirm_backup");
+}
+
 // 目录迁移：只传扫描节点 ID 和目标卷根，源路径从上次扫描结果里取。
 export function junctionState(): Promise<DirMigrationsState> {
   return invoke<DirMigrationsState>("junction_state");

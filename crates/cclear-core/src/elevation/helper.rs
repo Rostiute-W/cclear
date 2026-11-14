@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
@@ -291,11 +291,13 @@ fn restore_batch(
     let root = QuarantineRoot::open(root_path.to_path_buf());
 
     // 隔离区在普通用户可写的目录里，照着清单写系统路径之前必须先确认清单可信。
-    if let Err(reason) = load_admin_batch(&root, batch_id, roots) {
-        return OpOutcome::failed(token, reason);
-    }
+    // 之后一律用校验过的这份内存清单执行，不再从磁盘读第二次。
+    let (batch_dir, manifest) = match load_admin_batch(&root, batch_id, roots) {
+        Ok(loaded) => loaded,
+        Err(reason) => return OpOutcome::failed(token, reason),
+    };
 
-    match root.restore(batch_id, journal) {
+    match root.restore_loaded(&batch_dir, manifest, journal) {
         Ok(outcome) => {
             let detail = format!(
                 "还原批次 {batch_id}：{}，已还原 {} 个文件，{} 个因原位置已有同名文件跳过",
@@ -339,11 +341,12 @@ fn purge_batch(
     let root = QuarantineRoot::open(root_path.to_path_buf());
 
     // 彻删会整棵删掉批次目录，同样要先确认这个批次确实是提权规则创建的。
-    if let Err(reason) = load_admin_batch(&root, batch_id, roots) {
-        return OpOutcome::failed(token, reason);
-    }
+    let (batch_dir, manifest) = match load_admin_batch(&root, batch_id, roots) {
+        Ok(loaded) => loaded,
+        Err(reason) => return OpOutcome::failed(token, reason),
+    };
 
-    match root.purge(batch_id, journal) {
+    match root.purge_loaded(&batch_dir, manifest, journal) {
         Ok(()) => {
             let mut result = OpOutcome::done(token, format!("已彻底删除批次 {batch_id}"));
             result.batch_id = Some(batch_id.to_string());
@@ -353,13 +356,22 @@ fn purge_batch(
     }
 }
 
-/// 读批次清单并校验它确实属于需要管理员的两条规则。不合格时返回给用户看的中文原因。
-fn load_admin_batch(root: &QuarantineRoot, batch_id: Uuid, roots: &RootMap) -> Result<(), String> {
+/// 读批次清单并校验它确实属于需要管理员的两条规则。
+///
+/// 返回批次目录和校验过的清单：调用方必须用这份数据执行，不能校验完再读一次盘。
+/// 不合格时返回给用户看的中文原因。
+fn load_admin_batch(
+    root: &QuarantineRoot,
+    batch_id: Uuid,
+    roots: &RootMap,
+) -> Result<(PathBuf, Manifest), String> {
     let manifest = root
         .load_batch(batch_id)
         .map_err(|error| error.to_string())?;
 
-    validate_admin_batch(&manifest, roots)
+    validate_admin_batch(&manifest, roots)?;
+
+    Ok((root.batch_dir(batch_id), manifest))
 }
 
 /// 批次被拒绝时固定的一句说明。

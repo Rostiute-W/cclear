@@ -296,7 +296,7 @@ fn interrupted_source_deletion_keeps_only_copies() {
     fs::write(&second, "第二个文件的内容").unwrap();
 
     let root = temp.path().join("quarantine");
-    // 删掉第一个源之后就中断，模拟删源阶段进程被强行结束。
+    // 删掉第一个源之后就中断：崩溃点落在“源已删除、manifest 还没保存”的窗口里。
     let engine = QuarantineRoot::for_test(root.clone())
         .with_free_space(|_| 64 * GIB)
         .with_crash_after_deletions(1);
@@ -325,18 +325,30 @@ fn interrupted_source_deletion_keeps_only_copies() {
     assert!(!first.exists(), "第一个源应当已经删除");
     assert_eq!(fs::read_to_string(&second).unwrap(), "第二个文件的内容");
 
+    // 崩溃时清单落后于磁盘现场：第一个条目还是“已复制”，但它的源已经没了。
+    let batch_dir = only_batch_dir(engine.path());
+    let crashed = Manifest::load(&batch_dir).unwrap();
+    assert_eq!(
+        crashed.items[0].state,
+        ItemState::Copied,
+        "崩溃点在删源之后、保存之前，清单里应当还停在已复制"
+    );
+
     // 重新打开隔离区：逐条核对之后停在“需要处理”，两个条目的状态分开记。
     let engine = QuarantineRoot::for_test(root).with_free_space(|_| 64 * GIB);
     let reports = engine.recover_pending(&mut journal).unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].stage, BatchStage::NeedsAttention);
 
-    let batch_dir = only_batch_dir(engine.path());
     let manifest = Manifest::load(&batch_dir).unwrap();
     assert_eq!(
         manifest.items[0].state,
         ItemState::SourceDeleted,
-        "源已删除的条目要如实记成已隔离"
+        "源已删除的条目要按磁盘现场记成已隔离"
+    );
+    assert_eq!(
+        manifest.items[0].note, "源已不在原位，隔离副本是唯一的一份",
+        "这一条必须走 mark_source_gone 分支"
     );
     assert_eq!(
         manifest.items[1].state,
@@ -368,6 +380,110 @@ fn interrupted_source_deletion_keeps_only_copies() {
     let restored = engine.restore(manifest.batch_id, &mut journal).unwrap();
     assert_eq!(restored.stage, BatchStage::Restored);
     assert_eq!(fs::read_to_string(&first).unwrap(), "第一个文件的内容");
+}
+
+#[test]
+fn throttled_save_recovers_after_crash() {
+    let temp = TempDir::new().unwrap();
+    let source_dir = temp.path().join("source");
+    fs::create_dir(&source_dir).unwrap();
+
+    // 600 个小文件：manifest 落盘按时间和条数节流，崩溃时清单一定落后于实际进度。
+    let mut names = Vec::new();
+    for index in 0..600 {
+        let name = format!("f{index:03}.txt");
+        fs::write(source_dir.join(&name), format!("内容 {index}")).unwrap();
+        names.push(name);
+    }
+
+    let root = temp.path().join("quarantine");
+    let engine = QuarantineRoot::for_test(root.clone())
+        .with_free_space(|_| 64 * GIB)
+        .with_crash_after_deletions(300);
+
+    let anchors = vec![source_dir.clone()];
+    let items: Vec<QuarantineItem> = names
+        .iter()
+        .map(|name| QuarantineItem::new(0, &[name.as_str()]))
+        .collect();
+    let mut journal = NullJournal;
+
+    let error = engine
+        .quarantine(
+            "test-rule",
+            &Forbidden::empty(),
+            &anchors,
+            &items,
+            &mut journal,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, QuarantineError::Injected),
+        "注入的中断应当让这次隔离失败"
+    );
+
+    // 恢复之前先看清单：节流落盘留下的最后一段进度还在内存里，磁盘上一定少于 300 条。
+    let batch_dir = only_batch_dir(engine.path());
+    let crashed = Manifest::load(&batch_dir).unwrap();
+    let saved_deleted = crashed.count_state(ItemState::SourceDeleted);
+    assert!(
+        saved_deleted < 300,
+        "崩溃时清单应当落后于磁盘现场，实际已记录 {saved_deleted} 条"
+    );
+
+    // 恢复：清单里落后的部分要按磁盘现场推回来。
+    let engine = QuarantineRoot::for_test(root).with_free_space(|_| 64 * GIB);
+    let reports = engine.recover_pending(&mut journal).unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].stage, BatchStage::NeedsAttention);
+
+    let manifest = Manifest::load(&batch_dir).unwrap();
+    let deleted = manifest.count_state(ItemState::SourceDeleted);
+    assert_eq!(deleted, 300, "已删源的条目应当全部认出来");
+
+    // 恢复之后，每个条目的状态必须与磁盘现场一致。
+    for item in &manifest.items {
+        assert_eq!(
+            item.state == ItemState::SourceDeleted,
+            !item.source_path().exists(),
+            "条目状态和磁盘现场不一致：{}",
+            item.source_path().display()
+        );
+    }
+
+    // 放弃：源已删的副本必须留着，源还在的副本被删除。
+    let outcome = engine
+        .resolve(
+            manifest.batch_id,
+            ResolveAction::Abandon,
+            &Forbidden::empty(),
+            &mut journal,
+        )
+        .unwrap();
+    assert_eq!(outcome.moved, 300);
+
+    let after_abandon = Manifest::load(&batch_dir).unwrap();
+    for item in &after_abandon.items {
+        let copy = item.copy_path(&batch_dir);
+        if item.state == ItemState::SourceDeleted {
+            assert!(copy.exists(), "源已不在的条目，副本是唯一的一份，不能删");
+        } else {
+            assert!(!copy.exists(), "源还在的条目副本应当被放弃");
+        }
+    }
+
+    // 留着的 300 份副本都能原样还原，600 个文件一个不少。
+    let restored = engine.restore(manifest.batch_id, &mut journal).unwrap();
+    assert_eq!(restored.stage, BatchStage::Restored);
+    assert_eq!(restored.restored, 300);
+    for (index, name) in names.iter().enumerate() {
+        assert_eq!(
+            fs::read_to_string(source_dir.join(name)).unwrap(),
+            format!("内容 {index}"),
+            "{name} 还原之后内容必须与原来一致"
+        );
+    }
 }
 
 #[test]
@@ -500,8 +616,8 @@ fn skips_item_changed_after_freeze() {
         .unwrap_err();
 
     assert!(
-        matches!(error, QuarantineError::NothingToDo),
-        "预览之后变化的条目应当被跳过，实际：{error}"
+        matches!(&error, QuarantineError::NothingToDo(reason) if reason.contains("文件在预览之后发生了变化")),
+        "预览之后变化的条目应当被跳过并说明原因，实际：{error}"
     );
     assert_eq!(
         fs::read_to_string(&file).unwrap(),

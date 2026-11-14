@@ -17,6 +17,7 @@
     "allow-migration-start",
     "allow-migration-cleanup-old",
     "allow-migration-revert",
+    "allow-migration-confirm-backup",
     "allow-junction-state",
     "allow-junction-check",
     "allow-junction-start",

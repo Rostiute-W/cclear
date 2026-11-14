@@ -463,6 +463,8 @@ export interface MigrationsState {
   volumes: MigrationVolume[];
   // 迁移记录主文件不可用、退回备份时的提示。
   storeNote: string | null;
+  // 记录是从备份读出来的，确认使用备份之前后端拒绝写入。
+  storeNeedsConfirm: boolean;
   // 启动恢复的结果和错误。
   recoveryNotes: string[];
 }
@@ -525,6 +527,8 @@ export interface DirMigrationsState {
   volumes: MigrationVolume[];
   // 迁移记录主文件不可用、退回备份时的提示。
   storeNote: string | null;
+  // 记录是从备份读出来的，确认使用备份之前后端拒绝写入。
+  storeNeedsConfirm: boolean;
   // 启动恢复的结果和错误。
   recoveryNotes: string[];
 }

@@ -8,7 +8,10 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::guard::{Forbidden, GuardError, open_anchor, replace_in_dir};
+use crate::guard::{
+    DirHandle, Forbidden, GuardError, OpenIntent, create_file_in, delete, open_anchor, open_rel,
+    replace_in_dir,
+};
 use crate::model::FileIdentity;
 
 /// 批次清单的文件名。
@@ -206,18 +209,25 @@ impl Manifest {
     }
 
     /// 原子写入清单：先写临时文件并刷盘，再用护栏的目录句柄替换正式文件。
+    ///
+    /// 大批次要反复保存（每条规则可能上万条），所以写紧凑 JSON：
+    /// 读取端用 serde_json 解析，旧的 pretty 格式照样读得出来。
     pub fn save(&self, batch_dir: &Path) -> Result<(), GuardError> {
-        let json = serde_json::to_vec_pretty(self)
-            .map_err(|error| GuardError::Io(io::Error::other(error)))?;
+        let json =
+            serde_json::to_vec(self).map_err(|error| GuardError::Io(io::Error::other(error)))?;
+
+        // 批次清单在隔离区里，临时文件也必须相对目录句柄创建，不走字符串路径。
+        let dir = open_anchor(batch_dir, &Forbidden::empty())?;
+        // 上次写到一半留下的临时文件会让 `create_file_in` 一直失败，先清掉。
+        remove_stale_temp(&dir);
 
         // 必须先把内容落到磁盘再替换：否则掉电后可能换上一个空文件。
         {
-            let mut file = fs::File::create(batch_dir.join(MANIFEST_TMP_NAME))?;
+            let mut file = create_file_in(&dir, OsStr::new(MANIFEST_TMP_NAME))?;
             io::Write::write_all(&mut file, &json)?;
             file.sync_all()?;
         }
 
-        let dir = open_anchor(batch_dir, &Forbidden::empty())?;
         replace_in_dir(
             &dir,
             OsStr::new(MANIFEST_TMP_NAME),
@@ -262,6 +272,17 @@ impl Manifest {
     /// 清单里还有多少个条目停在某个状态。
     pub fn count_state(&self, state: ItemState) -> u64 {
         self.items.iter().filter(|item| item.state == state).count() as u64
+    }
+}
+
+/// 清掉上次写入残留的临时文件。`create_file_in` 只新建，同名残留会让保存一直失败。
+fn remove_stale_temp(dir: &DirHandle) {
+    let forbidden = Forbidden::empty();
+    let rel = [OsString::from(MANIFEST_TMP_NAME)];
+
+    if let Ok(entry) = open_rel(dir, &rel, OpenIntent::Delete, &forbidden) {
+        let expect = entry.expect();
+        let _ = delete(entry, &expect);
     }
 }
 

@@ -47,6 +47,9 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const STORE_DIR: &str = "CClear";
 const STORE_FILE: &str = "migrations.json";
 
+/// 记录是从 `.bak` 退回读出来的、用户还没确认时的统一拒绝文案。工具迁移和目录迁移共用。
+pub(crate) const BACKUP_UNCONFIRMED: &str = "迁移记录是从备份读出来的，请先在迁移页确认使用备份";
+
 /// 配置来源的说明文字，界面直接显示。
 const SOURCE_ENV: &str = "环境变量";
 const SOURCE_PROCESS_ENV: &str = "当前进程环境变量";
@@ -65,6 +68,9 @@ pub enum MigrateError {
     #[error("迁移记录读不出来，请先手工检查：{0}")]
     Store(String),
 
+    #[error("{0}")]
+    BackupUnconfirmed(String),
+
     #[error("没有在 PATH 里找到 {0}，无法改配置或验证")]
     MissingTool(String),
 
@@ -82,6 +88,9 @@ pub enum MigrateError {
 
     #[error("这个工具还没有迁移成功的记录，不能做这一步")]
     NotMigrated,
+
+    #[error("这个工具已经撤销过了，不需要再撤销")]
+    AlreadyReverted,
 
     #[error("{0} 还有一次没有撤销的迁移记录（{1}），请先撤销再重新迁移")]
     PendingMigration(String, &'static str),
@@ -359,6 +368,31 @@ impl Env {
         }
     }
 
+    /// 用户确认使用备份里的迁移记录：把这份内容写回主文件，之后才允许保存。
+    pub fn adopt_backup_store(&self) -> Result<(), MigrateError> {
+        let mut store = self.load_store()?;
+        if !store.from_backup {
+            return Ok(());
+        }
+
+        // 确认之后这份内容就是准的：落回主文件，主文件恢复成可读状态。
+        store.from_backup = false;
+        save_store(self.store_dir.as_deref(), &store)
+    }
+
+    /// 记录是从 `.bak` 退回读出来的、用户还没确认时，会写文件或改配置的入口先拒绝。
+    ///
+    /// 只有确认之后才允许动手：这里挡住的是“先改了配置或搬了文件，保存时才失败”。
+    fn refuse_without_backup(&self) -> Result<(), MigrateError> {
+        if self.load_store()?.from_backup {
+            return Err(MigrateError::BackupUnconfirmed(
+                BACKUP_UNCONFIRMED.to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// 全部工具的状态，界面表格用它。
     pub fn list(&self) -> Result<Vec<ToolState>, MigrateError> {
         let migrations = self.load_all()?;
@@ -390,6 +424,9 @@ impl Env {
         mode: Mode,
         journal: &mut dyn JournalSink,
     ) -> Result<Migration, MigrateError> {
+        // 记录是从备份退回读出来的话，复制和写配置都不能开始。
+        self.refuse_without_backup()?;
+
         let spec =
             tools::spec(tool).ok_or_else(|| MigrateError::UnknownTool(tool.key().to_string()))?;
 
@@ -548,6 +585,9 @@ impl Env {
         tool: ToolId,
         journal: &mut dyn JournalSink,
     ) -> Result<FrozenPlan, MigrateError> {
+        // 生成清单最后要写回记录，先从这一步挡住未确认的备份。
+        self.refuse_without_backup()?;
+
         let spec =
             tools::spec(tool).ok_or_else(|| MigrateError::UnknownTool(tool.key().to_string()))?;
         let mut migration = self
@@ -619,11 +659,20 @@ impl Env {
         tool: ToolId,
         journal: &mut dyn JournalSink,
     ) -> Result<Migration, MigrateError> {
+        // restore 会改用户配置，必须在动手之前挡住未确认的备份。
+        self.refuse_without_backup()?;
+
         let spec =
             tools::spec(tool).ok_or_else(|| MigrateError::UnknownTool(tool.key().to_string()))?;
         let mut migration = self
             .load_one(tool.key())?
             .ok_or(MigrateError::NotMigrated)?;
+
+        // 已经撤销过的记录不该再撤销一次：旧值早就写回去了，再写一遍只会在
+        // 用户之后手工调整过配置的情况下把它覆盖掉。
+        if migration.stage == Stage::Reverted {
+            return Err(MigrateError::AlreadyReverted);
+        }
 
         // 记录里的旧值就够恢复了：留空的项表示原来没有这个配置，恢复时删掉。
         // 中断在 Planned/Configured/Failed 时也一样，配置要么没写、要么已经恢复过。
@@ -884,7 +933,7 @@ impl Env {
 
     /// 需要避开的系统目录。盘符根由 [`is_drive_root`] 单独判断。
     fn known_paths(&self) -> Vec<PathBuf> {
-        [
+        let mut paths: Vec<PathBuf> = [
             KnownRoot::Profile,
             KnownRoot::LocalAppData,
             KnownRoot::RoamingAppData,
@@ -896,7 +945,22 @@ impl Env {
         ]
         .into_iter()
         .filter_map(|root| self.roots.get(root).map(Path::to_path_buf))
-        .collect()
+        .collect();
+
+        // 桌面、图片、音乐、视频也是资源管理器直接展示的位置，旧缓存落在那里同样不能当清理锚点。
+        // 它们可能被重定向到别的盘，根目录映射里没有，只能按 Known Folder 单独解析。
+        for folder in [
+            KnownFolder::Desktop,
+            KnownFolder::Pictures,
+            KnownFolder::Music,
+            KnownFolder::Videos,
+        ] {
+            if let Ok(path) = known_folder(folder) {
+                paths.push(path);
+            }
+        }
+
+        paths
     }
 
     /// 写入新配置。用户环境变量写完广播一次，让之后新启动的进程能读到。
@@ -1408,6 +1472,10 @@ pub(crate) struct Store {
     /// 读取时主文件不可用、退回备份的说明。只用于本次读取，不写回文件。
     #[serde(skip)]
     pub(crate) notice: Option<String>,
+    /// 内容是主文件坏掉之后从 `.bak` 读出来的。用户确认之前不许写回：
+    /// 备份可能比现场旧，直接覆盖主文件等于把真实进度丢掉。
+    #[serde(skip)]
+    pub(crate) from_backup: bool,
 }
 
 /// 迁移记录文件的位置。给了目录就用目录，否则用系统的 `%LOCALAPPDATA%\CClear`。
@@ -1449,20 +1517,37 @@ pub(crate) fn load_store(dir: Option<&Path>) -> Result<Store, MigrateError> {
             None => Store::default(),
         },
         Ok(Some(store)) => store,
-        // 主文件坏了不能当成“没迁移过”：用户既撤不回去，也不知道发生了什么。
-        Err(error) => match read_store(&backup) {
+        // 只有 JSON 解析失败才退回备份：主文件坏了不能当成“没迁移过”，用户既撤不回去，
+        // 也不知道发生了什么。I/O 错误（读不出来、权限不足）直接报出去：现场不明时
+        // 拿一份可能更旧的备份去覆盖，只会让下一次写入建立在错误的状态上。
+        Err(error @ MigrateError::Store(_)) => match read_store(&backup) {
             Ok(Some(mut store)) => {
                 store.notice = Some(format!(
-                    "迁移记录主文件读不出来（{error}），已读取备份 {}",
+                    "迁移记录主文件读不出来（{error}），已读取备份 {}；确认使用备份之后才会写回",
                     backup.display()
                 ));
+                store.from_backup = true;
                 store
             }
             _ => return Err(error),
         },
+        Err(error) => return Err(error),
     };
 
     Ok(store)
+}
+
+/// 迁移记录是不是从 `.bak` 退回读出来的。界面据此显示“确认使用备份”，
+/// 确认之前任何保存都会被拒绝。
+pub fn store_needs_confirm() -> bool {
+    load_store(None).is_ok_and(|store| store.from_backup)
+}
+
+/// 用户确认使用备份里的迁移记录：把这份内容写回主文件，之后才允许保存。
+///
+/// 备份内容本身不做任何改动，只是把它落回主文件；没有回退到备份时什么也不做。
+pub fn adopt_backup_store() -> Result<(), MigrateError> {
+    Env::system()?.adopt_backup_store()
 }
 
 /// 读一个记录文件。文件不存在时返回 `None`。
@@ -1483,6 +1568,14 @@ fn read_store(path: &Path) -> Result<Option<Store>, MigrateError> {
 /// 先写同目录下的临时文件、刷盘，再用护栏原子替换主文件，并且把上一版留成 `.bak`：
 /// 中途崩溃时读到的要么是旧的完整内容，要么是新的完整内容，不会出现半截 JSON。
 pub(crate) fn save_store(dir: Option<&Path>, store: &Store) -> Result<(), MigrateError> {
+    // 记录是从备份退回读出来的：用户确认之前一律不写。备份可能落后于现场，
+    // 拿它覆盖主文件会把真实进度抹掉，之后既改不回去也说不清做过什么。
+    if store.from_backup {
+        return Err(MigrateError::BackupUnconfirmed(
+            BACKUP_UNCONFIRMED.to_string(),
+        ));
+    }
+
     let path = store_file(dir)?;
     let parent = path
         .parent()

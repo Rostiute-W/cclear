@@ -86,6 +86,8 @@ pub struct MigrationsDto {
     pub volumes: Vec<MigrationVolumeDto>,
     /// 迁移记录主文件不可用、退回备份时的提示。
     pub store_note: Option<String>,
+    /// 记录是从备份读出来的，确认使用备份之前不许写入。
+    pub store_needs_confirm: bool,
     /// 启动恢复的结果和错误。
     pub recovery_notes: Vec<String>,
 }
@@ -141,6 +143,8 @@ pub struct DirMigrationsDto {
     pub volumes: Vec<MigrationVolumeDto>,
     /// 迁移记录主文件不可用、退回备份时的提示。
     pub store_note: Option<String>,
+    /// 记录是从备份读出来的，确认使用备份之前不许写入。
+    pub store_needs_confirm: bool,
     /// 启动恢复的结果和错误。
     pub recovery_notes: Vec<String>,
 }
@@ -173,6 +177,7 @@ pub async fn migrations_list(state: State<'_, AppState>) -> Result<MigrationsDto
                 .collect(),
             // 读记录文件是同步 I/O，和 junction_state 一样放到阻塞线程里做。
             store_note: migrate::store_notice(),
+            store_needs_confirm: migrate::store_needs_confirm(),
             recovery_notes,
         })
     })
@@ -244,6 +249,20 @@ pub async fn migration_cleanup_old(
     Ok(MigrationCleanupDto { plan_id, summary })
 }
 
+/// 确认使用备份里的迁移记录。迁移记录主文件读不出来时界面会退回 `.bak`，
+/// 在用户明确确认之前，后端拒绝把这份内容写回主文件。
+#[tauri::command]
+pub async fn migration_confirm_backup(state: State<'_, AppState>) -> Result<(), String> {
+    // 确认会写迁移记录，和迁移操作共用同一把执行锁。
+    let _exec = state.start_exec()?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        migrate::adopt_backup_store().map_err(|error| format!("确认使用备份失败：{error}"))
+    })
+    .await
+    .map_err(|error| format!("确认使用备份失败：{error}"))?
+}
+
 /// 撤销迁移：恢复写配置前记下的旧值。
 #[tauri::command]
 pub async fn migration_revert(
@@ -293,6 +312,7 @@ pub async fn junction_state(state: State<'_, AppState>) -> Result<DirMigrationsD
                 .map(volume_dto)
                 .collect(),
             store_note: migration.store_notice(),
+            store_needs_confirm: migrate::store_needs_confirm(),
             recovery_notes,
         })
     })
