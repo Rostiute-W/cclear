@@ -3,5 +3,16 @@
   "identifier": "main",
   "description": "主窗口只被授予本应用的命令权限",
   "windows": ["main"],
-  "permissions": ["allow-app-info"]
+  "permissions": [
+    "allow-app-info",
+    "allow-volume-info",
+    "allow-default-scan-roots",
+    "allow-scan-start",
+    "allow-scan-cancel",
+    "allow-scan-summary",
+    "allow-scan-children",
+    "allow-scan-top-files",
+    "allow-open-node-in-explorer",
+    "allow-open-top-file-in-explorer"
+  ]
 }

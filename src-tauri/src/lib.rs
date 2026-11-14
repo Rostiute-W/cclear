@@ -9,6 +9,7 @@ use tauri::{WebviewUrl, WebviewWindowBuilder};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(state::AppState::default())
         .setup(|app| {
             // WebView2 的用户数据目录与系统盘默认位置分开，便于自我保护。
             let data_directory = known_folder(KnownFolder::LocalAppData)?
@@ -24,7 +25,18 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![commands::app::app_info])
+        .invoke_handler(tauri::generate_handler![
+            commands::app::app_info,
+            commands::scan::volume_info,
+            commands::scan::default_scan_roots,
+            commands::scan::scan_start,
+            commands::scan::scan_cancel,
+            commands::scan::scan_summary,
+            commands::scan::scan_children,
+            commands::scan::scan_top_files,
+            commands::scan::open_node_in_explorer,
+            commands::scan::open_top_file_in_explorer,
+        ])
         .run(tauri::generate_context!())
         .expect("CClear 启动失败");
 }
