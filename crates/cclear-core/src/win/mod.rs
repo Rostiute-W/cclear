@@ -1,6 +1,8 @@
 //! 对 Win32 的薄封装。
 
-use std::path::PathBuf;
+pub mod dirinfo;
+
+use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
@@ -77,4 +79,21 @@ pub fn is_elevated() -> bool {
         let _ = CloseHandle(token);
         queried && elevation.TokenIsElevated != 0
     }
+}
+
+/// 转成 `\\?\` 长路径形式。Win32 的宽字符接口只有在去掉 `MAX_PATH` 限制后才能处理超长路径。
+pub fn to_verbatim(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+
+    // 已经是长路径形式时原样返回，避免叠加前缀。
+    if text.starts_with(r"\\?\") {
+        return path.to_path_buf();
+    }
+
+    // UNC 路径必须用 \\?\UNC\ 前缀，不能直接拼 \\?\。
+    if let Some(rest) = text.strip_prefix(r"\\") {
+        return PathBuf::from(format!(r"\\?\UNC\{rest}"));
+    }
+
+    PathBuf::from(format!(r"\\?\{text}"))
 }
