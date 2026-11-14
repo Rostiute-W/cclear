@@ -7,7 +7,10 @@ use cclear_core::journal::FileJournal;
 use cclear_core::rules::catalog::{Target, find};
 use cclear_core::rules::commands::{self, CommandReport};
 use serde::Serialize;
+use tauri::State;
 use tauri::ipc::Channel;
+
+use crate::state::AppState;
 
 /// 执行进度。命令没有分项进度，只有“已开始”和“已结束”。
 #[derive(Clone, Serialize)]
@@ -41,7 +44,11 @@ pub async fn command_execute(
     rule_id: String,
     second_confirm: bool,
     on_progress: Channel<CommandProgressDto>,
+    state: State<'_, AppState>,
 ) -> Result<CommandReportDto, String> {
+    // 清单执行、清空回收站和命令执行共用一把锁，同一时间只允许一次清理类操作。
+    let _exec = state.start_exec()?;
+
     // 命令要等工具跑完，放到阻塞线程池里执行，避免占住异步运行时。
     tauri::async_runtime::spawn_blocking(move || {
         let rule = find(&rule_id).ok_or_else(|| "没有这条清理规则".to_string())?;

@@ -71,7 +71,9 @@ export function commandExecute(
 
 export function volumeInfo(): Promise<VolumeInfo[]> {
   return invoke<VolumeInfo[]>("volume_info");
-}export function defaultScanRoots(): Promise<ScanRoot[]> {
+}
+
+export function defaultScanRoots(): Promise<ScanRoot[]> {
   return invoke<ScanRoot[]>("default_scan_roots");
 }
 

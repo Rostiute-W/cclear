@@ -78,6 +78,8 @@ export function CleanPage() {
   // C 盘回收站当前内容，清空前要把这份数值回传后端比对。
   const [recycle, setRecycle] = useState<RecycleBinInfo | null>(null);
   const [recycleBusy, setRecycleBusy] = useState(false);
+  // 清单是否正在执行。执行状态在 PlanPreview 内部，这里留一份用来禁用其他执行按钮。
+  const [planRunning, setPlanRunning] = useState(false);
   // 每条命令的运行状态。命令之间互不影响，按规则 ID 分开记。
   const [commandStates, setCommandStates] = useState<Record<string, CommandState>>({});
 
@@ -268,6 +270,13 @@ export function CleanPage() {
   // 命令类规则单独成组：它们不生成冻结清单，一条一行单独运行。
   const commandRules = rules.filter((rule) => rule.targetKind === "command");
 
+  // 命令、回收站和清单共用后端的执行锁：任一操作进行时，其他执行按钮都禁用。
+  // 判断以后端为准，这里只是不让用户白点。
+  const anyCommandRunning = Object.values(commandStates).some(
+    (state) => state.phase === "running",
+  );
+  const execBusy = planning || recycleBusy || planRunning || anyCommandRunning;
+
   return (
     <section>
       <h2>清理</h2>
@@ -315,7 +324,7 @@ export function CleanPage() {
                   <button
                     type="button"
                     className="button-primary"
-                    disabled={planning || safeIds.length === 0}
+                    disabled={execBusy || safeIds.length === 0}
                     onClick={() => startPlan(safeIds)}
                   >
                     {planning ? "正在生成清单…" : "一键清理安全项"}
@@ -325,7 +334,7 @@ export function CleanPage() {
                   <button
                     type="button"
                     className="button-primary"
-                    disabled={planning || checkedIds.length === 0}
+                    disabled={execBusy || checkedIds.length === 0}
                     onClick={() => startPlan(checkedIds)}
                   >
                     {planning ? "正在生成清单…" : "清理选中项"}
@@ -509,7 +518,7 @@ export function CleanPage() {
                             <button
                               type="button"
                               className="link"
-                              disabled={!recycle || recycleBusy || recycle.items === 0}
+                              disabled={!recycle || execBusy || recycle.items === 0}
                               onClick={emptyRecycle}
                             >
                               {recycleBusy ? "正在清空…" : "清空回收站"}
@@ -583,7 +592,7 @@ export function CleanPage() {
                         <button
                           type="button"
                           className="link"
-                          disabled={candidate?.executable !== true || running || scope === ""}
+                          disabled={candidate?.executable !== true || execBusy || scope === ""}
                           onClick={() => runCommand(rule, scope)}
                         >
                           {running ? "运行中…" : "运行"}
@@ -627,6 +636,9 @@ export function CleanPage() {
           key={plan.planId}
           planId={plan.planId}
           summary={plan}
+          // 命令或清空回收站正在进行时不能开始清理，由后端的执行锁兜底。
+          blocked={planning || recycleBusy || anyCommandRunning}
+          onRunningChange={setPlanRunning}
           onFinished={() => {
             // 清理已经结束，把界面上的统计和回收站数量重新读一遍。
             evaluate();

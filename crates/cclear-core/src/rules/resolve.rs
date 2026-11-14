@@ -226,9 +226,20 @@ fn plain_dirs_below(start: &Path, rel: &str) -> bool {
 
 /// 评估一条规则。
 pub fn evaluate(rule: &Rule, roots: &RootMap, procs: &[ProcInfo], now: SystemTime) -> Candidate {
+    evaluate_with_checks(rule, roots, procs, now, None)
+}
+
+/// 评估一条规则。`checks` 有值时命令类规则直接用已经查好的结果，不再重复查询和统计。
+fn evaluate_with_checks(
+    rule: &Rule,
+    roots: &RootMap,
+    procs: &[ProcInfo],
+    now: SystemTime,
+    checks: Option<&CommandChecks>,
+) -> Candidate {
     // 命令类规则不看目录，改成查工具和缓存路径，单独走一条评估。
     if let Target::Command(id) = &rule.target {
-        return evaluate_command(rule, *id);
+        return evaluate_command(rule, *id, checks.and_then(|checks| checks.get(*id)));
     }
 
     let mut candidate = Candidate {
@@ -293,7 +304,11 @@ pub fn evaluate(rule: &Rule, roots: &RootMap, procs: &[ProcInfo], now: SystemTim
 /// 命令类规则的评估：工具装没装、缓存在不在 C 盘、缓存多大。
 ///
 /// 这里会启动工具查询缓存路径，正常几百毫秒；查询失败只让这条规则不可执行。
-fn evaluate_command(rule: &Rule, id: CommandId) -> Candidate {
+fn evaluate_command(
+    rule: &Rule,
+    id: CommandId,
+    precomputed: Option<(&CommandCheck, SizeInfo)>,
+) -> Candidate {
     let mut candidate = Candidate {
         rule_id: rule.id,
         status: CandidateStatus::NotPresent,
@@ -308,11 +323,23 @@ fn evaluate_command(rule: &Rule, id: CommandId) -> Candidate {
         return candidate;
     }
 
-    match commands::check(id) {
+    // 一次评估里已经查过并统计过，直接取结果；单独评估时现场查询。
+    let queried;
+    let (check, size) = match precomputed {
+        Some(precomputed) => precomputed,
+        None => {
+            queried = commands::check(id);
+            (&queried, measured_size(&queried))
+        }
+    };
+
+    match check {
         CommandCheck::NotPresent => candidate.status = CandidateStatus::NotPresent,
-        CommandCheck::Unusable(reason) => candidate.status = CandidateStatus::Insufficient(reason),
-        CommandCheck::Ready { paths, size } => {
-            candidate.anchors = paths;
+        CommandCheck::Unusable(reason) => {
+            candidate.status = CandidateStatus::Insufficient(reason.clone())
+        }
+        CommandCheck::Ready { paths } => {
+            candidate.anchors = paths.clone();
             candidate.size = size;
             candidate.status = CandidateStatus::Ready;
         }
@@ -325,14 +352,134 @@ fn evaluate_command(rule: &Rule, id: CommandId) -> Candidate {
     candidate
 }
 
+/// 现场统计一条命令规则的缓存大小，口径和一次评估里预先统计的相同。
+fn measured_size(check: &CommandCheck) -> SizeInfo {
+    match check {
+        CommandCheck::Ready { paths } => measure_paths(paths),
+        CommandCheck::NotPresent | CommandCheck::Unusable(_) => SizeInfo::default(),
+    }
+}
+
 /// 评估全部内置规则。规则之间互不依赖，用 rayon 跨规则并行，输出顺序与 `catalog()` 相同。
 pub fn evaluate_all(roots: &RootMap, procs: &[ProcInfo], now: SystemTime) -> Vec<Candidate> {
     use rayon::prelude::*;
 
+    // 命令类规则的缓存路径要先在规则之间去重再统计，文件类规则则直接枚举目录。
+    // 两组工作互不依赖，同时跑，总耗时取较慢的那一边。
+    let (checks, file_candidates) = rayon::join(CommandChecks::collect, || {
+        catalog()
+            .par_iter()
+            .filter(|rule| !matches!(rule.target, Target::Command(_)))
+            .map(|rule| evaluate_with_checks(rule, roots, procs, now, None))
+            .collect::<Vec<Candidate>>()
+    });
+
+    // 合并回规则目录的顺序。命令类规则取预先查好、统计好的结果，不再重复查询。
+    let mut file_candidates = file_candidates.into_iter();
     catalog()
-        .par_iter()
-        .map(|rule| evaluate(rule, roots, procs, now))
+        .iter()
+        .map(|rule| match &rule.target {
+            Target::Command(_) => evaluate_with_checks(rule, roots, procs, now, Some(&checks)),
+            _ => file_candidates
+                .next()
+                .expect("文件类规则的数量与上面过滤后一致"),
+        })
         .collect()
+}
+
+/// 一次评估里所有命令规则的结果，按命令 ID 索引。
+struct CommandChecks {
+    entries: Vec<(CommandId, CommandCheck, SizeInfo)>,
+}
+
+impl CommandChecks {
+    /// 并行查询所有命令规则的缓存路径，去重后并行统计。
+    fn collect() -> Self {
+        use rayon::prelude::*;
+
+        // 1. 并行查询各条命令规则的缓存路径。每次查询都要启动一次工具，规则之间互不依赖。
+        let queried: Vec<(CommandId, CommandCheck)> = catalog()
+            .par_iter()
+            .filter(|rule| ENABLED_PHASES.contains(&rule.phase))
+            .filter_map(|rule| match &rule.target {
+                Target::Command(id) => Some((*id, commands::check(*id))),
+                _ => None,
+            })
+            .collect();
+
+        // 2. 同一个缓存目录只统计一遍。
+        let mut unique: Vec<PathBuf> = Vec::new();
+        for (_, check) in &queried {
+            let CommandCheck::Ready { paths } = check else {
+                continue;
+            };
+            for path in paths {
+                if !unique.iter().any(|known| same_path(known, path)) {
+                    unique.push(path.clone());
+                }
+            }
+        }
+        let measured: Vec<SizeInfo> = unique
+            .par_iter()
+            .map(|path| measure_paths(std::slice::from_ref(path)))
+            .collect();
+
+        // 3. 把统计好的大小分发给各条规则。
+        let entries = queried
+            .into_iter()
+            .map(|(id, check)| {
+                let size = match &check {
+                    CommandCheck::Ready { paths } => sum_paths(paths, &unique, &measured),
+                    CommandCheck::NotPresent | CommandCheck::Unusable(_) => SizeInfo::default(),
+                };
+                (id, check, size)
+            })
+            .collect();
+
+        Self { entries }
+    }
+
+    /// 按命令 ID 取已经查好的结果。工具没装或路径不可用时也有记录。
+    fn get(&self, id: CommandId) -> Option<(&CommandCheck, SizeInfo)> {
+        self.entries
+            .iter()
+            .find(|(known, _, _)| *known == id)
+            .map(|(_, check, size)| (check, *size))
+    }
+}
+
+/// 一组缓存路径的合计大小。同一个目录只算一次。
+fn sum_paths(paths: &[PathBuf], unique: &[PathBuf], measured: &[SizeInfo]) -> SizeInfo {
+    let mut total = SizeInfo::default();
+    let mut counted: Vec<&Path> = Vec::new();
+
+    for path in paths {
+        // 不同子命令可能报出大小写不同的同一个目录。
+        if counted.iter().any(|known| same_path(known, path)) {
+            continue;
+        }
+        counted.push(path);
+
+        let Some(index) = unique.iter().position(|known| same_path(known, path)) else {
+            continue;
+        };
+
+        let size = measured[index];
+        total.logical += size.logical;
+        total.allocated += size.allocated;
+        total.files += size.files;
+        total.dirs += size.dirs;
+    }
+
+    total
+}
+
+/// 两个路径是否相同。Windows 路径不区分大小写，pip 输出的就是小写盘符。
+fn same_path(left: &Path, right: &Path) -> bool {
+    crate::win::equals_ignore_case(
+        &left.as_os_str().to_string_lossy(),
+        &right.as_os_str().to_string_lossy(),
+    )
 }
 
 /// 候选的样例路径：占盘最大的前 `SAMPLE_LIMIT` 个文件。
@@ -464,13 +611,40 @@ fn missing_layout_marker(rule: &Rule, roots: &RootMap) -> Option<String> {
 pub fn selector_of(rule: &Rule) -> Selector {
     match &rule.target {
         Target::Paths { selector, .. } => *selector,
-        _ => Selector {
-            kind: SelectKind::AllContents,
-            min_age_hours: None,
-            exclude_newest_per_dir: false,
-            exclude_child_dirs: &[],
-        },
+        _ => all_contents_selector(),
     }
+}
+
+/// 全部内容的选择器：不带年龄过滤和排除项。命令类规则的缓存目录按它统计。
+fn all_contents_selector() -> Selector {
+    Selector {
+        kind: SelectKind::AllContents,
+        min_age_hours: None,
+        exclude_newest_per_dir: false,
+        exclude_child_dirs: &[],
+    }
+}
+
+/// 统计一组目录的占盘大小。命令类规则的缓存路径走这里，和文件类规则用同一套枚举。
+pub(crate) fn measure_paths(anchors: &[PathBuf]) -> SizeInfo {
+    let dirs = collect_all(anchors, &all_contents_selector());
+
+    let mut total = SizeInfo {
+        dirs: dirs.len() as u64,
+        ..SizeInfo::default()
+    };
+    for dir in &dirs {
+        for file in &dir.files {
+            // 云占位符本地没有数据，逻辑大小没有意义，只计入占盘大小。
+            if file.counts_logical {
+                total.logical += file.logical;
+            }
+            total.allocated += file.allocated;
+            total.files += 1;
+        }
+    }
+
+    total
 }
 
 /// 统计锚点的体积，并取最大的若干文件作为样例。
