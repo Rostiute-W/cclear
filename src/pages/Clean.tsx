@@ -12,7 +12,17 @@ import {
   rulesCatalog,
   rulesEvaluate,
 } from "../api";
+import {
+  IconInfo,
+  IconLock,
+  IconQuarantine,
+  IconRefresh,
+  IconShield,
+  IconTerminal,
+  IconWarning,
+} from "../components/Icons";
 import { PlanPreview } from "../components/PlanPreview";
+import { AdminTag, AlertBanner, StatusBadge, type SemanticTone } from "../components/Ui";
 import { formatDuration, formatSize } from "../format";
 import type {
   CandidateInfo,
@@ -29,12 +39,12 @@ import type {
 } from "../types";
 
 // 分组顺序固定，禁区默认折叠。
-const TIER_GROUPS: { tier: Tier; label: string }[] = [
-  { tier: "safe", label: "安全" },
-  { tier: "caution", label: "谨慎" },
-  { tier: "leftover", label: "残留" },
-  { tier: "manual", label: "手动" },
-  { tier: "forbidden", label: "禁区" },
+const TIER_GROUPS: { tier: Tier; label: string; hint: string }[] = [
+  { tier: "safe", label: "安全", hint: "可安全清理或自动再生" },
+  { tier: "caution", label: "谨慎", hint: "逐项确认后再清理" },
+  { tier: "leftover", label: "残留", hint: "先移入隔离区 · 可还原" },
+  { tier: "manual", label: "手动", hint: "仅分析参考或阶段受限" },
+  { tier: "forbidden", label: "禁区", hint: "系统核心与不可触碰路径" },
 ];
 
 // 徽标上显示阶段时用的写法，和后端 PhaseLocked 的文案保持一致。
@@ -45,6 +55,16 @@ const PHASE_LABELS: Record<Phase, string> = {
   m4: "M4",
   m5a: "M5a",
   m5b: "M5b",
+};
+
+const CANDIDATE_TONES: Record<CandidateStatusKind, SemanticTone> = {
+  ready: "safe",
+  processRunning: "caution",
+  notPresent: "neutral",
+  layoutMismatch: "neutral",
+  phaseLocked: "info",
+  insufficient: "neutral",
+  forbidden: "danger",
 };
 
 // 单行的占用检查状态。
@@ -75,6 +95,41 @@ const SYSTEM_OP_LABELS: Record<string, string> = {
 
 function systemOpLabel(op: string): string {
   return SYSTEM_OP_LABELS[op] ?? op;
+}
+
+function tierBadge(tier: Tier, hint: string) {
+  switch (tier) {
+    case "safe":
+      return (
+        <StatusBadge tone="safe" icon={<IconShield width={12} height={12} />}>
+          {hint}
+        </StatusBadge>
+      );
+    case "caution":
+      return (
+        <StatusBadge tone="caution" icon={<IconWarning width={12} height={12} />}>
+          {hint}
+        </StatusBadge>
+      );
+    case "leftover":
+      return (
+        <StatusBadge tone="quarantine" icon={<IconQuarantine width={12} height={12} />}>
+          {hint}
+        </StatusBadge>
+      );
+    case "forbidden":
+      return (
+        <StatusBadge tone="danger" icon={<IconLock width={12} height={12} />}>
+          {hint}
+        </StatusBadge>
+      );
+    case "manual":
+      return (
+        <StatusBadge tone="neutral" icon={<IconInfo width={12} height={12} />}>
+          {hint}
+        </StatusBadge>
+      );
+  }
 }
 
 // 单条命令的运行状态。
@@ -459,28 +514,33 @@ export function CleanPage() {
     maintenanceRunning;
 
   return (
-    <section>
-      <h2>清理</h2>
-
-      <div className="card">
+    <section className="page-section">
+      <div className="page-header">
+        <div>
+          <h2 className="page-title">清理</h2>
+          <p className="page-subtitle">先评估各规则候选规模，生成冻结清单预览后再确认执行</p>
+        </div>
         <div className="actions">
+          {evaluatedMs !== null && (
+            <StatusBadge tone="neutral">上次评估耗时 {formatDuration(evaluatedMs)}</StatusBadge>
+          )}
           <button
             type="button"
-            className="button-primary"
+            className="btn btn-primary"
             onClick={evaluate}
             disabled={evaluating}
           >
-            {evaluating ? "评估中…" : "重新评估"}
+            <IconRefresh width={14} height={14} />
+            <span>{evaluating ? "评估中…" : "重新评估"}</span>
           </button>
-          {evaluatedMs !== null && (
-            <span className="muted">上次评估耗时 {formatDuration(evaluatedMs)}</span>
-          )}
         </div>
-        <p className="muted">
-          安全层可一键清理，谨慎层逐项勾选后清理，残留层的条目一律先进隔离区。命令类规则在下方「不可撤销命令」分组里单独运行。
-        </p>
-        {error && <p className="warn">{error}</p>}
       </div>
+
+      <AlertBanner tone="info">
+        安全层可一键清理，谨慎层逐项勾选后清理，残留层的条目一律先进隔离区。命令类规则在下方「不可撤销命令」分组里单独运行。
+      </AlertBanner>
+
+      {error && <AlertBanner tone="danger">{error}</AlertBanner>}
 
       {TIER_GROUPS.map((group) => {
         const groupRules = rules.filter((rule) => rule.tier === group.tier);
@@ -498,16 +558,19 @@ export function CleanPage() {
         const checkedIds = group.tier === "caution" ? selectedIds("caution") : [];
 
         return (
-          <div className="card" key={group.tier}>
-            <div className="group-header">
-              <h3>
-                {group.label}（{cardCount}）
-              </h3>
+          <div className={`card card-tier-${group.tier}`} key={group.tier}>
+            <div className="card-header" style={isCollapsed ? { marginBottom: 0 } : undefined}>
+              <div className="card-title-group">
+                <h3 className="card-title">
+                  {group.label}（{cardCount}）
+                </h3>
+                {tierBadge(group.tier, group.hint)}
+              </div>
               <div className="actions">
                 {group.tier === "safe" && (
                   <button
                     type="button"
-                    className="button-primary"
+                    className="btn btn-primary"
                     disabled={execBusy || safeIds.length === 0}
                     onClick={() => startPlan(safeIds)}
                   >
@@ -517,7 +580,7 @@ export function CleanPage() {
                 {group.tier === "caution" && (
                   <button
                     type="button"
-                    className="button-primary"
+                    className="btn btn-primary"
                     disabled={execBusy || checkedIds.length === 0}
                     onClick={() => startPlan(checkedIds)}
                   >
@@ -527,14 +590,18 @@ export function CleanPage() {
                 {group.tier === "leftover" && adminLeftoverRules.length > 0 && (
                   <button
                     type="button"
-                    className="button-primary"
+                    className="btn btn-primary"
                     disabled={execBusy}
                     onClick={() => runElevated(adminLeftoverRules)}
                   >
                     可执行的管理员残留项一起隔离（一次授权）
                   </button>
                 )}
-                <button type="button" className="link" onClick={() => toggleGroup(group.tier)}>
+                <button
+                  type="button"
+                  className="btn btn-subtle"
+                  onClick={() => toggleGroup(group.tier)}
+                >
                   {isCollapsed ? "展开" : "收起"}
                 </button>
               </div>
@@ -543,31 +610,33 @@ export function CleanPage() {
             {!isCollapsed &&
               (group.tier === "forbidden" ? (
                 // 禁区只列出名称和原因，不提供任何操作。
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th>名称</th>
-                      <th>原因</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {groupRules.length === 0 && (
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead>
                       <tr>
-                        <td colSpan={2} className="muted">
-                          这一类没有规则
-                        </td>
+                        <th>名称</th>
+                        <th>原因</th>
                       </tr>
-                    )}
-                    {groupRules.map((rule) => (
-                      <tr key={rule.id}>
-                        <td>{rule.name}</td>
-                        <td>{rule.description}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {groupRules.length === 0 && (
+                        <tr>
+                          <td colSpan={2} className="muted">
+                            这一类没有规则
+                          </td>
+                        </tr>
+                      )}
+                      {groupRules.map((rule) => (
+                        <tr key={rule.id}>
+                          <td className="td-nowrap">{rule.name}</td>
+                          <td>{rule.description}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               ) : (
-                <>
+                <div className="table-wrap">
                   <table className="table">
                     <thead>
                       <tr>
@@ -607,13 +676,14 @@ export function CleanPage() {
                         return (
                           <Fragment key={rule.id}>
                             <tr>
-                              <td>
+                              <td className="td-nowrap">
                                 {group.tier === "leftover" ? (
                                   // 残留项一条操作一次，勾选对它没有意义。
-                                  <span className="muted">隔离</span>
+                                  <StatusBadge tone="quarantine">隔离</StatusBadge>
                                 ) : (
                                   <input
                                     type="checkbox"
+                                    className="checkbox-input"
                                     checked={selected.has(rule.id)}
                                     disabled={!selectable}
                                     onChange={() => toggleSelected(rule.id)}
@@ -623,81 +693,85 @@ export function CleanPage() {
                                 )}
                               </td>
                               <td>{rule.name}</td>
-                              <td>{candidate ? formatSize(candidate.allocated) : "—"}</td>
-                              <td>
+                              <td className="td-num">
+                                {candidate ? formatSize(candidate.allocated) : "—"}
+                              </td>
+                              <td className="td-nowrap">
                                 {badge ? (
-                                  <span className={`status-badge status-${badge.kind}`}>
+                                  <StatusBadge tone={CANDIDATE_TONES[badge.kind]}>
                                     {badge.label}
-                                  </span>
+                                  </StatusBadge>
                                 ) : (
                                   "—"
                                 )}
                               </td>
                               <td>
-                                <span>{rule.description}</span>
-                                {rule.admin && (
-                                  <span className="status-badge">需要管理员</span>
-                                )}
-                                {rule.warning && <p className="warn">注意：{rule.warning}</p>}
-                                {note && <p className="muted">{note}</p>}
+                                <div className="actions" style={{ marginBottom: rule.admin ? 4 : 0 }}>
+                                  <span>{rule.description}</span>
+                                  {rule.admin && <AdminTag />}
+                                </div>
+                                {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
+                                {note && <p className="muted" style={{ margin: "3px 0 0" }}>{note}</p>}
                               </td>
                               <td>
-                                <button
-                                  type="button"
-                                  className="link"
-                                  disabled={!hasAnchors || lockState?.phase === "loading"}
-                                  onClick={() => checkLocks(rule.id)}
-                                >
-                                  检查占用
-                                </button>{" "}
-                                <button
-                                  type="button"
-                                  className="link"
-                                  disabled={!hasAnchors}
-                                  onClick={() => openLocation(rule.id, null)}
-                                >
-                                  打开位置
-                                </button>{" "}
-                                {candidate && candidate.samples.length > 0 && (
+                                <div className="actions">
                                   <button
                                     type="button"
-                                    className="link"
-                                    onClick={() => toggleSamples(rule.id)}
+                                    className="btn-link"
+                                    disabled={!hasAnchors || lockState?.phase === "loading"}
+                                    onClick={() => checkLocks(rule.id)}
                                   >
-                                    {samplesOpen
-                                      ? "收起样例"
-                                      : `样例路径（${candidate.samples.length}）`}
+                                    检查占用
                                   </button>
-                                )}{" "}
-                                {hasEvidence && (
                                   <button
                                     type="button"
-                                    className="link"
-                                    onClick={() => toggleEvidence(rule.id)}
+                                    className="btn-link"
+                                    disabled={!hasAnchors}
+                                    onClick={() => openLocation(rule.id, null)}
                                   >
-                                    {evidenceOpen ? "收起证据" : "查看证据"}
+                                    打开位置
                                   </button>
-                                )}{" "}
-                                {group.tier === "leftover" && (
-                                  <button
-                                    type="button"
-                                    className="button-primary"
-                                    disabled={!selectable || execBusy}
-                                    onClick={() =>
-                                      rule.admin ? runElevated([rule]) : startPlan([rule.id])
-                                    }
-                                    title={selectable ? undefined : "当前不能清理这一项"}
-                                  >
-                                    {rule.admin ? "移入隔离区（需管理员）" : "移入隔离区"}
-                                  </button>
-                                )}
+                                  {candidate && candidate.samples.length > 0 && (
+                                    <button
+                                      type="button"
+                                      className="btn-link"
+                                      onClick={() => toggleSamples(rule.id)}
+                                    >
+                                      {samplesOpen
+                                        ? "收起样例"
+                                        : `样例路径（${candidate.samples.length}）`}
+                                    </button>
+                                  )}
+                                  {hasEvidence && (
+                                    <button
+                                      type="button"
+                                      className="btn-link"
+                                      onClick={() => toggleEvidence(rule.id)}
+                                    >
+                                      {evidenceOpen ? "收起证据" : "查看证据"}
+                                    </button>
+                                  )}
+                                  {group.tier === "leftover" && (
+                                    <button
+                                      type="button"
+                                      className="btn btn-primary"
+                                      disabled={!selectable || execBusy}
+                                      onClick={() =>
+                                        rule.admin ? runElevated([rule]) : startPlan([rule.id])
+                                      }
+                                      title={selectable ? undefined : "当前不能清理这一项"}
+                                    >
+                                      {rule.admin ? "移入隔离区（需管理员）" : "移入隔离区"}
+                                    </button>
+                                  )}
+                                </div>
                               </td>
                             </tr>
 
                             {evidenceOpen && candidate && (
                               <tr className="sub-row">
                                 <td colSpan={6}>
-                                  <p className="muted">
+                                  <p className="muted" style={{ margin: 0 }}>
                                     判定依据：没有列在这里的内容不会被处理。
                                   </p>
                                   <ul className="sample-list">
@@ -710,7 +784,7 @@ export function CleanPage() {
                                     ))}
                                   </ul>
                                   {candidate.notes.map((line) => (
-                                    <p key={line} className="muted">
+                                    <p key={line} className="muted" style={{ margin: "4px 0 0" }}>
                                       {line}
                                     </p>
                                   ))}
@@ -729,7 +803,7 @@ export function CleanPage() {
                                         </span>
                                         <button
                                           type="button"
-                                          className="link"
+                                          className="btn-link"
                                           onClick={() => openLocation(rule.id, index)}
                                         >
                                           打开
@@ -758,53 +832,64 @@ export function CleanPage() {
 
                       {specialRules.map((rule) => (
                         <tr key={rule.id}>
-                          <td className="muted">独立操作</td>
+                          <td className="td-nowrap">
+                            <StatusBadge tone="danger">独立操作</StatusBadge>
+                          </td>
                           <td>{rule.name}</td>
-                          <td>{recycle ? formatSize(recycle.bytes) : "—"}</td>
-                          <td>
+                          <td className="td-num">{recycle ? formatSize(recycle.bytes) : "—"}</td>
+                          <td className="td-nowrap">
                             {recycle ? (
-                              <span className="status-badge status-ready">
+                              <StatusBadge tone="safe">
                                 {recycle.items.toLocaleString()} 项
-                              </span>
+                              </StatusBadge>
                             ) : (
-                              <span className="muted">读取失败</span>
+                              <StatusBadge tone="neutral">读取失败</StatusBadge>
                             )}
                           </td>
                           <td>
                             <span>{rule.description}</span>
-                            {rule.warning && <p className="warn">注意：{rule.warning}</p>}
+                            {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
                           </td>
                           <td>
-                            <button
-                              type="button"
-                              className="link"
-                              disabled={!recycle || execBusy || recycle.items === 0}
-                              onClick={emptyRecycle}
-                            >
-                              {recycleBusy ? "正在清空…" : "清空回收站"}
-                            </button>{" "}
-                            <button type="button" className="link" onClick={refreshRecycle}>
-                              重新查询
-                            </button>
+                            <div className="actions">
+                              <button
+                                type="button"
+                                className="btn btn-danger-outline"
+                                disabled={!recycle || execBusy || recycle.items === 0}
+                                onClick={emptyRecycle}
+                              >
+                                {recycleBusy ? "正在清空…" : "清空回收站"}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-subtle"
+                                onClick={refreshRecycle}
+                              >
+                                重新查询
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
-                </>
+                </div>
               ))}
           </div>
         );
       })}
 
       {maintenanceRules.length > 0 && (
-        <div className="card">
-          <div className="group-header">
-            <h3>系统维护（需要管理员）（{maintenanceRules.length}）</h3>
+        <div className="card card-tier-caution">
+          <div className="card-header">
+            <div className="card-title-group">
+              <h3 className="card-title">系统维护（需要管理员）（{maintenanceRules.length}）</h3>
+              <AdminTag />
+            </div>
             <div className="actions">
               <button
                 type="button"
-                className="link"
+                className="btn btn-subtle"
                 disabled={execBusy}
                 onClick={analyzeComponentStore}
               >
@@ -812,7 +897,7 @@ export function CleanPage() {
               </button>
               <button
                 type="button"
-                className="button-primary"
+                className="btn btn-danger-solid"
                 disabled={execBusy || maintenanceIds.length === 0}
                 onClick={() => runMaintenance(maintenanceIds)}
               >
@@ -820,161 +905,202 @@ export function CleanPage() {
               </button>
             </div>
           </div>
-          <p className="muted">
-            这些项走 Windows 自己的维护流程，需要管理员权限。勾选多项后点“执行选中项”，整个过程中只会弹出一次授权提示。
-            文件类操作按冻结清单逐项删除，被占用的文件跳过；DISM 组件存储清理不做 ResetBase，可能需要 10–30
-            分钟且无法取消，请勿关机；传递优化缓存调用官方 cmdlet。
-          </p>
-          <table className="table">
-            <thead>
-              <tr>
-                <th>选择</th>
-                <th>名称</th>
-                <th>说明</th>
-              </tr>
-            </thead>
-            <tbody>
-              {maintenanceRules.map((rule) => (
-                <tr key={rule.id}>
-                  <td>
-                    <input
-                      type="checkbox"
-                      checked={maintenanceSelected.has(rule.id)}
-                      disabled={maintenanceRunning || anyAnalyzeRunning}
-                      onChange={() => toggleMaintenance(rule.id)}
-                      aria-label={`选择 ${rule.name}`}
-                    />
-                  </td>
-                  <td>{rule.name}</td>
-                  <td>
-                    <span>{rule.description}</span>
-                    {rule.warning && <p className="warn">注意：{rule.warning}</p>}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
 
-          {anyAnalyzeRunning && <p className="muted">正在分析组件存储，可能需要几分钟…</p>}
-          {analyzeState?.phase === "failed" && (
-            <p className="warn">分析失败：{analyzeState.message}</p>
+          <div style={{ marginBottom: 12 }}>
+            <AlertBanner tone="warn">
+              这些项走 Windows 自己的维护流程，需要管理员权限。勾选多项后点“执行选中项”，整个过程中只会弹出一次授权提示。
+              文件类操作按冻结清单逐项删除，被占用的文件跳过；DISM 组件存储清理不做 ResetBase，可能需要 10–30
+              分钟且无法取消，请勿关机；传递优化缓存调用官方 cmdlet。
+            </AlertBanner>
+          </div>
+
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>选择</th>
+                  <th>名称</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                {maintenanceRules.map((rule) => (
+                  <tr key={rule.id}>
+                    <td className="td-nowrap">
+                      <input
+                        type="checkbox"
+                        className="checkbox-input"
+                        checked={maintenanceSelected.has(rule.id)}
+                        disabled={maintenanceRunning || anyAnalyzeRunning}
+                        onChange={() => toggleMaintenance(rule.id)}
+                        aria-label={`选择 ${rule.name}`}
+                      />
+                    </td>
+                    <td className="td-nowrap">{rule.name}</td>
+                    <td>
+                      <span>{rule.description}</span>
+                      {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {anyAnalyzeRunning && (
+            <p className="muted" style={{ marginTop: 10 }}>
+              正在分析组件存储，可能需要几分钟…
+            </p>
           )}
-          {analyzeState?.phase === "done" &&
-            analyzeState.result.ops.map((op) => (
-              <p key={op.op} className={op.status === "failed" ? "warn" : "muted"}>
-                {systemOpLabel(op.op)}：{op.detail}
-              </p>
-            ))}
+          {analyzeState?.phase === "failed" && (
+            <div style={{ marginTop: 10 }}>
+              <AlertBanner tone="danger">分析失败：{analyzeState.message}</AlertBanner>
+            </div>
+          )}
+          {analyzeState?.phase === "done" && (
+            <div className="summary-box">
+              {analyzeState.result.ops.map((op) => (
+                <p
+                  key={op.op}
+                  className={op.status === "failed" ? "danger-text" : "muted"}
+                  style={{ margin: "3px 0 0" }}
+                >
+                  {systemOpLabel(op.op)}：{op.detail}
+                </p>
+              ))}
+            </div>
+          )}
 
           {maintenanceRunning && (
-            <p className="muted">
+            <p className="muted" style={{ marginTop: 10 }}>
               {maintenanceProgress
                 ? `${systemOpLabel(maintenanceProgress.op)}：${maintenanceProgress.detail}`
                 : "等待管理员授权并执行…"}
             </p>
           )}
-          {maintenanceError && <p className="warn">系统维护失败：{maintenanceError}</p>}
+          {maintenanceError && (
+            <div style={{ marginTop: 10 }}>
+              <AlertBanner tone="danger">系统维护失败：{maintenanceError}</AlertBanner>
+            </div>
+          )}
           {maintenanceResult && (
-            <ul className="sample-list">
-              {maintenanceResult.ops.map((op) => (
-                <li key={op.op} className={op.status === "failed" ? "warn" : "muted"}>
-                  {systemOpLabel(op.op)}：{op.detail}
-                </li>
-              ))}
-            </ul>
+            <div className="summary-box">
+              <ul className="sample-list" style={{ marginTop: 0 }}>
+                {maintenanceResult.ops.map((op) => (
+                  <li key={op.op} className={op.status === "failed" ? "danger-text" : "muted"}>
+                    {systemOpLabel(op.op)}：{op.detail}
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
         </div>
       )}
 
       {commandRules.length > 0 && (
-        <div className="card">
-          <div className="group-header">
-            <h3>不可撤销命令（{commandRules.length}）</h3>
+        <div className="card card-tier-forbidden">
+          <div className="card-header">
+            <div className="card-title-group">
+              <h3 className="card-title">不可撤销命令（{commandRules.length}）</h3>
+              <StatusBadge tone="danger" icon={<IconTerminal width={12} height={12} />}>
+                不可撤销 · 无逐文件预览
+              </StatusBadge>
+            </div>
           </div>
-          <p className="muted">
+          <p className="card-lead">
             这些项调用工具自己的官方命令清理缓存，没有逐文件预览，执行后无法撤销。失败或超时只报告，不会强行终止命令。
           </p>
-          <table className="table">
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>占盘大小</th>
-                <th>状态</th>
-                <th>说明</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {commandRules.map((rule) => {
-                const candidate = candidates.get(rule.id);
-                const state = commandStates[rule.id];
-                const badge = statusBadge(candidate, rule);
-                const note = statusNote(candidate);
-                const running = state?.phase === "running";
-                // 作用范围要在确认框里写清楚，没解析出缓存路径就不能运行。
-                const paths = candidate?.anchors ?? [];
-                const scope = paths.join("、");
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>占盘大小</th>
+                  <th>状态</th>
+                  <th>说明</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {commandRules.map((rule) => {
+                  const candidate = candidates.get(rule.id);
+                  const state = commandStates[rule.id];
+                  const badge = statusBadge(candidate, rule);
+                  const note = statusNote(candidate);
+                  const running = state?.phase === "running";
+                  // 作用范围要在确认框里写清楚，没解析出缓存路径就不能运行。
+                  const paths = candidate?.anchors ?? [];
+                  const scope = paths.join("、");
 
-                return (
-                  <Fragment key={rule.id}>
-                    <tr>
-                      <td>{rule.name}</td>
-                      <td>{candidate ? formatSize(candidate.allocated) : "—"}</td>
-                      <td>
-                        {badge ? (
-                          <span className={`status-badge status-${badge.kind}`}>{badge.label}</span>
-                        ) : (
-                          "—"
-                        )}
-                      </td>
-                      <td>
-                        <span>{rule.description}</span>
-                        {rule.warning && <p className="warn">注意：{rule.warning}</p>}
-                        {note && <p className="muted">{note}</p>}
-                        {paths.length > 0 && (
-                          <p className="path-text" title={scope}>
-                            {scope}
-                          </p>
-                        )}
-                      </td>
-                      <td>
-                        <button
-                          type="button"
-                          className="link"
-                          disabled={candidate?.executable !== true || execBusy || scope === ""}
-                          onClick={() => runCommand(rule, scope)}
-                        >
-                          {running ? "运行中…" : "运行"}
-                        </button>
-                      </td>
-                    </tr>
-
-                    {running && (
-                      <tr className="sub-row">
-                        <td colSpan={5}>
-                          <p className="muted">运行中…（超时只报告，不会强行终止）</p>
+                  return (
+                    <Fragment key={rule.id}>
+                      <tr>
+                        <td className="td-nowrap">{rule.name}</td>
+                        <td className="td-num">
+                          {candidate ? formatSize(candidate.allocated) : "—"}
+                        </td>
+                        <td className="td-nowrap">
+                          {badge ? (
+                            <StatusBadge tone={CANDIDATE_TONES[badge.kind]}>
+                              {badge.label}
+                            </StatusBadge>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td>
+                          <span>{rule.description}</span>
+                          {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
+                          {note && <p className="muted" style={{ margin: "3px 0 0" }}>{note}</p>}
+                          {paths.length > 0 && (
+                            <p className="path-text" style={{ margin: "4px 0 0" }} title={scope}>
+                              {scope}
+                            </p>
+                          )}
+                        </td>
+                        <td>
+                          <button
+                            type="button"
+                            className="btn btn-danger-outline"
+                            disabled={candidate?.executable !== true || execBusy || scope === ""}
+                            onClick={() => runCommand(rule, scope)}
+                          >
+                            {running ? "运行中…" : "运行"}
+                          </button>
                         </td>
                       </tr>
-                    )}
 
-                    {state?.phase === "done" && (
-                      <tr className="sub-row">
-                        <td colSpan={5}>{commandResult(state.report)}</td>
-                      </tr>
-                    )}
+                      {running && (
+                        <tr className="sub-row">
+                          <td colSpan={5}>
+                            <p className="muted" style={{ margin: 0 }}>
+                              运行中…（超时只报告，不会强行终止）
+                            </p>
+                          </td>
+                        </tr>
+                      )}
 
-                    {state?.phase === "failed" && (
-                      <tr className="sub-row">
-                        <td colSpan={5}>
-                          <p className="warn">执行失败：{state.message}</p>
-                        </td>
-                      </tr>
-                    )}
-                  </Fragment>
-                );
-              })}
-            </tbody>
-          </table>
+                      {state?.phase === "done" && (
+                        <tr className="sub-row">
+                          <td colSpan={5}>{commandResult(state.report)}</td>
+                        </tr>
+                      )}
+
+                      {state?.phase === "failed" && (
+                        <tr className="sub-row">
+                          <td colSpan={5}>
+                            <p className="danger-text" style={{ margin: 0 }}>
+                              执行失败：{state.message}
+                            </p>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
@@ -1059,18 +1185,24 @@ function commandResult(report: CommandReport) {
   return (
     <>
       {report.timedOut ? (
-        <p className="warn">
+        <p className="warn-text" style={{ margin: 0 }}>
           命令超时，已停止等待；没有强行终止进程，它可能还在运行（缓存 {size}）
         </p>
       ) : report.exitCode === 0 ? (
-        <p className="muted">命令已结束：缓存 {size}</p>
+        <p className="muted td-num" style={{ margin: 0 }}>
+          命令已结束：缓存 {size}
+        </p>
       ) : (
-        <p className="warn">
+        <p className="danger-text" style={{ margin: 0 }}>
           命令失败（退出码 {report.exitCode ?? "未知"}）：缓存 {size}
         </p>
       )}
-      {report.output && <p className="path-text">{report.output}</p>}
-      {report.logError && <p className="warn">{report.logError}</p>}
+      {report.output && (
+        <p className="path-text" style={{ margin: "4px 0 0" }}>
+          {report.output}
+        </p>
+      )}
+      {report.logError && <p className="danger-text">{report.logError}</p>}
     </>
   );
 }
@@ -1078,19 +1210,29 @@ function commandResult(report: CommandReport) {
 // 提权执行的结果：等待授权、失败原因，或者每个内置操作的说明。
 function elevatedResult(state: ElevatedState) {
   if (state.phase === "running") {
-    return <p className="muted">等待管理员授权并执行…</p>;
+    return (
+      <p className="muted" style={{ margin: 0 }}>
+        等待管理员授权并执行…
+      </p>
+    );
   }
   if (state.phase === "failed") {
-    return <p className="warn">提权执行失败：{state.message}</p>;
+    return (
+      <p className="danger-text" style={{ margin: 0 }}>
+        提权执行失败：{state.message}
+      </p>
+    );
   }
 
   return (
     <>
       {state.result.ops.map((op) => (
         <Fragment key={op.op}>
-          <p className={op.status === "failed" ? "warn" : "muted"}>{op.detail}</p>
+          <p className={op.status === "failed" ? "danger-text" : "muted"} style={{ margin: 0 }}>
+            {op.detail}
+          </p>
           {op.conflicts.length > 0 && (
-            <p className="muted">
+            <p className="muted" style={{ margin: "4px 0 0" }}>
               原位置已有同名文件、因此没有还原：{op.conflicts.join("、")}
             </p>
           )}
@@ -1103,17 +1245,25 @@ function elevatedResult(state: ElevatedState) {
 // 占用检查的结果：占用进程列表，或者“未发现占用 / 检测不完整”。
 function lockResult(state: LockState) {
   if (state.phase === "loading") {
-    return <p className="muted">正在检查占用…</p>;
+    return (
+      <p className="muted" style={{ margin: 0 }}>
+        正在检查占用…
+      </p>
+    );
   }
   if (state.phase === "failed") {
-    return <p className="warn">检测失败：{state.message}</p>;
+    return (
+      <p className="danger-text" style={{ margin: 0 }}>
+        检测失败：{state.message}
+      </p>
+    );
   }
 
   const { report } = state;
   return (
     <>
       {report.lockers.length > 0 ? (
-        <ul className="locker-list">
+        <ul className="locker-list" style={{ marginTop: 0 }}>
           {report.lockers.map((locker) => (
             <li key={`${locker.pid}-${locker.appName}`}>
               {locker.appName}（PID {locker.pid}）
@@ -1122,12 +1272,12 @@ function lockResult(state: LockState) {
           ))}
         </ul>
       ) : (
-        <p className="muted">
+        <p className="muted" style={{ margin: 0 }}>
           本次未发现占用（检测 {report.checked}/{report.total} 个文件）
         </p>
       )}
       {!report.complete && (
-        <p className="warn">检测不完整：{report.error ?? "未知原因"}</p>
+        <p className="warn-text">检测不完整：{report.error ?? "未知原因"}</p>
       )}
     </>
   );

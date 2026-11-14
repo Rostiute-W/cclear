@@ -17,9 +17,9 @@ pub fn run() {
                 .join("webview");
 
             WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
-                .title("CClear — C 盘清理")
-                .inner_size(1280.0, 820.0)
-                .min_inner_size(1000.0, 680.0)
+                .title("CClear · C 盘清理")
+                .inner_size(1240.0, 800.0)
+                .min_inner_size(1040.0, 680.0)
                 .data_directory(data_directory)
                 .build()?;
 

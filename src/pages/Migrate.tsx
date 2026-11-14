@@ -17,6 +17,7 @@ import {
   migrationsList,
 } from "../api";
 import { PlanPreview } from "../components/PlanPreview";
+import { AlertBanner, StatusBadge, type SemanticTone } from "../components/Ui";
 import { formatSize } from "../format";
 import type {
   DirMigration,
@@ -56,6 +57,43 @@ const DIR_STEPS: readonly [DirMigrationStage, string][] = [
   ["backupDeleted", "删除备份"],
   ["done", "完成"],
 ];
+
+function toolStageTone(stage: string): SemanticTone {
+  switch (stage) {
+    case "verified":
+    case "cleaned":
+      return "safe";
+    case "cleanupPlanned":
+    case "needsAttention":
+      return "caution";
+    case "failed":
+      return "danger";
+    case "planned":
+    case "configured":
+      return "info";
+    case "reverted":
+    default:
+      return "neutral";
+  }
+}
+
+function dirStageTone(stage: DirMigrationStage): SemanticTone {
+  switch (stage) {
+    case "done":
+    case "validated":
+    case "backupDeleted":
+    case "returned":
+      return "safe";
+    case "awaitingUserTest":
+    case "needsAttention":
+    case "returning":
+      return "caution";
+    case "failed":
+      return "danger";
+    default:
+      return "info";
+  }
+}
 
 export function MigratePage({
   initialSourceId,
@@ -266,77 +304,96 @@ export function MigratePage({
   };
 
   return (
-    <section>
-      <h2>迁移</h2>
+    <section className="page-section">
+      <div className="page-header">
+        <div>
+          <h2 className="page-title">迁移</h2>
+          <p className="page-subtitle">修改工具官方缓存配置，或通过 junction 迁出纯数据目录</p>
+        </div>
+      </div>
 
-      {error && <p className="warn">{error}</p>}
-      {message && <p className="muted">{message}</p>}
+      {error && <AlertBanner tone="danger">{error}</AlertBanner>}
+      {message && <AlertBanner tone="success">{message}</AlertBanner>}
 
       {/* 启动恢复的结果和记录文件的读取提示都要让人看得见。 */}
       {alerts.length > 0 && (
-        <ul className="warn">
-          {alerts.map((note) => (
-            <li key={note}>{note}</li>
-          ))}
-        </ul>
+        <AlertBanner tone="warn">
+          <ul>
+            {alerts.map((note) => (
+              <li key={note}>{note}</li>
+            ))}
+          </ul>
+        </AlertBanner>
       )}
 
       {/* 确认之前后端不写记录：先核对状态，再决定用不用这份备份。 */}
       {needsConfirm && (
-        <div className="card">
-          <p className="warn">
-            迁移记录是从备份读出来的：确认使用备份之前，迁移和撤销都不会写回记录。
-          </p>
-          <div className="actions">
-            <button type="button" disabled={busy} onClick={onConfirmBackup}>
+        <AlertBanner
+          tone="danger"
+          actions={
+            <button
+              type="button"
+              className="btn btn-danger-outline"
+              disabled={busy}
+              onClick={onConfirmBackup}
+            >
               确认使用备份
             </button>
-          </div>
-        </div>
+          }
+        >
+          <span>迁移记录是从备份读出来的：确认使用备份之前，迁移和撤销都不会写回记录。</span>
+        </AlertBanner>
       )}
 
       <div className="card">
-        <h3>目标盘与方式</h3>
+        <div className="card-header">
+          <h3 className="card-title">目标盘与方式</h3>
+          <span className="muted">迁移后原配置可撤销恢复</span>
+        </div>
 
         {!state && <p className="muted">正在读取工具缓存位置…</p>}
 
         {state && (
           <>
-            <div className="volume-row">
-              <span className="volume-name">目标盘</span>
-              <select
-                value={volume}
-                disabled={busy || state.volumes.length === 0}
-                onChange={(event) => setVolume(event.target.value)}
-              >
-                {state.volumes.map((item) => (
-                  <option key={item.root} value={item.root}>
-                    {item.root} {item.label}（剩余 {formatSize(item.free)}）
-                  </option>
-                ))}
-              </select>
-            </div>
+            <div className="form-grid">
+              <div className="field-row">
+                <span className="field-label">目标盘</span>
+                <select
+                  className="select-input"
+                  value={volume}
+                  disabled={busy || state.volumes.length === 0}
+                  onChange={(event) => setVolume(event.target.value)}
+                >
+                  {state.volumes.map((item) => (
+                    <option key={item.root} value={item.root}>
+                      {item.root} {item.label}（剩余 {formatSize(item.free)}）
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-            <div className="volume-row">
-              <span className="volume-name">迁移方式</span>
-              <select
-                value={mode}
-                disabled={busy}
-                onChange={(event) => setMode(event.target.value as MigrationMode)}
-              >
-                <option value="migrate">迁移旧缓存：先复制并校验，再改配置</option>
-                <option value="rebuild">允许重建：不复制，工具在新位置重新下载</option>
-              </select>
+              <div className="field-row">
+                <span className="field-label">迁移方式</span>
+                <select
+                  className="select-input"
+                  value={mode}
+                  disabled={busy}
+                  onChange={(event) => setMode(event.target.value as MigrationMode)}
+                >
+                  <option value="migrate">迁移旧缓存：先复制并校验，再改配置</option>
+                  <option value="rebuild">允许重建：不复制，工具在新位置重新下载</option>
+                </select>
+              </div>
             </div>
 
             {state.volumes.length === 0 && (
-              <p className="warn">
+              <AlertBanner tone="warn">
                 没有可用的目标盘：缓存目录只能放在非系统盘的本地 NTFS 固定盘上。
-              </p>
+              </AlertBanner>
             )}
             {state.volumes.length > 0 && (
-              <p className="muted">
-                缓存会放在 {volume}CClearData\ 下面，各工具一个子目录。
+              <p className="muted" style={{ margin: "6px 0 0" }}>
+                缓存会放在 <span className="path-text">{volume}CClearData\</span> 下面，各工具一个子目录。
               </p>
             )}
           </>
@@ -344,149 +401,185 @@ export function MigratePage({
       </div>
 
       <div className="card">
-        <h3>工具缓存目录</h3>
+        <div className="card-header">
+          <h3 className="card-title">工具缓存目录</h3>
+          <span className="muted">官方配置写入后再用新进程验证路径</span>
+        </div>
 
         {state && (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>工具</th>
-                <th>当前路径</th>
-                <th>大小</th>
-                <th>在 C 盘</th>
-                <th>状态</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {state.tools.map((tool) => (
-                <tr key={tool.tool}>
-                  <td>{tool.label}</td>
-                  <td>
-                    {tool.entries.map((entry) => (
-                      <div key={entry.name}>
-                        <span className="muted">{entry.name}：</span>
-                        <span className="path-text" title={entry.path}>
-                          {entry.path}
-                        </span>
-                        <span className="muted">
-                          （{entry.source}
-                          {entry.exists ? "" : "，目录不存在"}）
-                        </span>
-                      </div>
-                    ))}
-                    {tool.warning && <div className="warn">{tool.warning}</div>}
-                    {mode === "rebuild" && !tool.supportsRebuild && (
-                      <div className="warn">
-                        {tool.label} 无法查询自己的缓存位置，只支持“迁移旧缓存”。
-                      </div>
-                    )}
-                    {tool.needsProgram && !tool.installed && (
-                      <div className="warn">没有在 PATH 里找到 {tool.label}，无法验证新位置。</div>
-                    )}
-                  </td>
-                  <td>{formatSize(tool.totalSize)}</td>
-                  <td>{tool.onSystemDrive ? "是" : "否"}</td>
-                  <td>
-                    {tool.stageLabel ? (
-                      <span className="status-badge">{tool.stageLabel}</span>
-                    ) : (
-                      <span className="muted">还没迁移</span>
-                    )}
-                    {tool.note && <div className="muted">{tool.note}</div>}
-                    {tool.target && <div className="muted">目标：{tool.target}</div>}
-                  </td>
-                  <td>
-                    <div className="actions">
-                      <button
-                        type="button"
-                        disabled={
-                          busy ||
-                          planRunning ||
-                          !volume ||
-                          (tool.needsProgram && !tool.installed) ||
-                          // 不支持重建的工具（Gradle）在这里禁用，避免选了做不到的方式。
-                          (mode === "rebuild" && !tool.supportsRebuild)
-                        }
-                        onClick={() => onStart(tool)}
-                      >
-                        开始迁移
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy || planRunning || tool.oldDirs.length === 0}
-                        onClick={() => onCleanup(tool)}
-                      >
-                        清理旧目录
-                      </button>
-                      <button
-                        type="button"
-                        disabled={
-                          busy ||
-                          planRunning ||
-                          !REVERTIBLE_STAGES.includes(tool.stage ?? "")
-                        }
-                        onClick={() => onRevert(tool)}
-                      >
-                        撤销
-                      </button>
-                    </div>
-                    {tool.oldDirs.length > 0 && (
-                      <div className="muted">旧目录：{tool.oldDirs.join("、")}</div>
-                    )}
-                  </td>
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>工具</th>
+                  <th>当前路径</th>
+                  <th>大小</th>
+                  <th>在 C 盘</th>
+                  <th>状态</th>
+                  <th>操作</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {state.tools.map((tool) => (
+                  <tr key={tool.tool}>
+                    <td className="td-nowrap">{tool.label}</td>
+                    <td>
+                      {tool.entries.map((entry) => (
+                        <div className="entry-line" key={entry.name}>
+                          <span className="muted">{entry.name}：</span>
+                          <span className="path-text" title={entry.path}>
+                            {entry.path}
+                          </span>
+                          <span className="muted">
+                            （{entry.source}
+                            {entry.exists ? "" : "，目录不存在"}）
+                          </span>
+                        </div>
+                      ))}
+                      {tool.warning && <div className="warn-text">{tool.warning}</div>}
+                      {mode === "rebuild" && !tool.supportsRebuild && (
+                        <div className="warn-text">
+                          {tool.label} 无法查询自己的缓存位置，只支持“迁移旧缓存”。
+                        </div>
+                      )}
+                      {tool.needsProgram && !tool.installed && (
+                        <div className="warn-text">
+                          没有在 PATH 里找到 {tool.label}，无法验证新位置。
+                        </div>
+                      )}
+                    </td>
+                    <td className="td-num">{formatSize(tool.totalSize)}</td>
+                    <td className="td-nowrap">
+                      <StatusBadge tone={tool.onSystemDrive ? "caution" : "safe"}>
+                        {tool.onSystemDrive ? "是" : "否"}
+                      </StatusBadge>
+                    </td>
+                    <td>
+                      {tool.stageLabel && tool.stage ? (
+                        <StatusBadge tone={toolStageTone(tool.stage)}>
+                          {tool.stageLabel}
+                        </StatusBadge>
+                      ) : (
+                        <StatusBadge tone="neutral">还没迁移</StatusBadge>
+                      )}
+                      {tool.note && (
+                        <div className="muted" style={{ marginTop: 4 }}>
+                          {tool.note}
+                        </div>
+                      )}
+                      {tool.target && (
+                        <div className="muted" style={{ marginTop: 2 }}>
+                          目标：<span className="path-text">{tool.target}</span>
+                        </div>
+                      )}
+                    </td>
+                    <td>
+                      <div className="actions">
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          disabled={
+                            busy ||
+                            planRunning ||
+                            !volume ||
+                            (tool.needsProgram && !tool.installed) ||
+                            // 不支持重建的工具（Gradle）在这里禁用，避免选了做不到的方式。
+                            (mode === "rebuild" && !tool.supportsRebuild)
+                          }
+                          onClick={() => onStart(tool)}
+                        >
+                          开始迁移
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-subtle"
+                          disabled={busy || planRunning || tool.oldDirs.length === 0}
+                          onClick={() => onCleanup(tool)}
+                        >
+                          清理旧目录
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-subtle"
+                          disabled={
+                            busy ||
+                            planRunning ||
+                            !REVERTIBLE_STAGES.includes(tool.stage ?? "")
+                          }
+                          onClick={() => onRevert(tool)}
+                        >
+                          撤销
+                        </button>
+                      </div>
+                      {tool.oldDirs.length > 0 && (
+                        <div className="muted" style={{ marginTop: 4 }}>
+                          旧目录：<span className="path-text">{tool.oldDirs.join("、")}</span>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
 
-        <p className="muted">
-          CARGO_HOME 和 RUSTUP_HOME 不提供自动迁移：请先手工把旧内容移到新位置，再改这两个环境变量，
-          否则 Cargo 会按新位置重新下载全部依赖。
-        </p>
-        <p className="muted">
-          迁移完成后请重启 IDE 和终端：已经在运行的程序不会读取新的环境变量。
-        </p>
+        <div className="notice-stack">
+          <p className="muted">
+            CARGO_HOME 和 RUSTUP_HOME 不提供自动迁移：请先手工把旧内容移到新位置，再改这两个环境变量，
+            否则 Cargo 会按新位置重新下载全部依赖。
+          </p>
+          <p className="muted">
+            迁移完成后请重启 IDE 和终端：已经在运行的程序不会读取新的环境变量。
+          </p>
+        </div>
       </div>
 
       <div className="card">
-        <h3>目录迁移</h3>
+        <div className="card-header">
+          <h3 className="card-title">目录迁移</h3>
+          <StatusBadge tone="info">仅限纯数据目录 · junction</StatusBadge>
+        </div>
 
-        <p className="muted">
+        <p className="card-lead">
           只迁移纯数据目录：把目录复制到其他盘，在原位置留下 junction，原路径照常可访问。
           备份和目标里的旧副本都要你确认之后才删除。
         </p>
 
         {!dirCheck && (
-          <p className="muted">
+          <p className="muted" style={{ margin: 0 }}>
             在“空间分析”页选一个目录，点“迁移到其他盘…”，这里会显示资格检查结果。
           </p>
         )}
 
         {dirCheck && (
-          <>
-            <div className="volume-row">
-              <span className="volume-name">待迁移目录</span>
+          <div className="summary-box" style={{ marginTop: 0, marginBottom: dirs?.records.length ? 14 : 0 }}>
+            <div className="field-row" style={{ marginBottom: 8 }}>
+              <span className="field-label">待迁移目录</span>
               <span className="path-text" title={dirCheck.path}>
                 {dirCheck.path}
               </span>
-              <span className="muted">（占盘 {formatSize(dirCheck.allocated)}）</span>
+              <span className="muted td-num">（占盘 {formatSize(dirCheck.allocated)}）</span>
             </div>
 
             {dirCheck.eligible ? (
-              <p className="muted">资格检查通过：没有链接、程序文件、加密文件或云占位符。</p>
+              <AlertBanner tone="success">
+                资格检查通过：没有链接、程序文件、加密文件或云占位符。
+              </AlertBanner>
             ) : (
-              <ul className="warn">
-                {dirCheck.reasons.map((reason) => (
-                  <li key={reason}>{reason}</li>
-                ))}
-              </ul>
+              <AlertBanner tone="danger">
+                <ul>
+                  {dirCheck.reasons.map((reason) => (
+                    <li key={reason}>{reason}</li>
+                  ))}
+                </ul>
+              </AlertBanner>
             )}
 
-            <div className="actions">
+            <div className="actions" style={{ marginTop: 10 }}>
               <button
                 type="button"
+                className="btn btn-primary"
                 disabled={busy || planRunning || !dirCheck.eligible || !volume}
                 onClick={() => onDirStart(dirCheck)}
               >
@@ -494,7 +587,7 @@ export function MigratePage({
               </button>
               <button
                 type="button"
-                className="link"
+                className="btn btn-subtle"
                 disabled={busy}
                 onClick={() => {
                   setDirCheck(null);
@@ -504,76 +597,90 @@ export function MigratePage({
                 取消
               </button>
             </div>
-          </>
+          </div>
         )}
 
         {dirs && dirs.records.length > 0 && (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>目录</th>
-                <th>状态</th>
-                <th>步骤</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {dirs.records.map((record) => (
-                <tr key={record.id}>
-                  <td>
-                    <div className="path-text" title={record.source}>
-                      {record.source}
-                    </div>
-                    <div className="muted">目标：{record.target}</div>
-                    <div className="muted">备份：{record.backup}</div>
-                  </td>
-                  <td>
-                    <span className="status-badge">{record.stageLabel}</span>
-                    {record.note && <div className="muted">{record.note}</div>}
-                  </td>
-                  <td>{timeline(record.stage)}</td>
-                  <td>
-                    <div className="actions">
-                      <button
-                        type="button"
-                        disabled={busy || planRunning || !record.resumable}
-                        onClick={() => onDirContinue(record)}
-                      >
-                        继续
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy || planRunning || !record.canDeleteBackup}
-                        onClick={() => onDirDeleteBackup(record)}
-                      >
-                        确认删除备份
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy || planRunning || !record.hasJunction}
-                        onClick={() => onDirReturn(record)}
-                      >
-                        迁回
-                      </button>
-                      <button
-                        type="button"
-                        // 只有迁回之后目标里的数据才是“旧副本”，迁移成功后它仍是活的数据。
-                        disabled={
-                          busy ||
-                          planRunning ||
-                          record.stage !== "returned" ||
-                          !record.targetExists
-                        }
-                        onClick={() => onDirDiscardTarget(record)}
-                      >
-                        删除旧副本
-                      </button>
-                    </div>
-                  </td>
+          <div className="table-wrap" style={{ marginTop: 12 }}>
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>目录</th>
+                  <th>状态</th>
+                  <th>步骤</th>
+                  <th>操作</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {dirs.records.map((record) => (
+                  <tr key={record.id}>
+                    <td>
+                      <div className="path-text" title={record.source}>
+                        {record.source}
+                      </div>
+                      <div className="muted" style={{ marginTop: 3 }}>
+                        目标：<span className="path-text">{record.target}</span>
+                      </div>
+                      <div className="muted" style={{ marginTop: 2 }}>
+                        备份：<span className="path-text">{record.backup}</span>
+                      </div>
+                    </td>
+                    <td>
+                      <StatusBadge tone={dirStageTone(record.stage)}>{record.stageLabel}</StatusBadge>
+                      {record.note && (
+                        <div className="muted" style={{ marginTop: 4 }}>
+                          {record.note}
+                        </div>
+                      )}
+                    </td>
+                    <td>{timeline(record.stage)}</td>
+                    <td>
+                      <div className="actions">
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          disabled={busy || planRunning || !record.resumable}
+                          onClick={() => onDirContinue(record)}
+                        >
+                          继续
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-danger-outline"
+                          disabled={busy || planRunning || !record.canDeleteBackup}
+                          onClick={() => onDirDeleteBackup(record)}
+                        >
+                          确认删除备份
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-subtle"
+                          disabled={busy || planRunning || !record.hasJunction}
+                          onClick={() => onDirReturn(record)}
+                        >
+                          迁回
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-danger-outline"
+                          // 只有迁回之后目标里的数据才是“旧副本”，迁移成功后它仍是活的数据。
+                          disabled={
+                            busy ||
+                            planRunning ||
+                            record.stage !== "returned" ||
+                            !record.targetExists
+                          }
+                          onClick={() => onDirDiscardTarget(record)}
+                        >
+                          删除旧副本
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
 

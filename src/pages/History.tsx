@@ -1,6 +1,8 @@
 // 历史页：按日志列出每次清理的汇总，点开看每条规则的删除数和跳过原因。
 import { useEffect, useState } from "react";
 import { historyDetail, historyList, rulesCatalog } from "../api";
+import { IconHistory } from "../components/Icons";
+import { AlertBanner, EmptyState, StatusBadge } from "../components/Ui";
 import { formatSize, formatTime } from "../format";
 import type { PlanDetail, PlanHistoryEntry } from "../types";
 
@@ -53,99 +55,147 @@ export function HistoryPage() {
   };
 
   return (
-    <section>
-      <h2>历史</h2>
+    <section className="page-section">
+      <div className="page-header">
+        <div>
+          <h2 className="page-title">历史</h2>
+          <p className="page-subtitle">只读展示最近 {HISTORY_DAYS} 天的执行日志、释放空间与跳过原因</p>
+        </div>
+      </div>
 
-      {error && <p className="warn">{error}</p>}
+      {error && <AlertBanner tone="danger">{error}</AlertBanner>}
       {skippedLines > 0 && (
-        <p className="warn">
+        <AlertBanner tone="warn">
           日志里有 {skippedLines} 行无法解析，下面的历史可能不完整。
-        </p>
+        </AlertBanner>
       )}
 
       {plans.length === 0 ? (
-        <p className="placeholder">最近 {HISTORY_DAYS} 天还没有清理记录。</p>
+        <div className="card">
+          <EmptyState
+            icon={<IconHistory />}
+            title="暂无清理记录"
+            description={`最近 ${HISTORY_DAYS} 天还没有清理记录。`}
+          />
+        </div>
       ) : (
-        <p className="muted">点击时间可以查看这次清理的详情。</p>
-      )}
-
-      {plans.length > 0 && (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>时间</th>
-              <th>规则</th>
-              <th>释放空间</th>
-              <th>跳过数</th>
-            </tr>
-          </thead>
-          <tbody>
-            {plans.map((plan) => (
-              <tr key={plan.planId}>
-                <td>
-                  <button type="button" className="link" onClick={() => toggleDetail(plan.planId)}>
-                    {formatTime(plan.startedAt)}
-                  </button>
-                  {plan.cancelled && <span className="muted">（已取消）</span>}
-                  {!plan.finished && !plan.cancelled && <span className="muted">（未完成）</span>}
-                </td>
-                <td>{ruleSummary(plan, nameOf)}</td>
-                <td>{formatSize(plan.freedAllocated)}</td>
-                <td>{plan.skipped.toLocaleString()}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div className="card">
+          <div className="card-header">
+            <h3 className="card-title">最近清理记录</h3>
+            <span className="muted">点击时间可以查看这次清理的详情</span>
+          </div>
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>状态</th>
+                  <th>规则</th>
+                  <th>释放空间</th>
+                  <th>跳过数</th>
+                </tr>
+              </thead>
+              <tbody>
+                {plans.map((plan) => (
+                  <tr key={plan.planId}>
+                    <td className="td-nowrap">
+                      <button
+                        type="button"
+                        className="btn-link"
+                        onClick={() => toggleDetail(plan.planId)}
+                      >
+                        {formatTime(plan.startedAt)}
+                      </button>
+                    </td>
+                    <td className="td-nowrap">
+                      {plan.cancelled ? (
+                        <StatusBadge tone="caution">已取消</StatusBadge>
+                      ) : !plan.finished ? (
+                        <StatusBadge tone="danger">未完成</StatusBadge>
+                      ) : (
+                        <StatusBadge tone="safe">已正常结束</StatusBadge>
+                      )}
+                    </td>
+                    <td>{ruleSummary(plan, nameOf)}</td>
+                    <td className="td-num">{formatSize(plan.freedAllocated)}</td>
+                    <td className="td-num">{plan.skipped.toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
       )}
 
       {openPlan && (
         <div className="card">
-          <h3>清理详情</h3>
+          <div className="card-header">
+            <h3 className="card-title">清理详情</h3>
+            {detail && (
+              <StatusBadge
+                tone={detail.cancelled ? "caution" : detail.finished ? "safe" : "danger"}
+              >
+                {finishLabel(detail)}
+              </StatusBadge>
+            )}
+          </div>
 
           {loading && <p className="muted">正在读取日志…</p>}
 
           {detail && (
             <>
-              <p className="muted">
-                执行前剩余 {formatSize(detail.freeBefore)}，执行后剩余{" "}
-                {formatSize(detail.freeAfter)}（{finishLabel(detail)}）。
-              </p>
+              <dl className="stats-grid" style={{ marginBottom: 14 }}>
+                <div className="stat-tile">
+                  <dt>执行前剩余</dt>
+                  <dd>{formatSize(detail.freeBefore)}</dd>
+                </div>
+                <div className="stat-tile">
+                  <dt>执行后剩余</dt>
+                  <dd>{formatSize(detail.freeAfter)}</dd>
+                </div>
+                <div className="stat-tile">
+                  <dt>结束状态</dt>
+                  <dd>{finishLabel(detail)}</dd>
+                </div>
+              </dl>
 
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>规则</th>
-                    <th>删除文件</th>
-                    <th>删除目录</th>
-                    <th>释放空间</th>
-                    <th>跳过</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {detail.rules.length === 0 && (
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
                     <tr>
-                      <td colSpan={5} className="muted">
-                        日志里没有这次清理的规则记录
-                      </td>
+                      <th>规则</th>
+                      <th>删除文件</th>
+                      <th>删除目录</th>
+                      <th>释放空间</th>
+                      <th>跳过</th>
                     </tr>
-                  )}
-                  {detail.rules.map((rule) => (
-                    <tr key={rule.ruleId}>
-                      <td>{nameOf(rule.ruleId)}</td>
-                      <td>{rule.deletedFiles.toLocaleString()}</td>
-                      <td>{rule.deletedDirs.toLocaleString()}</td>
-                      <td>{formatSize(rule.freedAllocated)}</td>
-                      <td>{rule.skipped.toLocaleString()}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {detail.rules.length === 0 && (
+                      <tr>
+                        <td colSpan={5} className="muted">
+                          日志里没有这次清理的规则记录
+                        </td>
+                      </tr>
+                    )}
+                    {detail.rules.map((rule) => (
+                      <tr key={rule.ruleId}>
+                        <td>{nameOf(rule.ruleId)}</td>
+                        <td className="td-num">{rule.deletedFiles.toLocaleString()}</td>
+                        <td className="td-num">{rule.deletedDirs.toLocaleString()}</td>
+                        <td className="td-num">{formatSize(rule.freedAllocated)}</td>
+                        <td className="td-num">{rule.skipped.toLocaleString()}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
 
               {detail.skipped.length > 0 && (
-                <>
-                  <p className="muted">
+                <div className="summary-box">
+                  <p className="summary-title">
                     跳过原因（显示 {detail.skipped.length} 条，共{" "}
-                    {detail.skippedTotal.toLocaleString()} 条）：
+                    {detail.skippedTotal.toLocaleString()} 条）
                   </p>
                   <ul className="sample-list">
                     {detail.skipped.map((skipped) => (
@@ -157,7 +207,7 @@ export function HistoryPage() {
                       </li>
                     ))}
                   </ul>
-                </>
+                </div>
               )}
             </>
           )}
