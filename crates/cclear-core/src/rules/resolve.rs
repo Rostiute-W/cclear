@@ -1,17 +1,14 @@
 //! 路径模板的候选解析：解析锚点、统计大小、判断状态。
 
 use std::collections::HashSet;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{CoreError, Result};
-use crate::model::{KnownRoot, Phase, SizeInfo, Tier};
+use crate::model::{FileIdentity, KnownRoot, Phase, SizeInfo, Tier};
 use crate::rules::catalog::{ENABLED_PHASES, Rule, SelectKind, Selector, Target};
 use crate::rules::forbidden;
-use crate::scan::{EntryInfo, FileFilter, ScanOptions, ScanProgress, scan};
+use crate::scan::{FileCount, classify_file};
 use crate::win::process::ProcInfo;
 use crate::win::restart_manager::{LockReport, query_lockers};
 use crate::win::{KnownFolder, dirinfo, known_folder};
@@ -167,22 +164,29 @@ pub fn resolve_anchors(rule: &Rule, roots: &RootMap) -> Vec<PathBuf> {
                 return Vec::new();
             };
 
+            // `user_data` 是多级路径，每一级都要校验：中间某一级是 junction 时，末级会被带到别处。
+            if !plain_dirs_below(base, user_data) {
+                return Vec::new();
+            }
             let user_data = base.join(user_data);
+
             let mut anchors = Vec::new();
 
             for profile in chromium_profiles(&user_data) {
+                let profile_dir = user_data.join(&profile);
+                if !dirinfo::is_plain_dir(&profile_dir) {
+                    continue;
+                }
                 for leaf in *leaves {
-                    let path = user_data.join(&profile).join(leaf);
-                    if path.is_dir() {
-                        anchors.push(path);
+                    if plain_dirs_below(&profile_dir, leaf) {
+                        anchors.push(profile_dir.join(leaf));
                     }
                 }
             }
 
             for leaf in *root_leaves {
-                let path = user_data.join(leaf);
-                if path.is_dir() {
-                    anchors.push(path);
+                if plain_dirs_below(&user_data, leaf) {
+                    anchors.push(user_data.join(leaf));
                 }
             }
 
@@ -192,6 +196,25 @@ pub fn resolve_anchors(rule: &Rule, roots: &RootMap) -> Vec<PathBuf> {
             Vec::new()
         }
     }
+}
+
+/// 从 `start` 起逐级下探 `rel` 的每一级目录，全部必须是真实目录（存在且不是 reparse point）。
+///
+/// 只看末级不够：中间某一级是 junction 或符号链接时，末级会被带到别的卷甚至禁区。
+fn plain_dirs_below(start: &Path, rel: &str) -> bool {
+    let mut current = start.to_path_buf();
+
+    for part in rel
+        .split(['\\', '/'])
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        current.push(part);
+        if !dirinfo::is_plain_dir(&current) {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// 评估一条规则。
@@ -272,6 +295,13 @@ pub fn check_locks(rule: &Rule, roots: &RootMap, now: SystemTime) -> LockReport 
     let mut report = query_lockers(&files.largest);
 
     report.total = files.total;
+    if report.total == 0 {
+        // 没有文件可查时 Restart Manager 查不出任何东西，不能因此报“没有占用”。
+        report.complete = false;
+        report.error = Some("没有可检查的文件".to_string());
+        return report;
+    }
+
     if report.checked < report.total {
         report.complete = false;
         if report.error.is_none() {
@@ -295,22 +325,10 @@ struct LockFiles {
 fn lock_files(rule: &Rule, roots: &RootMap, now: SystemTime) -> LockFiles {
     let selector = selector_of(rule);
     let dirs = collect_all(&resolve_anchors(rule, roots), &selector);
+    let allowed = allowed_ids(&dirs, &selector, now);
 
-    let allowed = if needs_selection(&selector) {
-        Some(allowed_ids(&dirs, &selector, now))
-    } else {
-        None
-    };
-    let mut files: Vec<&ScannedFile> = dirs
-        .iter()
-        .flat_map(|dir| dir.files.iter())
-        .filter(|file| {
-            allowed
-                .as_ref()
-                .is_none_or(|allowed| allowed.contains(&file.id))
-        })
-        .collect();
-    files.sort_by_key(|file| std::cmp::Reverse(file.allocated));
+    let mut files = selected_files(&dirs, &allowed);
+    sort_by_allocated(&mut files);
 
     LockFiles {
         total: files.len(),
@@ -320,6 +338,27 @@ fn lock_files(rule: &Rule, roots: &RootMap, now: SystemTime) -> LockFiles {
             .map(|file| file.path.clone())
             .collect(),
     }
+}
+
+/// 统计和占用检查共用的文件取舍：只保留选择器和年龄条件允许的文件。
+fn selected_files<'a>(
+    dirs: &'a [DirFiles],
+    allowed: &HashSet<FileIdentity>,
+) -> Vec<&'a ScannedFile> {
+    dirs.iter()
+        .flat_map(|dir| dir.files.iter())
+        .filter(|file| allowed.contains(&file.identity))
+        .collect()
+}
+
+/// 占盘大的排前面，大小相同时按路径排，保证统计出的样例顺序稳定。
+fn sort_by_allocated(files: &mut [&ScannedFile]) {
+    files.sort_by(|left, right| {
+        right
+            .allocated
+            .cmp(&left.allocated)
+            .then_with(|| left.path.cmp(&right.path))
+    });
 }
 
 /// 从 `Local State` 的 `profile.info_cache` 读出 Profile 目录名。读不到就当没有 Profile。
@@ -338,7 +377,16 @@ fn chromium_profiles(user_data: &Path) -> Vec<String> {
         return Vec::new();
     };
 
-    cache.keys().cloned().collect()
+    cache
+        .keys()
+        .filter(|name| is_valid_profile_name(name))
+        .cloned()
+        .collect()
+}
+
+/// Profile 名只能是单个普通路径组件，否则 `..\evil`、`a/b` 这类键会把锚点带出 User Data。
+fn is_valid_profile_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['\\', '/', ':'])
 }
 
 /// 布局标记必须全部存在，否则不能确定目录就是目标应用的布局。
@@ -351,7 +399,7 @@ fn missing_layout_marker(rule: &Rule, roots: &RootMap) -> Option<String> {
 
     rule.layout_markers
         .iter()
-        .find(|marker| !base.join(marker).is_dir())
+        .find(|marker| !plain_dirs_below(base, marker))
         .map(|marker| marker.to_string())
 }
 
@@ -363,73 +411,56 @@ fn selector_of(rule: &Rule) -> Selector {
             kind: SelectKind::AllContents,
             min_age_hours: None,
             exclude_newest_per_dir: false,
+            exclude_child_dirs: &[],
         },
     }
 }
 
 /// 统计锚点的体积，并取最大的若干文件作为样例。
 fn measure(anchors: &[PathBuf], selector: &Selector, now: SystemTime) -> (SizeInfo, Vec<PathBuf>) {
-    let options = ScanOptions {
-        file_filter: build_filter(anchors, selector, now),
-        top_files: SAMPLE_LIMIT,
-        ..ScanOptions::default()
-    };
+    let dirs = collect_all(anchors, selector);
+    let allowed = allowed_ids(&dirs, selector, now);
 
-    let progress = ScanProgress::default();
-    let cancel = AtomicBool::new(false);
-    let Ok(result) = scan(anchors, &options, &progress, &cancel) else {
-        return (SizeInfo::default(), Vec::new());
+    let mut files = selected_files(&dirs, &allowed);
+    let mut total = SizeInfo {
+        dirs: dirs.len() as u64,
+        ..SizeInfo::default()
     };
-
-    let mut total = SizeInfo::default();
-    for id in &result.roots {
-        let size = result.nodes[*id as usize].size;
-        total.logical += size.logical;
-        total.allocated += size.allocated;
-        total.files += size.files;
-        total.dirs += size.dirs;
+    for file in &files {
+        // 云占位符本地没有数据，逻辑大小没有意义，只计入占盘大小。
+        if file.counts_logical {
+            total.logical += file.logical;
+        }
+        total.allocated += file.allocated;
+        total.files += 1;
     }
 
-    let samples = result
-        .top_files
-        .iter()
+    sort_by_allocated(&mut files);
+    let samples = files
+        .into_iter()
+        .take(SAMPLE_LIMIT)
         .map(|file| file.path.clone())
         .collect();
+
     (total, samples)
 }
 
-/// 选择器需要逐文件判断时（限制层级或按时间筛选），先枚举锚点得到允许的文件 ID 集合，
-/// 再用 `file_filter` 只放行这些文件。
-fn build_filter(anchors: &[PathBuf], selector: &Selector, now: SystemTime) -> Option<FileFilter> {
-    if !needs_selection(selector) {
-        return None;
-    }
-
-    let allowed = allowed_ids(&collect_all(anchors, selector), selector, now);
-    Some(Arc::new(move |entry: &EntryInfo| {
-        allowed.contains(&entry.file_id)
-    }))
-}
-
-/// 选择器是否需要逐文件筛选：限制层级、按时间筛选或者保留最新一个。
-fn needs_selection(selector: &Selector) -> bool {
-    !matches!(selector.kind, SelectKind::AllContents)
-        || selector.min_age_hours.is_some()
-        || selector.exclude_newest_per_dir
-}
-
 /// 枚举锚点子树，保留每个目录里的文件列表。
+///
+/// 统计和占用检查都走这里，两者看到的文件集合才不会出现差异。
 fn collect_all(anchors: &[PathBuf], selector: &Selector) -> Vec<DirFiles> {
     let mut dirs = Vec::new();
+    // 硬链接的多个名字只算一次，和扫描器的去重口径一致。
+    let mut seen = HashSet::new();
     for anchor in anchors {
-        collect_dirs(anchor, true, selector, &mut dirs);
+        collect_dirs(anchor, true, selector, &mut seen, &mut dirs);
     }
 
     dirs
 }
 
-/// 计算本次允许统计的文件 ID 集合。
-fn allowed_ids(dirs: &[DirFiles], selector: &Selector, now: SystemTime) -> HashSet<u128> {
+/// 计算本次允许统计的文件身份集合。
+fn allowed_ids(dirs: &[DirFiles], selector: &Selector, now: SystemTime) -> HashSet<FileIdentity> {
     let now = system_time_ticks(now);
     let mut allowed = HashSet::new();
     for dir in dirs {
@@ -439,7 +470,7 @@ fn allowed_ids(dirs: &[DirFiles], selector: &Selector, now: SystemTime) -> HashS
             {
                 continue;
             }
-            allowed.insert(file.id);
+            allowed.insert(file.identity);
         }
     }
 
@@ -451,7 +482,7 @@ fn allowed_ids(dirs: &[DirFiles], selector: &Selector, now: SystemTime) -> HashS
             // 每个目录里最新的那个文件始终保留，时间相同的也一起保留。
             for file in &dir.files {
                 if file.last_write_time == newest {
-                    allowed.remove(&file.id);
+                    allowed.remove(&file.identity);
                 }
             }
         }
@@ -463,38 +494,43 @@ fn allowed_ids(dirs: &[DirFiles], selector: &Selector, now: SystemTime) -> HashS
 /// 锚点下一层的子目录是否整棵纳入统计。
 ///
 /// `TopFiles` 只匹配锚点直属的文件，所以一个子目录都不进；`ChildDirs` 只进名字匹配的那些。
-fn descend_into(selector: &Selector, name: &OsString) -> bool {
+fn descend_into(selector: &Selector, name: &str) -> bool {
     match selector.kind {
         SelectKind::AllContents => true,
         SelectKind::TopFiles(_) => false,
-        SelectKind::ChildDirs(patterns) => {
-            let name = name.to_string_lossy();
-            patterns
-                .iter()
-                .any(|pattern| matches_pattern(pattern, &name))
-        }
+        SelectKind::ChildDirs(patterns) => patterns
+            .iter()
+            .any(|pattern| matches_pattern(pattern, name)),
     }
 }
 
 /// 锚点直属的文件是否纳入统计。`TopFiles` 只收名字匹配的，`ChildDirs` 一个都不收。
-fn keep_anchor_file(selector: &Selector, name: &OsString) -> bool {
+fn keep_anchor_file(selector: &Selector, name: &str) -> bool {
     match selector.kind {
         SelectKind::AllContents => true,
         SelectKind::ChildDirs(_) => false,
-        SelectKind::TopFiles(patterns) => {
-            let name = name.to_string_lossy();
-            patterns
-                .iter()
-                .any(|pattern| matches_pattern(pattern, &name))
-        }
+        SelectKind::TopFiles(patterns) => patterns
+            .iter()
+            .any(|pattern| matches_pattern(pattern, name)),
     }
+}
+
+/// 锚点下一层按名称排除的子目录。
+fn is_excluded_child_dir(selector: &Selector, name: &str) -> bool {
+    selector
+        .exclude_child_dirs
+        .iter()
+        .any(|pattern| matches_pattern(pattern, name))
 }
 
 /// 枚举目录树时看到的文件。
 struct ScannedFile {
     path: PathBuf,
-    id: u128,
+    identity: FileIdentity,
+    logical: u64,
     allocated: u64,
+    /// 云占位符本地没有数据，逻辑大小不计入。
+    counts_logical: bool,
     creation_time: u64,
     last_write_time: u64,
 }
@@ -505,11 +541,19 @@ struct DirFiles {
 }
 
 /// 递归枚举锚点子树，只收集选择器选中的文件。读不到的目录直接跳过，和扫描器的处理一致。
-fn collect_dirs(dir: &Path, is_anchor: bool, selector: &Selector, dirs: &mut Vec<DirFiles>) {
+fn collect_dirs(
+    dir: &Path,
+    is_anchor: bool,
+    selector: &Selector,
+    seen: &mut HashSet<FileIdentity>,
+    dirs: &mut Vec<DirFiles>,
+) {
     let Ok(handle) = dirinfo::open_dir(dir) else {
         return;
     };
 
+    // 文件身份按“卷序列号 + 文件 ID”判断同一个文件，卷序列号取目录所在卷的。
+    let volume_serial = dirinfo::volume_serial(&handle).unwrap_or(0);
     let mut current = DirFiles { files: Vec::new() };
     let mut subdirs = Vec::new();
 
@@ -519,21 +563,47 @@ fn collect_dirs(dir: &Path, is_anchor: bool, selector: &Selector, dirs: &mut Vec
             if entry.is_reparse() {
                 return;
             }
-            if is_anchor && !descend_into(selector, &entry.name) {
+            let name = entry.name.to_string_lossy();
+            // 禁区目录整棵不碰，统计和占用检查都不能看到里面的文件。
+            if forbidden::is_forbidden_name(&name) {
+                return;
+            }
+            if is_anchor && is_excluded_child_dir(selector, &name) {
+                return;
+            }
+            if is_anchor && !descend_into(selector, &name) {
                 return;
             }
             subdirs.push(dir.join(&entry.name));
             return;
         }
 
-        if is_anchor && !keep_anchor_file(selector, &entry.name) {
+        let name = entry.name.to_string_lossy();
+        if is_anchor && !keep_anchor_file(selector, &name) {
+            return;
+        }
+
+        // 和扫描器口径一致：符号链接这类 reparse 文件不算进任何统计。
+        let count = classify_file(&entry);
+        if count == FileCount::Skip {
+            return;
+        }
+
+        let identity = FileIdentity {
+            volume_serial,
+            file_id: entry.file_id,
+        };
+        // 硬链接的另一个名字：大小和文件数都只算一次。
+        if !seen.insert(identity) {
             return;
         }
 
         current.files.push(ScannedFile {
             path: dir.join(&entry.name),
-            id: entry.file_id,
+            identity,
+            logical: entry.logical,
             allocated: entry.allocated,
+            counts_logical: count != FileCount::AllocatedOnly,
             creation_time: entry.creation_time,
             last_write_time: entry.last_write_time,
         });
@@ -544,22 +614,24 @@ fn collect_dirs(dir: &Path, is_anchor: bool, selector: &Selector, dirs: &mut Vec
     dirs.push(current);
 
     for subdir in subdirs {
-        collect_dirs(&subdir, false, selector, dirs);
+        collect_dirs(&subdir, false, selector, seen, dirs);
     }
 }
 
 /// 展开相对路径里的通配符组件，只保留实际存在的目录。
+///
+/// 空字符串和 `.` 表示根目录本身。
 fn expand_relative(base: &Path, rel: &str, anchors: &mut Vec<PathBuf>) {
     let parts: Vec<&str> = rel
         .split(['\\', '/'])
-        .filter(|part| !part.is_empty())
+        .filter(|part| !part.is_empty() && *part != ".")
         .collect();
     expand_parts(base, &parts, anchors);
 }
 
 fn expand_parts(current: &Path, parts: &[&str], anchors: &mut Vec<PathBuf>) {
     let Some((head, rest)) = parts.split_first() else {
-        if current.is_dir() {
+        if dirinfo::is_plain_dir(current) {
             anchors.push(current.to_path_buf());
         }
         return;
@@ -576,10 +648,10 @@ fn expand_parts(current: &Path, parts: &[&str], anchors: &mut Vec<PathBuf>) {
 
     let next = current.join(head);
     if rest.is_empty() {
-        if next.is_dir() {
+        if dirinfo::is_plain_dir(&next) {
             anchors.push(next);
         }
-    } else if next.is_dir() {
+    } else if dirinfo::is_plain_dir(&next) {
         expand_parts(&next, rest, anchors);
     }
 }

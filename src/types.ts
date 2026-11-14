@@ -133,12 +133,16 @@ export interface EnvLocation {
   path: string | null;
   // true 表示在 C 盘，false 表示已在其他盘，null 表示判断不了。
   onSystemDrive: boolean | null;
+  // 文件大小。只有按文件展示的项（未关联虚拟磁盘）才有。
+  sizeBytes: number | null;
 }
 
 export interface EnvState {
   hibernateEnabled: boolean | null;
   pagefiles: EnvLocation[] | null;
   wslDistros: EnvLocation[] | null;
+  // 不属于任何已注册发行版的 WSL 虚拟磁盘，只展示。
+  unregisteredVhdx: EnvLocation[] | null;
   knownFolders: EnvLocation[];
   onedrive: EnvLocation | null;
 }

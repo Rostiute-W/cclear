@@ -49,26 +49,31 @@ pub async fn candidate_locks(rule_id: String) -> Result<LockReportDto, String> {
 
 /// 打开候选的位置。给了 `sample_index` 就打开对应样例，否则打开第一个锚点目录。
 #[tauri::command]
-pub fn open_candidate_in_explorer(
+pub async fn open_candidate_in_explorer(
     rule_id: String,
     sample_index: Option<u32>,
 ) -> Result<(), String> {
-    let rule = find(&rule_id).ok_or_else(|| "没有这条清理规则".to_string())?;
-    let roots = RootMap::system().map_err(|error| error.to_string())?;
+    // 重算样例要重新统计磁盘，放到阻塞线程池里执行，避免卡住主线程。
+    tauri::async_runtime::spawn_blocking(move || {
+        let rule = find(&rule_id).ok_or_else(|| "没有这条清理规则".to_string())?;
+        let roots = RootMap::system().map_err(|error| error.to_string())?;
 
-    let path = match sample_index {
-        // 样例序号对应“重新评估”时的同一套统计，这里按同样方式重算一次。
-        Some(index) => sample_paths(rule, &roots, SystemTime::now())
-            .into_iter()
-            .nth(index as usize)
-            .ok_or_else(|| "样例路径不存在，请重新评估后再试".to_string())?,
-        None => resolve_anchors(rule, &roots)
-            .into_iter()
-            .next()
-            .ok_or_else(|| "这个候选没有可打开的目录".to_string())?,
-    };
+        let path = match sample_index {
+            // 样例序号对应“重新评估”时的同一套统计，这里按同样方式重算一次。
+            Some(index) => sample_paths(rule, &roots, SystemTime::now())
+                .into_iter()
+                .nth(index as usize)
+                .ok_or_else(|| "样例路径不存在，请重新评估后再试".to_string())?,
+            None => resolve_anchors(rule, &roots)
+                .into_iter()
+                .next()
+                .ok_or_else(|| "这个候选没有可打开的目录".to_string())?,
+        };
 
-    open_in_explorer(&path).map_err(|error| format!("打开资源管理器失败：{error}"))
+        open_in_explorer(&path).map_err(|error| format!("打开资源管理器失败：{error}"))
+    })
+    .await
+    .map_err(|error| format!("打开位置失败：{error}"))?
 }
 
 fn lock_report_dto(report: LockReport) -> LockReportDto {

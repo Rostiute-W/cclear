@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use cclear_core::model::{Category, KnownRoot, Phase, Recovery, Tier};
 use cclear_core::rules::catalog::{Rule, SelectKind, Selector, Target, catalog};
 use cclear_core::rules::forbidden::is_forbidden;
-use cclear_core::rules::resolve::{RootMap, evaluate, resolve_anchors};
+use cclear_core::rules::resolve::{RootMap, check_locks, evaluate, resolve_anchors};
 use tempfile::tempdir;
 
 /// 所有已知根目录，每个都映射到独立的临时子目录。
@@ -118,7 +118,7 @@ fn chromium_profiles_come_from_local_state() {
     fs::create_dir_all(&user_data).unwrap();
     fs::write(
         user_data.join("Local State"),
-        r#"{"profile":{"info_cache":{"Default":{},"Profile 1":{}}}}"#,
+        r#"{"profile":{"info_cache":{"Default":{},"Profile 1":{},"..\\evil":{},"a/b":{}}}}"#,
     )
     .unwrap();
 
@@ -128,15 +128,82 @@ fn chromium_profiles_come_from_local_state() {
         }
     }
 
+    // 越界或带分隔符的 Profile 名即使目录真实存在，也不能变成锚点。
+    fs::create_dir_all(user_data.join("a").join("b").join("Cache")).unwrap();
+    fs::create_dir_all(user_data.parent().unwrap().join("evil").join("Cache")).unwrap();
+
     let rule = catalog()
         .iter()
         .find(|rule| rule.id == "browser-edge-cache")
         .expect("目录里没有 Edge 缓存规则");
 
     let anchors = resolve_anchors(rule, &roots);
-    assert_eq!(anchors.len(), 6, "两个 Profile 的三个叶子目录都要解析出来");
+    assert_eq!(
+        anchors.len(),
+        6,
+        "只认 Default 和 Profile 1 两个合法 Profile 的三个叶子目录"
+    );
     assert!(anchors.contains(&user_data.join("Profile 1").join("Code Cache")));
     assert!(anchors.contains(&user_data.join("Default").join("GPUCache")));
+}
+
+#[test]
+fn forbidden_zones_cover_whole_subtree() {
+    let temp = tempdir().unwrap();
+    let roots = temp_roots(temp.path());
+
+    // 禁区按整棵子树判断，不能只看路径末尾。
+    for path in [
+        r"Q:\App\QQ\auth\x",
+        r"Q:\Kingsoft\office6\backup\y.doc",
+        r"Q:\a\security\b",
+        r"Q:\Temp\foo\IndexedDB\c",
+    ] {
+        assert!(
+            is_forbidden(Path::new(path), &roots).is_some(),
+            "{path} 应判为禁区"
+        );
+    }
+
+    // 只是名字相近的目录不算禁区。
+    assert!(
+        is_forbidden(Path::new(r"Q:\App\QQ\authx\d"), &roots).is_none(),
+        "authx 不是 auth"
+    );
+}
+
+#[test]
+fn user_temp_skips_excluded_and_forbidden_dirs() {
+    let temp = tempdir().unwrap();
+    let roots = temp_roots(temp.path());
+    let user_temp = roots.get(KnownRoot::LocalAppData).unwrap().join("Temp");
+
+    fs::create_dir_all(user_temp.join("DockerDesktopUpdates")).unwrap();
+    fs::create_dir_all(user_temp.join("x").join("IndexedDB")).unwrap();
+    // 三个文件都够旧，只有普通那个该被统计：DockerDesktopUpdates 属于 M4 的残留规则，IndexedDB 是禁区。
+    write_aged(&user_temp.join("old.tmp"), 100, 48);
+    write_aged(
+        &user_temp.join("DockerDesktopUpdates").join("old.exe"),
+        200,
+        48,
+    );
+    write_aged(
+        &user_temp.join("x").join("IndexedDB").join("old.db"),
+        300,
+        48,
+    );
+
+    let rule = catalog()
+        .iter()
+        .find(|rule| rule.id == "user-temp")
+        .expect("目录里没有 user-temp 规则");
+
+    let candidate = evaluate(rule, &roots, &[], SystemTime::now());
+    assert_eq!(candidate.size.files, 1, "只统计锚点下的普通旧文件");
+    assert_eq!(candidate.size.logical, 100);
+
+    let report = check_locks(rule, &roots, SystemTime::now());
+    assert_eq!(report.total, 1, "占用检查的文件集合要和统计一致");
 }
 
 #[test]
@@ -176,6 +243,7 @@ fn age_filter_and_newest_file_per_dir() {
                 kind: SelectKind::AllContents,
                 min_age_hours: Some(24),
                 exclude_newest_per_dir: true,
+                exclude_child_dirs: &[],
             },
         },
     };
@@ -224,6 +292,7 @@ fn wildcard_component_expands() {
                 kind: SelectKind::AllContents,
                 min_age_hours: None,
                 exclude_newest_per_dir: false,
+                exclude_child_dirs: &[],
             },
         },
     };

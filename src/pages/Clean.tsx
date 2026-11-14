@@ -10,6 +10,7 @@ import type {
   CandidateInfo,
   CandidateStatusKind,
   LockReport,
+  Phase,
   RuleInfo,
   Tier,
 } from "../types";
@@ -22,6 +23,16 @@ const TIER_GROUPS: { tier: Tier; label: string }[] = [
   { tier: "manual", label: "手动" },
   { tier: "forbidden", label: "禁区" },
 ];
+
+// 徽标上显示阶段时用的写法，和后端 PhaseLocked 的文案保持一致。
+const PHASE_LABELS: Record<Phase, string> = {
+  analysis: "分析阶段",
+  m3a: "M3a",
+  m3b: "M3b",
+  m4: "M4",
+  m5a: "M5a",
+  m5b: "M5b",
+};
 
 // 单行的占用检查状态。
 type LockState =
@@ -192,9 +203,11 @@ export function CleanPage() {
                     {groupRules.map((rule) => {
                       const candidate = candidates.get(rule.id);
                       const lockState = lockStates[rule.id];
-                      const badge = statusBadge(candidate);
+                      const badge = statusBadge(candidate, rule);
                       const note = statusNote(candidate);
                       const samplesOpen = openSamples.has(rule.id);
+                      // 没有锚点时既没有文件可查占用，也没有目录可以打开。
+                      const hasAnchors = candidate !== undefined && candidate.anchors.length > 0;
 
                       return (
                         <Fragment key={rule.id}>
@@ -227,7 +240,7 @@ export function CleanPage() {
                               <button
                                 type="button"
                                 className="link"
-                                disabled={lockState?.phase === "loading"}
+                                disabled={!hasAnchors || lockState?.phase === "loading"}
                                 onClick={() => checkLocks(rule.id)}
                               >
                                 检查占用
@@ -235,6 +248,7 @@ export function CleanPage() {
                               <button
                                 type="button"
                                 className="link"
+                                disabled={!hasAnchors}
                                 onClick={() => openLocation(rule.id, null)}
                               >
                                 打开位置
@@ -297,6 +311,7 @@ export function CleanPage() {
 // 状态徽标。没有评估结果时返回 null，界面显示占位符。
 function statusBadge(
   candidate: CandidateInfo | undefined,
+  rule: RuleInfo,
 ): { kind: CandidateStatusKind; label: string } | null {
   if (!candidate) {
     return null;
@@ -304,7 +319,10 @@ function statusBadge(
 
   switch (candidate.status) {
     case "ready":
-      return { kind: "ready", label: "可执行" };
+      // 阶段还没开放时不能显示“可执行”，否则会让人以为点了就会清理。
+      return candidate.executable
+        ? { kind: "ready", label: "可执行" }
+        : { kind: "phaseLocked", label: `将在 ${PHASE_LABELS[rule.phase]} 开放` };
     case "processRunning":
       return {
         kind: "processRunning",
