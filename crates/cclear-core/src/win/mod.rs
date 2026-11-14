@@ -1,6 +1,7 @@
 //! 对 Win32 的薄封装。
 
 pub mod dirinfo;
+pub mod volume;
 
 use std::path::{Path, PathBuf};
 
