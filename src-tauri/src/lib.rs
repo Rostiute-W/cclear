@@ -29,6 +29,7 @@ pub fn run() {
             commands::app::app_info,
             commands::clean::candidate_locks,
             commands::clean::open_candidate_in_explorer,
+            commands::devcache::command_execute,
             commands::env::env_state,
             commands::plan::plan_build,
             commands::plan::plan_items,

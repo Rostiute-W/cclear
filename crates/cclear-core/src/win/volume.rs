@@ -1,7 +1,7 @@
 //! 卷信息：固定盘的容量、文件系统与系统盘判定。
 
 use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use windows::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows::Win32::Storage::FileSystem::{
@@ -9,7 +9,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::core::PCWSTR;
 
-use super::{KnownFolder, known_folder, to_verbatim};
+use super::{KnownFolder, dirinfo, known_folder, to_verbatim};
 
 /// `GetDriveTypeW` 对本地固定盘返回的值。windows crate 把它放在 WindowsProgramming 模块，
 /// 为了一个常量引入整个 feature 不划算，这里直接照 Win32 头文件的值。
@@ -135,6 +135,33 @@ pub fn free_space(path: &Path) -> u64 {
     };
 
     if queried.is_err() { 0 } else { available }
+}
+
+/// 任意路径所在卷的序列号。只看盘符根目录，路径本身不存在也能判断。
+pub fn path_volume_serial(path: &Path) -> Option<u64> {
+    let root = volume_root(path)?;
+    let handle = dirinfo::open_dir(&root).ok()?;
+
+    dirinfo::volume_serial(&handle).ok()
+}
+
+/// 系统盘（Windows 所在卷）的序列号。判断缓存是否在系统盘时按它比较。
+pub fn system_volume_serial() -> Option<u64> {
+    let windows = known_folder(KnownFolder::Windows).ok()?;
+
+    path_volume_serial(&windows)
+}
+
+/// 路径所在的卷根，例如 `C:\`。相对路径没有盘符，返回 None。
+fn volume_root(path: &Path) -> Option<PathBuf> {
+    let Component::Prefix(prefix) = path.components().next()? else {
+        return None;
+    };
+
+    let mut root = PathBuf::from(prefix.as_os_str());
+    root.push("\\");
+
+    Some(root)
 }
 
 /// 系统盘所在的卷根，例如 `C:\`。

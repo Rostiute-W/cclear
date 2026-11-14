@@ -3,6 +3,8 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
   CandidateInfo,
+  CommandProgress,
+  CommandReport,
   DirNode,
   EnvState,
   ExecProgress,
@@ -49,11 +51,27 @@ export function openCandidateInExplorer(
   return invoke<void>("open_candidate_in_explorer", { ruleId, sampleIndex });
 }
 
-export function volumeInfo(): Promise<VolumeInfo[]> {
-  return invoke<VolumeInfo[]>("volume_info");
+// 命令类规则只传规则 ID 和是否已二次确认：命令和缓存路径都由后端命令表决定。
+export function commandExecute(
+  ruleId: string,
+  secondConfirm: boolean,
+  onProgress: (progress: CommandProgress) => void,
+): Promise<CommandReport> {
+  const channel = new Channel<CommandProgress>();
+  channel.onmessage = (progress) => {
+    onProgress(progress);
+  };
+
+  return invoke<CommandReport>("command_execute", {
+    ruleId,
+    secondConfirm,
+    onProgress: channel,
+  });
 }
 
-export function defaultScanRoots(): Promise<ScanRoot[]> {
+export function volumeInfo(): Promise<VolumeInfo[]> {
+  return invoke<VolumeInfo[]>("volume_info");
+}export function defaultScanRoots(): Promise<ScanRoot[]> {
   return invoke<ScanRoot[]>("default_scan_roots");
 }
 

@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 import {
   candidateLocks,
+  commandExecute,
   openCandidateInExplorer,
   planBuild,
   recycleBinEmpty,
@@ -13,6 +14,7 @@ import { formatDuration, formatSize } from "../format";
 import type {
   CandidateInfo,
   CandidateStatusKind,
+  CommandReport,
   LockReport,
   Phase,
   PlanSummary,
@@ -46,6 +48,17 @@ type LockState =
   | { phase: "done"; report: LockReport }
   | { phase: "failed"; message: string };
 
+// 能按冻结清单执行的规则。命令和特殊操作各有自己的执行方式，不进清单。
+function isPlanRule(rule: RuleInfo): boolean {
+  return rule.targetKind !== "command" && rule.targetKind !== "special";
+}
+
+// 单条命令的运行状态。
+type CommandState =
+  | { phase: "running" }
+  | { phase: "done"; report: CommandReport }
+  | { phase: "failed"; message: string };
+
 export function CleanPage() {
   const [rules, setRules] = useState<RuleInfo[]>([]);
   const [candidates, setCandidates] = useState<Map<string, CandidateInfo>>(new Map());
@@ -65,6 +78,8 @@ export function CleanPage() {
   // C 盘回收站当前内容，清空前要把这份数值回传后端比对。
   const [recycle, setRecycle] = useState<RecycleBinInfo | null>(null);
   const [recycleBusy, setRecycleBusy] = useState(false);
+  // 每条命令的运行状态。命令之间互不影响，按规则 ID 分开记。
+  const [commandStates, setCommandStates] = useState<Record<string, CommandState>>({});
 
   const refreshRecycle = () => {
     recycleBinQuery()
@@ -176,17 +191,54 @@ export function CleanPage() {
       .finally(() => setPlanning(false));
   };
 
-  // 某一层里可执行的规则（安全组一键清理用）。
+  // 某一层里可执行的规则（安全组一键清理用）。命令和特殊操作不走冻结清单，排除掉。
   const executableIds = (tier: Tier) =>
     rules
-      .filter((rule) => rule.tier === tier && candidates.get(rule.id)?.executable === true)
+      .filter(
+        (rule) =>
+          rule.tier === tier && isPlanRule(rule) && candidates.get(rule.id)?.executable === true,
+      )
       .map((rule) => rule.id);
 
-  // 某一层里用户勾选的规则（谨慎组逐项清理用）。
+  // 某一层里用户勾选的规则（谨慎组逐项清理用）。同样只保留按清单执行的规则。
   const selectedIds = (tier: Tier) =>
     rules
-      .filter((rule) => rule.tier === tier && selected.has(rule.id))
+      .filter((rule) => rule.tier === tier && isPlanRule(rule) && selected.has(rule.id))
       .map((rule) => rule.id);
+
+  // 运行官方命令：确认文案写清工具和作用范围，需要二次确认的规则多问一步。
+  const runCommand = (rule: RuleInfo, scope: string) => {
+    const tool = rule.command?.tool ?? rule.name;
+    const text = `调用 ${tool} 官方命令，作用范围：${scope}；不可撤销；无法逐文件预览`;
+    if (!window.confirm(text)) {
+      return;
+    }
+
+    const needSecond = rule.command?.needsSecondConfirm === true;
+    const secondText = `「${rule.name}」会删除全部缓存，下次使用需要重新下载。确认继续？`;
+    if (needSecond && !window.confirm(secondText)) {
+      return;
+    }
+
+    setCommandStates((previous) => ({ ...previous, [rule.id]: { phase: "running" } }));
+    commandExecute(rule.id, needSecond, (progress) => {
+      // 命令一开始就保持“运行中”，结束后由返回值接管。
+      if (progress.stage === "running") {
+        setCommandStates((previous) => ({ ...previous, [rule.id]: { phase: "running" } }));
+      }
+    })
+      .then((report) => {
+        setCommandStates((previous) => ({ ...previous, [rule.id]: { phase: "done", report } }));
+        // 命令结束后缓存大小变了，重新评估一次，界面上的数字才是当前的。
+        evaluate();
+      })
+      .catch((reason) => {
+        setCommandStates((previous) => ({
+          ...previous,
+          [rule.id]: { phase: "failed", message: String(reason) },
+        }));
+      });
+  };
 
   // 清空回收站：确认文案里写明执行时清空的是全部内容，并把当前数值一起回传。
   const emptyRecycle = () => {
@@ -213,6 +265,9 @@ export function CleanPage() {
       .finally(() => setRecycleBusy(false));
   };
 
+  // 命令类规则单独成组：它们不生成冻结清单，一条一行单独运行。
+  const commandRules = rules.filter((rule) => rule.targetKind === "command");
+
   return (
     <section>
       <h2>清理</h2>
@@ -232,7 +287,7 @@ export function CleanPage() {
           )}
         </div>
         <p className="muted">
-          只有安全层和谨慎层的文件类规则可以执行，命令类规则仍在后续任务开放。
+          只有安全层和谨慎层的文件类规则可以按清单执行，命令类规则在下方「不可撤销命令」分组里单独运行。
         </p>
         {error && <p className="warn">{error}</p>}
       </div>
@@ -240,9 +295,12 @@ export function CleanPage() {
       {TIER_GROUPS.map((group) => {
         const groupRules = rules.filter((rule) => rule.tier === group.tier);
         const isCollapsed = collapsed.has(group.tier);
-        // 特殊操作（回收站）不走冻结清单，单独成行，不参与勾选。
-        const tableRules = groupRules.filter((rule) => rule.targetKind !== "special");
+        // 特殊操作（回收站）和命令都不走冻结清单，单独成行，不参与勾选。
+        const tableRules = groupRules.filter(isPlanRule);
         const specialRules = groupRules.filter((rule) => rule.targetKind === "special");
+        // 卡片标题按实际渲染的条目数统计：命令和特殊操作已经移出各自的表格。
+        const cardCount =
+          group.tier === "forbidden" ? groupRules.length : tableRules.length + specialRules.length;
         const safeIds = group.tier === "safe" ? executableIds("safe") : [];
         const checkedIds = group.tier === "caution" ? selectedIds("caution") : [];
 
@@ -250,7 +308,7 @@ export function CleanPage() {
           <div className="card" key={group.tier}>
             <div className="group-header">
               <h3>
-                {group.label}（{groupRules.length}）
+                {group.label}（{cardCount}）
               </h3>
               <div className="actions">
                 {group.tier === "safe" && (
@@ -470,6 +528,98 @@ export function CleanPage() {
         );
       })}
 
+      {commandRules.length > 0 && (
+        <div className="card">
+          <div className="group-header">
+            <h3>不可撤销命令（{commandRules.length}）</h3>
+          </div>
+          <p className="muted">
+            这些项调用工具自己的官方命令清理缓存，没有逐文件预览，执行后无法撤销。失败或超时只报告，不会强行终止命令。
+          </p>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>占盘大小</th>
+                <th>状态</th>
+                <th>说明</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {commandRules.map((rule) => {
+                const candidate = candidates.get(rule.id);
+                const state = commandStates[rule.id];
+                const badge = statusBadge(candidate, rule);
+                const note = statusNote(candidate);
+                const running = state?.phase === "running";
+                // 作用范围要在确认框里写清楚，没解析出缓存路径就不能运行。
+                const paths = candidate?.anchors ?? [];
+                const scope = paths.join("、");
+
+                return (
+                  <Fragment key={rule.id}>
+                    <tr>
+                      <td>{rule.name}</td>
+                      <td>{candidate ? formatSize(candidate.allocated) : "—"}</td>
+                      <td>
+                        {badge ? (
+                          <span className={`status-badge status-${badge.kind}`}>{badge.label}</span>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                      <td>
+                        <span>{rule.description}</span>
+                        {rule.warning && <p className="warn">注意：{rule.warning}</p>}
+                        {note && <p className="muted">{note}</p>}
+                        {paths.length > 0 && (
+                          <p className="path-text" title={scope}>
+                            {scope}
+                          </p>
+                        )}
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="link"
+                          disabled={candidate?.executable !== true || running || scope === ""}
+                          onClick={() => runCommand(rule, scope)}
+                        >
+                          {running ? "运行中…" : "运行"}
+                        </button>
+                      </td>
+                    </tr>
+
+                    {running && (
+                      <tr className="sub-row">
+                        <td colSpan={5}>
+                          <p className="muted">运行中…（超时只报告，不会强行终止）</p>
+                        </td>
+                      </tr>
+                    )}
+
+                    {state?.phase === "done" && (
+                      <tr className="sub-row">
+                        <td colSpan={5}>{commandResult(state.report)}</td>
+                      </tr>
+                    )}
+
+                    {state?.phase === "failed" && (
+                      <tr className="sub-row">
+                        <td colSpan={5}>
+                          <p className="warn">执行失败：{state.message}</p>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       {plan && (
         <PlanPreview
           // 每份新计划都重建预览：上一次的执行结果、勾选项和展开状态不能带过来，
@@ -509,7 +659,11 @@ function statusBadge(
         label: `进程运行中：${candidate.statusDetail ?? "未知进程"}`,
       };
     case "notPresent":
-      return { kind: "notPresent", label: "未找到" };
+      // 命令类规则的“找不到工具”就是没安装，文案按任务书写成“未安装”。
+      return {
+        kind: "notPresent",
+        label: rule.targetKind === "command" ? "未安装" : "未找到",
+      };
     case "layoutMismatch":
       return { kind: "layoutMismatch", label: "布局不符" };
     case "phaseLocked":
@@ -535,6 +689,29 @@ function statusNote(candidate: CandidateInfo | undefined): string | null {
   }
 
   return candidate.statusDetail;
+}
+
+// 命令执行结果：成功看前后对比，失败和超时要如实说明，并附上输出末尾。
+function commandResult(report: CommandReport) {
+  const size = `${formatSize(report.allocatedBefore)} → ${formatSize(report.allocatedAfter)}`;
+
+  return (
+    <>
+      {report.timedOut ? (
+        <p className="warn">
+          命令超时，已停止等待；没有强行终止进程，它可能还在运行（缓存 {size}）
+        </p>
+      ) : report.exitCode === 0 ? (
+        <p className="muted">命令已结束：缓存 {size}</p>
+      ) : (
+        <p className="warn">
+          命令失败（退出码 {report.exitCode ?? "未知"}）：缓存 {size}
+        </p>
+      )}
+      {report.output && <p className="path-text">{report.output}</p>}
+      {report.logError && <p className="warn">{report.logError}</p>}
+    </>
+  );
 }
 
 // 占用检查的结果：占用进程列表，或者“未发现占用 / 检测不完整”。

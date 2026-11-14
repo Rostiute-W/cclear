@@ -4,6 +4,7 @@ use std::time::SystemTime;
 
 use cclear_core::model::{Category, Phase, Recovery, Tier};
 use cclear_core::rules::catalog::{Rule, Target, catalog};
+use cclear_core::rules::commands;
 use cclear_core::rules::resolve::{Candidate, RootMap, evaluate_all};
 use cclear_core::win::process::running_processes;
 use serde::Serialize;
@@ -24,6 +25,17 @@ pub struct RuleDto {
     pub warning: Option<String>,
     /// 目标类型：界面对命令类和特殊操作显示不同的引导文案。
     pub target_kind: String,
+    /// 命令类规则调用的工具和二次确认要求，界面据此写确认文案。
+    pub command: Option<CommandDto>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandDto {
+    /// 调用的工具名，例如 npm。
+    pub tool: String,
+    /// 需要在普通确认之后再确认一次。
+    pub needs_second_confirm: bool,
 }
 
 #[derive(Serialize)]
@@ -78,7 +90,21 @@ fn rule_dto(rule: &Rule) -> RuleDto {
         processes: rule.processes.iter().map(|name| name.to_string()).collect(),
         warning: rule.warning.map(|text| text.to_string()),
         target_kind: target_kind(&rule.target).to_string(),
+        command: command_dto(&rule.target),
     }
+}
+
+/// 命令类规则的工具信息。其他目标没有命令，返回 None。
+fn command_dto(target: &Target) -> Option<CommandDto> {
+    let Target::Command(id) = target else {
+        return None;
+    };
+    let spec = commands::spec(*id)?;
+
+    Some(CommandDto {
+        tool: spec.tool.to_string(),
+        needs_second_confirm: spec.needs_second_confirm,
+    })
 }
 
 fn candidate_dto(candidate: Candidate) -> CandidateDto {

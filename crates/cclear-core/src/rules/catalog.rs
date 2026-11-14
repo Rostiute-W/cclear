@@ -441,7 +441,7 @@ static CATALOG: &[Rule] = &[
     Rule {
         id: "command-nuget-http-temp",
         name: "NuGet http-cache 与 temp",
-        description: "执行 dotnet nuget locals http-cache,temp --clear",
+        description: "依次执行 dotnet nuget locals http-cache --clear 和 dotnet nuget locals temp --clear",
         category: Category::Dev,
         tier: Tier::Caution,
         recovery: Recovery::IrreversibleCommand,
