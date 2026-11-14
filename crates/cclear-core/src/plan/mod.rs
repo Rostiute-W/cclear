@@ -119,6 +119,80 @@ pub fn build_plan(
     })
 }
 
+/// 按给定的锚点生成冻结清单。
+///
+/// 迁移这类锚点来自运行时查询（当前生效的缓存目录）的流程用它：没有规则模板，
+/// 但和普通规则共用同一套枚举、禁区检查和条目记录，执行时同样只认这份清单。
+/// 锚点自身不进清单，只收它下面的内容。
+pub fn build_plan_at(
+    rule_id: &'static str,
+    recovery: Recovery,
+    anchors: &[PathBuf],
+    forbidden: &Forbidden,
+    procs: &[ProcInfo],
+    now: SystemTime,
+) -> FrozenPlan {
+    let now_ticks = system_time_ticks(now);
+    let selector = Selector {
+        kind: SelectKind::AllContents,
+        min_age_hours: None,
+        exclude_newest_per_dir: false,
+        exclude_child_dirs: &[],
+    };
+
+    let mut items: Vec<FrozenItem> = Vec::new();
+    let mut skipped: Vec<(PathBuf, String)> = Vec::new();
+    let mut total = SizeInfo::default();
+    let mut seen: HashSet<FileIdentity> = HashSet::new();
+
+    for (index, anchor_path) in anchors.iter().enumerate() {
+        let anchor = match guard::open_anchor(anchor_path, forbidden) {
+            Ok(anchor) => anchor,
+            Err(error) => {
+                skipped.push((anchor_path.clone(), error.to_string()));
+                continue;
+            }
+        };
+
+        let mut walker = Walker {
+            anchor: &anchor,
+            anchor_path,
+            // 锚点数量远小于 u16 上限。
+            anchor_index: index as u16,
+            volume_serial: anchor.identity().volume_serial,
+            selector,
+            keep_dirs: true,
+            forbidden,
+            procs,
+            now_ticks,
+            seen: &mut seen,
+            items: &mut items,
+            skipped: &mut skipped,
+            total: &mut total,
+            rule_id,
+        };
+
+        let mut rel = Vec::new();
+        walker.walk(&mut rel, None);
+    }
+
+    let count = items.len() as u32;
+
+    FrozenPlan {
+        plan_id: Uuid::new_v4(),
+        created_at: local_now(),
+        rules: vec![PlanRule {
+            rule_id,
+            recovery,
+            anchors: anchors.to_vec(),
+            items: 0..count,
+            total,
+            skipped_at_build: skipped,
+        }],
+        items,
+    }
+}
+
 /// 生成一条规则的条目时共用的可变状态。
 struct PlanBuildState<'a> {
     items: &'a mut Vec<FrozenItem>,

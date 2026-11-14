@@ -11,6 +11,12 @@ import type {
   ExecReport,
   FileEntry,
   LockReport,
+  MigrationCleanupPlan,
+  MigrationMode,
+  MigrationResult,
+  MigrationsState,
+  MigrationTool,
+  MigrationToolState,
   PlanDetail,
   PlanHistory,
   PlanItem,
@@ -185,6 +191,31 @@ export function quarantineResolve(
 
 export function quarantineOverdue(): Promise<QuarantineBatch[]> {
   return invoke<QuarantineBatch[]>("quarantine_overdue");
+}
+
+// 迁移：只传工具名、模式名和目标卷根。缓存在哪、配置怎么写、用什么命令验证都由后端决定。
+export function migrationsList(): Promise<MigrationsState> {
+  return invoke<MigrationsState>("migrations_list");
+}
+
+export function migrationInspect(tool: MigrationTool): Promise<MigrationToolState> {
+  return invoke<MigrationToolState>("migration_inspect", { tool });
+}
+
+export function migrationStart(
+  tool: MigrationTool,
+  volumeRoot: string,
+  mode: MigrationMode,
+): Promise<MigrationResult> {
+  return invoke<MigrationResult>("migration_start", { tool, volumeRoot, mode });
+}
+
+export function migrationCleanupOld(tool: MigrationTool): Promise<MigrationCleanupPlan> {
+  return invoke<MigrationCleanupPlan>("migration_cleanup_old", { tool });
+}
+
+export function migrationRevert(tool: MigrationTool): Promise<MigrationResult> {
+  return invoke<MigrationResult>("migration_revert", { tool });
 }
 
 type ScanListener = (progress: ScanProgress) => void;

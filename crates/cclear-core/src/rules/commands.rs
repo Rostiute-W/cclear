@@ -307,7 +307,8 @@ fn drive_check(path: &Path) -> Result<(), String> {
 /// 从查询命令的输出里取出缓存路径。
 ///
 /// NuGet 每一项是 `名字: <路径>`，npm、pnpm、pip、uv 直接输出路径本身。
-fn parse_paths(output: &str) -> Vec<PathBuf> {
+/// 迁移复用同一套解析，两个地方看到的路径口径才不会不一致。
+pub(crate) fn parse_paths(output: &str) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
 
     for line in output.lines() {
@@ -352,7 +353,7 @@ fn looks_like_path(text: &str) -> bool {
 }
 
 /// 命令输出末尾，stdout 和 stderr 各取一段。
-fn output_text(outcome: &CmdOutcome) -> String {
+pub(crate) fn output_text(outcome: &CmdOutcome) -> String {
     let stdout = outcome.stdout_tail.trim();
     let stderr = outcome.stderr_tail.trim();
 
