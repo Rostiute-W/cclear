@@ -331,7 +331,7 @@ fn flatten(node: DirScan, parent: Option<u32>, nodes: &mut Vec<DirNode>) -> u32 
 
 /// 文件在统计里怎么算。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FileCount {
+pub(crate) enum FileCount {
     /// 符号链接、AppExecLink 之类，不算。
     Skip,
     /// 普通文件和 de-dup：两个口径都算。
@@ -340,7 +340,8 @@ enum FileCount {
     AllocatedOnly,
 }
 
-fn classify_file(entry: &EntryInfo) -> FileCount {
+/// 规则统计和占用检查也要按同一套口径取舍文件，所以对 crate 内开放。
+pub(crate) fn classify_file(entry: &EntryInfo) -> FileCount {
     if !entry.is_reparse() {
         return FileCount::Both;
     }

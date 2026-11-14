@@ -180,11 +180,15 @@ export function OverviewPage() {
           <p className="env-group">WSL 发行版</p>
           {locationLines(env.wslDistros, "没有安装 WSL 发行版")}
 
+          <p className="env-group">未关联虚拟磁盘</p>
+          {locationLines(env.unregisteredVhdx, "没有未关联的虚拟磁盘")}
+
           <p className="env-group">用户目录</p>
           {locationLines(env.knownFolders, "未知")}
 
           <p className="env-group">OneDrive</p>
-          {locationLines(env.onedrive ? [env.onedrive] : null, "没有配置 OneDrive")}
+          {/* OneDrive 的 null 表示没有配置，不是读取失败。 */}
+          {env.onedrive ? locationLines([env.onedrive], "") : emptyLine("没有配置 OneDrive")}
         </div>
       )}
 
@@ -276,19 +280,11 @@ export function OverviewPage() {
 // 一组位置项：读不到时显示“未知”，没有配置时显示给定文案。
 function locationLines(locations: EnvLocation[] | null, emptyText: string) {
   if (locations === null) {
-    return (
-      <div className="env-line">
-        <span className="muted">未知</span>
-      </div>
-    );
+    return emptyLine("未知");
   }
 
   if (locations.length === 0) {
-    return (
-      <div className="env-line">
-        <span className="muted">{emptyText}</span>
-      </div>
-    );
+    return emptyLine(emptyText);
   }
 
   return locations.map((location, index) => (
@@ -297,11 +293,23 @@ function locationLines(locations: EnvLocation[] | null, emptyText: string) {
       <span className="env-path" title={location.path ?? undefined}>
         {location.path ?? "未知"}
       </span>
+      {location.sizeBytes !== null && (
+        <span className="muted">{formatSize(location.sizeBytes)}</span>
+      )}
       <span className={location.onSystemDrive === true ? "env-drive env-drive-c" : "env-drive"}>
         {driveLabel(location.onSystemDrive)}
       </span>
     </div>
   ));
+}
+
+// 一行说明文字，用于“未知”“没有配置”这类占位。
+function emptyLine(text: string) {
+  return (
+    <div className="env-line">
+      <span className="muted">{text}</span>
+    </div>
+  );
 }
 
 // 统一用“在 C 盘 / 已在其他盘”的说法。

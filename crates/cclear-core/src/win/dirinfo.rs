@@ -3,6 +3,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 
@@ -40,6 +41,18 @@ impl EntryInfo {
     pub fn is_reparse(&self) -> bool {
         self.attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
     }
+}
+
+/// 目录是否是真实目录：存在、是目录，并且本身不是 reparse point。
+///
+/// 用 `symlink_metadata` 取属性，不跟随链接。锚点解析必须用它代替 `Path::is_dir()`，
+/// 否则 junction 会把锚点带到别的卷甚至禁区。
+pub fn is_plain_dir(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+
+    metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0
 }
 
 /// 打开目录句柄。不跟随 reparse point，这样 junction 和符号链接本身也能被枚举出来。

@@ -9,16 +9,25 @@ use crate::model::KnownRoot;
 use crate::rules::resolve::RootMap;
 use crate::win::{KnownFolder, equals_ignore_case, known_folder};
 
-/// 路径组件命中即视为禁区。
+/// 路径组件命中即视为禁区。任意位置的同名目录都算，不只是路径末尾。
 pub fn forbidden_names() -> &'static [&'static str] {
     &[
         "db_storage",
         "msg",
         "nt_db",
+        "auth",
+        "security",
         "IndexedDB",
         "Local Storage",
         "WPS Cloud Files",
     ]
+}
+
+/// 单个组件名是否属于禁区。枚举目录时用它把整棵禁区子目录跳过去。
+pub fn is_forbidden_name(name: &str) -> bool {
+    forbidden_names()
+        .iter()
+        .any(|forbidden| equals_ignore_case(name, forbidden))
 }
 
 /// 整棵子树都禁止的已知根目录。
@@ -28,21 +37,17 @@ pub fn forbidden_roots() -> Vec<(KnownRoot, &'static str)> {
     vec![(KnownRoot::Windows, "Windows 目录整体禁止")]
 }
 
-/// 末尾组件必须完全匹配的具体禁止路径。
-const FORBIDDEN_TAILS: &[(&[&str], &str)] = &[
-    (&["QQ", "auth"], "QQ 登录凭据"),
-    (&["QQ", "security"], "QQ 安全数据"),
-    (&["Kingsoft", "office6", "backup"], "WPS 备份"),
-];
+/// 路径中任意位置出现这段连续组件，整棵子树都禁止。
+///
+/// 不能只比末尾：`office6\backup` 下面还有多层子目录，只比末尾会漏判。
+const FORBIDDEN_SEGMENTS: &[(&[&str], &str)] = &[(&["Kingsoft", "office6", "backup"], "WPS 备份")];
 
 /// 判断路径是否落在禁区，命中时返回中文原因。
 pub fn is_forbidden(path: &Path, roots: &RootMap) -> Option<String> {
     // 组件名禁区优先：这类目录名本身就代表聊天记录或凭据，出现在任何位置都不能碰。
     for component in path_components(path) {
-        for name in forbidden_names() {
-            if equals_ignore_case(&component, name) {
-                return Some(format!("路径中的「{name}」属于禁区"));
-            }
+        if is_forbidden_name(&component) {
+            return Some(format!("路径中的「{component}」属于禁区"));
         }
     }
 
@@ -76,10 +81,14 @@ pub fn is_forbidden(path: &Path, roots: &RootMap) -> Option<String> {
         if starts_with(path, &base.join("CClear")) {
             return Some("CClear 自身数据禁止".to_string());
         }
+        // Tauri/WebView2 按 tauri.conf.json 里的 identifier 建数据目录，同样不能碰。
+        if starts_with(path, &base.join("com.zhuanz.cclear")) {
+            return Some("CClear 自身数据禁止".to_string());
+        }
     }
 
-    for (tail, reason) in FORBIDDEN_TAILS {
-        if ends_with(path, tail) {
+    for (segments, reason) in FORBIDDEN_SEGMENTS {
+        if contains_components(path, segments) {
             return Some(reason.to_string());
         }
     }
@@ -105,15 +114,14 @@ fn starts_with(path: &Path, base: &Path) -> bool {
             .all(|(left, right)| equals_ignore_case(left, right))
 }
 
-/// 路径末尾的组件是否与 tail 完全一致。
-fn ends_with(path: &Path, tail: &[&str]) -> bool {
+/// 路径中是否有一处连续的组件与 segments 完全一致。
+fn contains_components(path: &Path, segments: &[&str]) -> bool {
     let path = path_components(path);
-    if path.len() < tail.len() {
-        return false;
-    }
 
-    let actual = &path[path.len() - tail.len()..];
-    tail.iter()
-        .zip(actual.iter())
-        .all(|(left, right)| equals_ignore_case(left, right))
+    path.windows(segments.len()).any(|window| {
+        segments
+            .iter()
+            .zip(window.iter())
+            .all(|(left, right)| equals_ignore_case(left, right))
+    })
 }
