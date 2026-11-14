@@ -14,6 +14,9 @@ use crate::win::{KnownFolder, known_folder};
 /// 每条记录都立即写入并 flush；每这么多条再 fsync 一次，兼顾可靠性和磁盘寿命。
 const SYNC_EVERY: u32 = 256;
 
+/// 详情里的跳过明细上限。跳过可能上万条，界面只需要看到一部分就能判断原因。
+const MAX_SKIPPED_DETAILS: usize = 200;
+
 /// 一条日志记录。后续任务会继续添加变体。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -69,6 +72,8 @@ pub trait JournalSink {
 pub struct PlanSummary {
     pub plan_id: Uuid,
     pub started_at: OffsetDateTime,
+    /// 这次执行涉及的规则 ID。日志只记 ID，名称由界面查规则目录。
+    pub rules: Vec<String>,
     pub free_before: u64,
     pub free_after: u64,
     pub deleted_files: u64,
@@ -77,6 +82,35 @@ pub struct PlanSummary {
     pub skipped: u64,
     /// 计划没有写完 PlanFinished 时是中断的执行。
     pub finished: bool,
+}
+
+/// 一次执行的详情：每条规则删了什么、跳过了什么。
+pub struct PlanDetail {
+    pub plan_id: Uuid,
+    pub started_at: OffsetDateTime,
+    pub free_before: u64,
+    pub free_after: u64,
+    pub finished: bool,
+    pub rules: Vec<RuleDetail>,
+    /// 跳过明细，最多 `MAX_SKIPPED_DETAILS` 条；`skipped_total` 是实际总数。
+    pub skipped: Vec<SkippedItem>,
+    pub skipped_total: u64,
+}
+
+/// 详情里一条规则的统计。
+pub struct RuleDetail {
+    pub rule_id: String,
+    pub deleted_files: u64,
+    pub deleted_dirs: u64,
+    pub freed_allocated: u64,
+    pub skipped: u64,
+}
+
+/// 详情里一条跳过记录。整条规则被跳过时没有具体路径。
+pub struct SkippedItem {
+    pub rule_id: String,
+    pub path: String,
+    pub reason: String,
 }
 
 /// 追加式文件日志，按天分文件写在 `%LOCALAPPDATA%\CClear\journal`。
@@ -158,29 +192,11 @@ impl JournalSink for FileJournal {
 /// 任务书给的签名是只返回列表，这里多返回一个计数：解析失败说明日志被截断或损坏，
 /// 界面需要如实告诉用户读到的不完整，而不是假装历史只有这些。
 pub fn read_summaries(days: usize) -> io::Result<(Vec<PlanSummary>, usize)> {
-    let dir = journal_dir()?;
-
-    // 文件名是 ISO 日期，按名字排序就是按日期排序。
-    let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-            .collect(),
-        // 还没产生过日志时不是错误。
-        Err(_) => return Ok((Vec::new(), 0)),
-    };
-
-    files.sort();
-    if files.len() > days {
-        files.drain(..files.len() - days);
-    }
-
     let mut plans: Vec<PlanSummary> = Vec::new();
     let mut index: HashMap<Uuid, usize> = HashMap::new();
     let mut skipped_lines = 0usize;
 
-    for file in files {
+    for file in journal_files(days)? {
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
@@ -205,6 +221,70 @@ pub fn read_summaries(days: usize) -> io::Result<(Vec<PlanSummary>, usize)> {
     Ok((plans, skipped_lines))
 }
 
+/// 读某一次执行的详情。日志里找不到这个计划时返回 None。
+pub fn read_detail(days: usize, plan_id: Uuid) -> io::Result<Option<PlanDetail>> {
+    let mut detail: Option<PlanDetail> = None;
+
+    for file in journal_files(days)? {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            // 详情页只关心这一个计划，坏行和其他计划的记录都直接略过。
+            let Ok(record) = serde_json::from_str::<Record>(line) else {
+                continue;
+            };
+            if record_plan_id(&record) != plan_id {
+                continue;
+            }
+
+            apply_detail(
+                detail.get_or_insert_with(|| PlanDetail {
+                    plan_id,
+                    started_at: OffsetDateTime::UNIX_EPOCH,
+                    free_before: 0,
+                    free_after: 0,
+                    finished: false,
+                    rules: Vec::new(),
+                    skipped: Vec::new(),
+                    skipped_total: 0,
+                }),
+                record,
+            );
+        }
+    }
+
+    Ok(detail)
+}
+
+/// 最近 `days` 天要读的日志文件，按日期升序。还没有日志时返回空列表。
+fn journal_files(days: usize) -> io::Result<Vec<PathBuf>> {
+    let dir = journal_dir()?;
+
+    // 文件名是 ISO 日期，按名字排序就是按日期排序。
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .collect(),
+        // 还没产生过日志时不是错误。
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    files.sort();
+    if files.len() > days {
+        files.drain(..files.len() - days);
+    }
+
+    Ok(files)
+}
+
 /// 把一条记录并入对应的计划摘要。
 fn apply(plans: &mut Vec<PlanSummary>, index: &mut HashMap<Uuid, usize>, record: Record) {
     let plan_id = record_plan_id(&record);
@@ -213,6 +293,7 @@ fn apply(plans: &mut Vec<PlanSummary>, index: &mut HashMap<Uuid, usize>, record:
         plans.push(PlanSummary {
             plan_id,
             started_at: OffsetDateTime::UNIX_EPOCH,
+            rules: Vec::new(),
             free_before: 0,
             free_after: 0,
             deleted_files: 0,
@@ -226,9 +307,10 @@ fn apply(plans: &mut Vec<PlanSummary>, index: &mut HashMap<Uuid, usize>, record:
     let summary = &mut plans[position];
 
     match record {
-        Record::PlanStarted { at, .. } => {
+        Record::PlanStarted { at, rules, .. } => {
             summary.started_at =
                 OffsetDateTime::from_unix_timestamp(at).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            summary.rules = rules;
         }
         Record::ItemDone {
             is_dir, allocated, ..
@@ -270,6 +352,99 @@ fn record_plan_id(record: &Record) -> Uuid {
         | Record::ItemSkipped { plan_id, .. }
         | Record::RuleSkipped { plan_id, .. }
         | Record::PlanFinished { plan_id, .. } => *plan_id,
+    }
+}
+
+/// 把一条记录并入执行详情。
+fn apply_detail(detail: &mut PlanDetail, record: Record) {
+    match record {
+        Record::PlanStarted { at, rules, .. } => {
+            detail.started_at =
+                OffsetDateTime::from_unix_timestamp(at).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            // 计划里的规则先全部列出来，没删任何文件的规则也要能显示成 0。
+            detail.rules = rules
+                .into_iter()
+                .map(|rule_id| RuleDetail::new(&rule_id))
+                .collect();
+        }
+        Record::ItemDone {
+            rule_id,
+            is_dir,
+            allocated,
+            ..
+        } => {
+            let rule = rule_detail(detail, &rule_id);
+            if is_dir {
+                rule.deleted_dirs += 1;
+            } else {
+                rule.deleted_files += 1;
+            }
+            rule.freed_allocated += allocated;
+        }
+        Record::ItemSkipped {
+            rule_id,
+            path,
+            reason,
+            ..
+        } => {
+            rule_detail(detail, &rule_id).skipped += 1;
+            detail.skipped_total += 1;
+            if detail.skipped.len() < MAX_SKIPPED_DETAILS {
+                detail.skipped.push(SkippedItem {
+                    rule_id,
+                    path,
+                    reason,
+                });
+            }
+        }
+        Record::RuleSkipped {
+            rule_id, reason, ..
+        } => {
+            rule_detail(detail, &rule_id).skipped += 1;
+            detail.skipped_total += 1;
+            if detail.skipped.len() < MAX_SKIPPED_DETAILS {
+                detail.skipped.push(SkippedItem {
+                    rule_id,
+                    // 整条规则被跳过，没有具体条目路径。
+                    path: String::new(),
+                    reason,
+                });
+            }
+        }
+        Record::PlanFinished {
+            free_before,
+            free_after,
+            ..
+        } => {
+            detail.free_before = free_before;
+            detail.free_after = free_after;
+            detail.finished = true;
+        }
+    }
+}
+
+/// 取某条规则的详情统计，没有就先补一条。
+fn rule_detail<'a>(detail: &'a mut PlanDetail, rule_id: &str) -> &'a mut RuleDetail {
+    let index = match detail.rules.iter().position(|rule| rule.rule_id == rule_id) {
+        Some(index) => index,
+        None => {
+            detail.rules.push(RuleDetail::new(rule_id));
+            detail.rules.len() - 1
+        }
+    };
+
+    &mut detail.rules[index]
+}
+
+impl RuleDetail {
+    fn new(rule_id: &str) -> Self {
+        Self {
+            rule_id: rule_id.to_string(),
+            deleted_files: 0,
+            deleted_dirs: 0,
+            freed_allocated: 0,
+            skipped: 0,
+        }
     }
 }
 

@@ -35,6 +35,7 @@ pub fn run() {
             commands::plan::plan_execute,
             commands::plan::plan_cancel,
             commands::plan::history_list,
+            commands::plan::history_detail,
             commands::rules::rules_catalog,
             commands::rules::rules_evaluate,
             commands::scan::volume_info,

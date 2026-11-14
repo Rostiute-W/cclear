@@ -158,6 +158,13 @@ export interface PlanRuleSummary {
   files: number;
   dirs: number;
   skippedAtBuild: number;
+  // 构建清单时被跳过的条目，展开可以看具体原因。
+  skippedDetails: PlanSkippedBuild[];
+}
+
+export interface PlanSkippedBuild {
+  path: string;
+  reason: string;
 }
 
 export interface PlanSummary {
@@ -214,6 +221,8 @@ export interface ExecReport {
 export interface PlanHistoryEntry {
   planId: string;
   startedAt: number;
+  // 这次执行涉及的规则 ID，名称由界面查规则目录。
+  rules: string[];
   freeBefore: number;
   freeAfter: number;
   deletedFiles: number;
@@ -227,4 +236,24 @@ export interface PlanHistory {
   plans: PlanHistoryEntry[];
   // 解析失败的日志行数，大于 0 说明历史不完整。
   skippedLines: number;
+}
+
+// 一次执行的历史详情。skipped 只保留前 200 条，skippedTotal 是实际总数。
+export interface PlanDetail {
+  planId: string;
+  startedAt: number;
+  freeBefore: number;
+  freeAfter: number;
+  finished: boolean;
+  rules: PlanDetailRule[];
+  skipped: ExecSkip[];
+  skippedTotal: number;
+}
+
+export interface PlanDetailRule {
+  ruleId: string;
+  deletedFiles: number;
+  deletedDirs: number;
+  freedAllocated: number;
+  skipped: number;
 }

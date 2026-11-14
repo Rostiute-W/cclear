@@ -13,6 +13,7 @@
     "allow-plan-execute",
     "allow-plan-cancel",
     "allow-history-list",
+    "allow-history-detail",
     "allow-rules-catalog",
     "allow-rules-evaluate",
     "allow-volume-info",

@@ -6,12 +6,13 @@ import {
   scanSummary,
   scanTopFiles,
 } from "../api";
+import { Treemap } from "../components/Treemap";
 import { formatSize, formatTime } from "../format";
 import type { DirNode, FileEntry, ScanSummary } from "../types";
 
 const TOP_FILE_LIMIT = 200;
 
-type Tab = "dirs" | "files";
+type Tab = "dirs" | "graph" | "files";
 
 export function SpacePage() {
   const [summary, setSummary] = useState<ScanSummary | null>(null);
@@ -32,7 +33,8 @@ export function SpacePage() {
   }, []);
 
   useEffect(() => {
-    if (!summary || tab !== "dirs") {
+    // 目录列表和图形视图看的都是当前节点的直接子目录，共用同一份数据。
+    if (!summary || tab === "files") {
       return;
     }
     scanChildren(currentId)
@@ -90,6 +92,13 @@ export function SpacePage() {
         </button>
         <button
           type="button"
+          className={tab === "graph" ? "tab tab-active" : "tab"}
+          onClick={() => setTab("graph")}
+        >
+          图形
+        </button>
+        <button
+          type="button"
           className={tab === "files" ? "tab tab-active" : "tab"}
           onClick={() => setTab("files")}
         >
@@ -99,7 +108,11 @@ export function SpacePage() {
 
       {error && <p className="warn">{error}</p>}
 
-      {tab === "dirs" ? (
+      {tab === "graph" && (
+        <Treemap nodes={rows} onEnter={(node) => setTrail([...trail, node])} />
+      )}
+
+      {tab === "dirs" && (
         <table className="table">
           <thead>
             <tr>
@@ -162,7 +175,9 @@ export function SpacePage() {
             ))}
           </tbody>
         </table>
-      ) : (
+      )}
+
+      {tab === "files" && (
         <table className="table">
           <thead>
             <tr>

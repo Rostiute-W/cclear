@@ -10,6 +10,7 @@ fn main() {
             "plan_execute",
             "plan_cancel",
             "history_list",
+            "history_detail",
             "rules_catalog",
             "rules_evaluate",
             "volume_info",
