@@ -132,8 +132,8 @@ pub enum SystemOpId {
     DeliveryOptimization,
 }
 
-/// 允许执行清理的阶段。M1 只做分析，所以这里是空的，所有候选都不具备执行资格。
-pub const ENABLED_PHASES: &[Phase] = &[];
+/// 允许执行清理的阶段。M3 开放 safe 和 caution 的文件类规则，命令类留给后续任务。
+pub const ENABLED_PHASES: &[Phase] = &[Phase::M3a, Phase::M3b];
 
 /// 递归清理锚点下的全部内容。
 const ALL_CONTENTS: Selector = Selector {

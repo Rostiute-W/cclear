@@ -253,7 +253,8 @@ fn age_filter_and_newest_file_per_dir() {
     // 只剩 a-50h、b-48h、d-30h：c-40h 是锚点目录最新，e-1h 太新。
     assert_eq!(candidate.size.files, 3);
     assert_eq!(candidate.size.logical, 450);
-    assert!(!candidate.executable, "ENABLED_PHASES 为空时不能有执行资格");
+    // M3b 已开放：满足条件的文件类规则应当拿到执行资格。
+    assert!(candidate.executable, "M3b 已开放，这条规则应当有执行资格");
 }
 
 #[test]

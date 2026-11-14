@@ -133,6 +133,45 @@ fn create_junction(link: &Path, target: &Path) {
     );
 }
 
+/// 复刻真实遇到的 ACL：去掉继承，只授 Everyone 删除、列目录和删子项，
+/// 没有遍历权限，也没有读取属性的权限之外的任何权限。
+fn restrict_acl(dir: &Path) {
+    let output = Command::new("icacls")
+        .arg(dir)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-1-0:(OI)(CI)(D,Rc,RD,DC)",
+        ])
+        .output()
+        .expect("启动 icacls 失败");
+
+    assert!(
+        output.status.success(),
+        "设置受限 ACL 失败：{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// 恢复继承权限，否则临时目录清理不掉。
+fn reset_acl(dir: &Path) {
+    if !dir.exists() {
+        return;
+    }
+
+    let output = Command::new("icacls")
+        .arg(dir)
+        .args(["/reset", "/T"])
+        .output()
+        .expect("启动 icacls 失败");
+
+    assert!(
+        output.status.success(),
+        "恢复 ACL 失败：{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 #[test]
 fn deletes_planned_items_only() {
     let temp = TempDir::new().unwrap();
@@ -284,4 +323,50 @@ fn skips_junction_inside_anchor() {
         "junction 指向的外部目录内容不能变"
     );
     assert!(outside.join("data.txt").exists());
+}
+
+/// 安装程序留下的目录常常只给“列目录、删除”，不给遍历权限：
+/// 评估能数到里面的文件，清单和护栏也必须能打开并删掉它们。
+#[test]
+fn plans_and_deletes_in_dir_without_traverse_right() {
+    let temp = TempDir::new().unwrap();
+    let roots = roots_for(&temp);
+    let anchor = roots.get(KnownRoot::LocalAppData).unwrap().join("anchor");
+    let locked = anchor.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("a.txt"), "a").unwrap();
+    fs::write(locked.join("b.txt"), "b").unwrap();
+
+    restrict_acl(&locked);
+
+    let rule = test_rule();
+    let forbidden = no_forbidden();
+    let plan = build_plan(&[&rule], &roots, &forbidden, &[], SystemTime::now()).unwrap();
+
+    assert_eq!(
+        plan.rules[0].total.files, 2,
+        "只缺遍历权限的目录里的文件也要进清单"
+    );
+    assert!(
+        plan.rules[0].skipped_at_build.is_empty(),
+        "这些文件不应当被跳过，实际跳过：{:?}",
+        plan.rules[0]
+            .skipped_at_build
+            .iter()
+            .map(|(path, reason)| (path.display().to_string(), reason.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    let report = run(&plan, &[rule.id], &forbidden);
+    reset_acl(&locked);
+
+    assert!(report.aborted.is_none(), "正常执行不应当中止");
+    assert!(
+        !locked.join("a.txt").exists(),
+        "权限受限目录里的文件应当被删除"
+    );
+    assert!(
+        !locked.join("b.txt").exists(),
+        "权限受限目录里的文件应当被删除"
+    );
 }

@@ -86,7 +86,8 @@ export function HistoryPage() {
                   <button type="button" className="link" onClick={() => toggleDetail(plan.planId)}>
                     {formatTime(plan.startedAt)}
                   </button>
-                  {!plan.finished && <span className="muted">（未完成）</span>}
+                  {plan.cancelled && <span className="muted">（已取消）</span>}
+                  {!plan.finished && !plan.cancelled && <span className="muted">（未完成）</span>}
                 </td>
                 <td>{ruleSummary(plan, nameOf)}</td>
                 <td>{formatSize(plan.freedAllocated)}</td>
@@ -107,7 +108,7 @@ export function HistoryPage() {
             <>
               <p className="muted">
                 执行前剩余 {formatSize(detail.freeBefore)}，执行后剩余{" "}
-                {formatSize(detail.freeAfter)}（{detail.finished ? "已正常结束" : "未正常结束"}）。
+                {formatSize(detail.freeAfter)}（{finishLabel(detail)}）。
               </p>
 
               <table className="table">
@@ -166,9 +167,17 @@ export function HistoryPage() {
   );
 }
 
+// 结束状态：取消的执行不能显示成“已正常结束”。
+function finishLabel(detail: PlanDetail): string {
+  if (detail.cancelled) {
+    return "已取消";
+  }
+
+  return detail.finished ? "已正常结束" : "未正常结束";
+}
+
 // “规则”列：列出前几条名称，超出部分只报数量。
-function ruleSummary(plan: PlanHistoryEntry, nameOf: (ruleId: string) => string): string {
-  if (plan.rules.length === 0) {
+function ruleSummary(plan: PlanHistoryEntry, nameOf: (ruleId: string) => string): string {  if (plan.rules.length === 0) {
     return "—";
   }
 

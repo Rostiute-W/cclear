@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{CoreError, Result};
 use crate::model::{FileIdentity, KnownRoot, Phase, SizeInfo, Tier};
-use crate::rules::catalog::{ENABLED_PHASES, Rule, SelectKind, Selector, Target};
+use crate::rules::catalog::{ENABLED_PHASES, Rule, SelectKind, Selector, Target, catalog};
 use crate::rules::forbidden;
 use crate::scan::{FileCount, HARD_LINK_SHARDS, HardLinkSet, classify_file};
 use crate::win::process::ProcInfo;
@@ -277,6 +277,16 @@ pub fn evaluate(rule: &Rule, roots: &RootMap, procs: &[ProcInfo], now: SystemTim
         && candidate.status == CandidateStatus::Ready;
 
     candidate
+}
+
+/// 评估全部内置规则。规则之间互不依赖，用 rayon 跨规则并行，输出顺序与 `catalog()` 相同。
+pub fn evaluate_all(roots: &RootMap, procs: &[ProcInfo], now: SystemTime) -> Vec<Candidate> {
+    use rayon::prelude::*;
+
+    catalog()
+        .par_iter()
+        .map(|rule| evaluate(rule, roots, procs, now))
+        .collect()
 }
 
 /// 候选的样例路径：占盘最大的前 `SAMPLE_LIMIT` 个文件。

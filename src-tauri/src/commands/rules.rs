@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use cclear_core::model::{Category, Phase, Recovery, Tier};
 use cclear_core::rules::catalog::{Rule, Target, catalog};
-use cclear_core::rules::resolve::{Candidate, RootMap, evaluate};
+use cclear_core::rules::resolve::{Candidate, RootMap, evaluate_all};
 use cclear_core::win::process::running_processes;
 use serde::Serialize;
 
@@ -54,9 +54,10 @@ pub async fn rules_evaluate() -> Result<Vec<CandidateDto>, String> {
         let procs = running_processes();
         let now = SystemTime::now();
 
-        Ok(catalog()
-            .iter()
-            .map(|rule| candidate_dto(evaluate(rule, &roots, &procs, now)))
+        // 规则之间互不依赖，跨规则并行评估；返回值顺序与规则目录一致。
+        Ok(evaluate_all(&roots, &procs, now)
+            .into_iter()
+            .map(candidate_dto)
             .collect())
     })
     .await

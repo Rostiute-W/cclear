@@ -122,6 +122,8 @@ pub struct PlanHistoryEntryDto {
     pub freed_allocated: u64,
     pub skipped: u64,
     pub finished: bool,
+    /// 用户取消了这次执行。
+    pub cancelled: bool,
 }
 
 #[derive(Serialize)]
@@ -140,6 +142,8 @@ pub struct PlanDetailDto {
     pub free_before: u64,
     pub free_after: u64,
     pub finished: bool,
+    /// 用户取消了这次执行。
+    pub cancelled: bool,
     pub rules: Vec<PlanDetailRuleDto>,
     /// 跳过明细，复用执行报告里的跳过结构。
     pub skipped: Vec<ExecSkipDto>,
@@ -446,6 +450,7 @@ fn history_dto(summary: cclear_core::journal::PlanSummary) -> PlanHistoryEntryDt
         freed_allocated: summary.freed_allocated,
         skipped: summary.skipped,
         finished: summary.finished,
+        cancelled: summary.cancelled,
     }
 }
 
@@ -456,6 +461,7 @@ fn detail_dto(detail: cclear_core::journal::PlanDetail) -> PlanDetailDto {
         free_before: detail.free_before,
         free_after: detail.free_after,
         finished: detail.finished,
+        cancelled: detail.cancelled,
         rules: detail
             .rules
             .into_iter()
