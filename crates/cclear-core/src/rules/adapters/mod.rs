@@ -346,7 +346,7 @@ fn editor_extensions(
 
     for name in names {
         // 仍被 extensions.json 引用的目录可能只是记录没清掉，删了会把在用的扩展带走。
-        if referenced.contains(name) {
+        if is_referenced(&referenced, name) {
             continue;
         }
         if !dirinfo::is_plain_dir(&base.join(name)) {
@@ -365,7 +365,7 @@ fn editor_extensions(
     }
 
     for (name, path) in child_dirs(&base) {
-        if !is_temp_dir_name(&name) || referenced.contains(&name) {
+        if !is_temp_dir_name(&name) || is_referenced(&referenced, &name) {
             continue;
         }
 
@@ -405,15 +405,21 @@ fn referenced_extensions(base: &Path) -> Option<HashSet<String>> {
 
     let mut names = HashSet::new();
     for entry in list {
-        if let Some(location) = entry
-            .get("relativeLocation")
-            .and_then(|value| value.as_str())
-        {
-            names.insert(location.to_string());
-        }
+        // 有一条读不出目录名时，整份引用表都不可信：可能把在用的扩展当成残留。
+        let location = entry.get("relativeLocation")?.as_str()?;
+        names.insert(location.to_string());
     }
 
     Some(names)
+}
+
+/// 某个目录名是否在 `extensions.json` 的有效引用里。
+///
+/// 目录名比较不区分大小写：Windows 上扩展目录的大小写和记录里不一定一致。
+fn is_referenced(referenced: &HashSet<String>, name: &str) -> bool {
+    referenced
+        .iter()
+        .any(|known| crate::win::equals_ignore_case(known, name))
 }
 
 /// MathWorks ServiceHost（本机确认的格式）：
@@ -446,6 +452,11 @@ fn mathworks_service_host(roots: &RootMap, procs: &[ProcInfo]) -> AdapterResult 
     // 最新版本目录本身必须存在，否则剩下的目录都可能包括它。
     if !dirinfo::is_plain_dir(&latest) {
         return insufficient(&format!("LatestInstall.info 指向的 {latest_name} 不存在"));
+    }
+    // 它的父目录必须就是 ServiceHost：指向别处时说明文件已经被改过，判断不了旧版本。
+    let parent = latest.parent().unwrap_or_else(|| Path::new(""));
+    if !same_path(parent, &base) {
+        return insufficient("LatestInstall.info 指向的目录不在 ServiceHost 下");
     }
 
     let mut items = Vec::new();
@@ -608,7 +619,9 @@ fn docker_desktop_updates(roots: &RootMap, procs: &[ProcInfo]) -> AdapterResult 
     }
 
     // Docker Desktop 的进程没退出时不碰更新包：可能正被安装程序使用。
-    with_running(items, Vec::new(), running_names(DOCKER_PROCESSES, procs))
+    // 除了进程名，还看有进程是不是正从这个更新目录里运行。
+    let running = running_for_target(&base, DOCKER_PROCESSES, procs);
+    with_running(items, Vec::new(), running)
 }
 
 /// 联想应用商店的 cicada 下载缓存：`ProgramData\Lenovo\LeAppStore\cicada`。

@@ -8,7 +8,7 @@ use crate::guard::{self, DirHandle, Expect, Forbidden, GuardError, OpenIntent};
 use crate::journal::{JournalSink, Record, unix_now};
 use crate::model::Recovery;
 use crate::plan::{FrozenItem, FrozenPlan, PlanRule};
-use crate::quarantine::{BatchStage, QuarantineItem, QuarantineRoot};
+use crate::quarantine::{BatchStage, FrozenExpect, QuarantineItem, QuarantineRoot};
 use crate::rules::catalog::find;
 use crate::win::process::ProcInfo;
 use crate::win::volume;
@@ -380,9 +380,15 @@ impl ExecContext<'_> {
                 continue;
             }
 
+            // 冻结清单里的身份、大小和修改时间交给隔离引擎，预检时逐项复核。
             items.push(QuarantineItem {
                 anchor_index: item.anchor_index,
                 rel: item.rel.clone(),
+                frozen: Some(FrozenExpect {
+                    identity: item.identity,
+                    size: item.size,
+                    mtime: item.mtime,
+                }),
             });
         }
 

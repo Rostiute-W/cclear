@@ -387,9 +387,17 @@ fn expand_adapter(
             ));
             continue;
         }
-        if !seen.insert(entry.identity) {
+
+        // 正在运行的程序文件不能动，这一条和目录分支的口径一致。
+        let path = join_all(&item.anchor, &item.rel);
+        if is_running_image(&path, procs) {
+            skipped.push((path, "正在运行的程序文件".to_string()));
             continue;
         }
+
+        // 同一文件的多个硬链接名字都要留在清单里：只隔离其中一个名字释放不了空间。
+        // 大小只计一次，和扫描器的去重口径一致。
+        let counted_before = !seen.insert(entry.identity);
 
         items.push(FrozenItem {
             item_id: items.len() as u32,
@@ -403,8 +411,10 @@ fn expand_adapter(
             mtime: entry.mtime,
         });
 
-        total.logical += entry.size;
-        total.allocated += entry.allocated;
+        if !counted_before {
+            total.logical += entry.size;
+            total.allocated += entry.allocated;
+        }
         total.files += 1;
     }
 
@@ -613,14 +623,19 @@ impl Walker<'_> {
 
     /// 文件的完整路径是否就是某个正在运行的进程映像。
     fn is_running_process(&self, path: &Path) -> bool {
-        let text = path.to_string_lossy();
-
-        self.procs.iter().any(|proc| {
-            proc.image_path.as_ref().is_some_and(|image| {
-                crate::win::equals_ignore_case(&image.to_string_lossy(), &text)
-            })
-        })
+        is_running_image(path, self.procs)
     }
+}
+
+/// 文件的完整路径是否就是某个正在运行的进程映像。目录和单文件两条分支共用它。
+fn is_running_image(path: &Path, procs: &[ProcInfo]) -> bool {
+    let text = path.to_string_lossy();
+
+    procs.iter().any(|proc| {
+        proc.image_path
+            .as_ref()
+            .is_some_and(|image| crate::win::equals_ignore_case(&image.to_string_lossy(), &text))
+    })
 }
 
 /// 拼出锚点下的完整路径，只用于记录和展示，不参与文件操作。

@@ -734,7 +734,7 @@ static CATALOG: &[Rule] = &[
     Rule {
         id: "adapter-codex-previous-runtime",
         name: "Codex 旧运行时",
-        description: "codex-primary-runtime.previous-* 目录，当前 runtime 存在且版本可读时才处理",
+        description: "codex-primary-runtime.previous-* 目录，当前 codex-primary-runtime 存在时才处理",
         category: Category::Leftover,
         tier: Tier::Leftover,
         recovery: Recovery::Quarantine,
@@ -846,7 +846,8 @@ static CATALOG: &[Rule] = &[
         phase: Phase::M4,
         admin: false,
         default_selected: false,
-        processes: &[],
+        // 执行器复核时按进程名判断：更新中的 installer.exe 不能再清。
+        processes: &["installer.exe"],
         layout_markers: &[],
         warning: None,
         target: Target::Adapter(AdapterId::QianfanInstaller),
@@ -861,7 +862,12 @@ static CATALOG: &[Rule] = &[
         phase: Phase::M4,
         admin: false,
         default_selected: false,
-        processes: &[],
+        // 适配器按“进程映像是否在这个目录下”判断，执行器按进程名复核。
+        processes: &[
+            "Docker Desktop.exe",
+            "com.docker.backend.exe",
+            "Docker Desktop Installer.exe",
+        ],
         layout_markers: &[],
         warning: None,
         target: Target::Adapter(AdapterId::DockerDesktopUpdates),

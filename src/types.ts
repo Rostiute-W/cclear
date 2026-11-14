@@ -362,6 +362,8 @@ export interface ElevatedOpResult {
   batchId: string | null;
   // 本次处理的条目数。
   items: number;
+  // 还原时原位已有同名文件、因此没有还原的路径。
+  conflicts: string[];
 }
 
 // 一次提权执行的完整结果。

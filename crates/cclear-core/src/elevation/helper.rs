@@ -12,7 +12,7 @@ use crate::guard::{self, Forbidden};
 use crate::journal::{FileJournal, JournalSink, Record, unix_now};
 use crate::model::{KnownRoot, Recovery};
 use crate::plan;
-use crate::quarantine::{BatchStage, QuarantineItem, QuarantineRoot};
+use crate::quarantine::{BatchStage, FrozenExpect, Manifest, QuarantineItem, QuarantineRoot};
 use crate::rules::adapters::{self, LE_APPSTORE_PROCESSES, NVIDIA_APP_PROCESSES};
 use crate::rules::forbidden as rules_forbidden;
 use crate::rules::resolve::RootMap;
@@ -27,6 +27,12 @@ use super::{ElevationError, HelperResult, OpOutcome, maintenance, windows_files}
 const LE_APPSTORE_CICADA: &str = r"Lenovo\LeAppStore\cicada";
 /// NVIDIA App 的 OTA 下载残留（相对 ProgramData）。
 const NVIDIA_OTA_ARTIFACTS: &str = r"NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts";
+
+/// 允许 helper 还原和彻底删除的规则，以及它对应的 ProgramData 相对基目录。
+const ADMIN_RULES: &[(&str, &str)] = &[
+    ("adapter-leappstore-cicada", LE_APPSTORE_CICADA),
+    ("adapter-nvidia-app-ota-artifacts", NVIDIA_OTA_ARTIFACTS),
+];
 
 /// 提权后仍然不许碰的 Windows 子目录（相对 Windows 目录）。
 const WINDOWS_PROTECTED: &[&str] = &[
@@ -157,8 +163,8 @@ fn run_op(
             quarantine_root,
             journal,
         ),
-        SystemOp::RestoreBatch(id) => restore_batch(op, id, quarantine_root, journal),
-        SystemOp::PurgeBatch(id) => purge_batch(op, id, quarantine_root, journal),
+        SystemOp::RestoreBatch(id) => restore_batch(op, id, roots, quarantine_root, journal),
+        SystemOp::PurgeBatch(id) => purge_batch(op, id, roots, quarantine_root, journal),
         SystemOp::WindowsTemp | SystemOp::WindowsLogs | SystemOp::SysReset => {
             windows_files::run(op, forbidden, roots, journal)
         }
@@ -223,6 +229,11 @@ fn quarantine_program_data(
         items.push(QuarantineItem {
             anchor_index: item.anchor_index,
             rel: item.rel.clone(),
+            frozen: Some(FrozenExpect {
+                identity: item.identity,
+                size: item.size,
+                mtime: item.mtime,
+            }),
         });
     }
 
@@ -267,6 +278,7 @@ fn quarantine_program_data(
 fn restore_batch(
     op: SystemOp,
     batch_id: Uuid,
+    roots: &RootMap,
     quarantine_root: Option<&Path>,
     journal: &mut dyn JournalSink,
 ) -> OpOutcome {
@@ -277,6 +289,12 @@ fn restore_batch(
     };
 
     let root = QuarantineRoot::open(root_path.to_path_buf());
+
+    // 隔离区在普通用户可写的目录里，照着清单写系统路径之前必须先确认清单可信。
+    if let Err(reason) = load_admin_batch(&root, batch_id, roots) {
+        return OpOutcome::failed(token, reason);
+    }
+
     match root.restore(batch_id, journal) {
         Ok(outcome) => {
             let detail = format!(
@@ -293,6 +311,11 @@ fn restore_batch(
             };
             result.batch_id = Some(batch_id.to_string());
             result.items = outcome.restored;
+            result.conflicts = outcome
+                .conflicts
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
             result
         }
         Err(error) => OpOutcome::failed(token, error.to_string()),
@@ -303,6 +326,7 @@ fn restore_batch(
 fn purge_batch(
     op: SystemOp,
     batch_id: Uuid,
+    roots: &RootMap,
     quarantine_root: Option<&Path>,
     journal: &mut dyn JournalSink,
 ) -> OpOutcome {
@@ -313,6 +337,12 @@ fn purge_batch(
     };
 
     let root = QuarantineRoot::open(root_path.to_path_buf());
+
+    // 彻删会整棵删掉批次目录，同样要先确认这个批次确实是提权规则创建的。
+    if let Err(reason) = load_admin_batch(&root, batch_id, roots) {
+        return OpOutcome::failed(token, reason);
+    }
+
     match root.purge(batch_id, journal) {
         Ok(()) => {
             let mut result = OpOutcome::done(token, format!("已彻底删除批次 {batch_id}"));
@@ -321,6 +351,79 @@ fn purge_batch(
         }
         Err(error) => OpOutcome::failed(token, error.to_string()),
     }
+}
+
+/// 读批次清单并校验它确实属于需要管理员的两条规则。不合格时返回给用户看的中文原因。
+fn load_admin_batch(root: &QuarantineRoot, batch_id: Uuid, roots: &RootMap) -> Result<(), String> {
+    let manifest = root
+        .load_batch(batch_id)
+        .map_err(|error| error.to_string())?;
+
+    validate_admin_batch(&manifest, roots)
+}
+
+/// 批次被拒绝时固定的一句说明。
+const REJECTED: &str = "批次不属于需要管理员的规则或清单被修改，未做任何操作";
+
+/// 校验一个批次是否可以交给提权 helper 还原或彻底删除。
+///
+/// 隔离区在普通用户可写的位置，伪造一份 manifest 就能借 UAC 写到任意系统路径，
+/// 所以这里只认两条 ProgramData 规则，并且用 Known Folder 重新解析基目录，
+/// 每个条目的锚点都必须落在基目录本身或它下面。
+pub fn validate_admin_batch(manifest: &Manifest, roots: &RootMap) -> Result<(), String> {
+    // 独立调用（例如将来别的入口）时也要先过一遍路径校验，不能只靠调用方先读过清单。
+    manifest.validate().map_err(|_| REJECTED.to_string())?;
+
+    if !manifest.requires_admin {
+        return Err(REJECTED.to_string());
+    }
+
+    // 没有条目的清单无从校验锚点落在哪里，一律拒绝。
+    if manifest.items.is_empty() {
+        return Err(REJECTED.to_string());
+    }
+
+    let Some(program_data) = roots.get(KnownRoot::ProgramData) else {
+        return Err("无法解析 ProgramData 目录".to_string());
+    };
+
+    let Some((_, rel)) = ADMIN_RULES
+        .iter()
+        .find(|(rule_id, _)| *rule_id == manifest.rule_id)
+    else {
+        return Err(REJECTED.to_string());
+    };
+
+    let base = program_data.join(rel);
+    if manifest
+        .items
+        .iter()
+        .any(|item| !is_same_or_under(Path::new(&item.anchor), &base))
+    {
+        return Err(REJECTED.to_string());
+    }
+
+    Ok(())
+}
+
+/// 路径是否就是 `base` 或它的子路径。逐组件不区分大小写比较。
+fn is_same_or_under(path: &Path, base: &Path) -> bool {
+    let mut path = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned());
+
+    for base_component in base.components() {
+        let Some(actual) = path.next() else {
+            return false;
+        };
+
+        let expected = base_component.as_os_str().to_string_lossy();
+        if !equals_ignore_case(&actual, &expected) {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// 提权 helper 的禁区：目录规则的禁区去掉整个 Windows 根目录，

@@ -7,23 +7,30 @@ pub mod manifest;
 pub mod settings;
 pub mod volumes;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 use uuid::Uuid;
-use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_READONLY};
+use windows::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+};
 
 use crate::guard::{self, DirHandle, Expect, Forbidden, GuardError, OpenIntent};
 use crate::journal::{JournalSink, Record, unix_now};
+use crate::model::FileIdentity;
 use crate::win;
+use crate::win::dirinfo;
 use crate::win::volume;
 
 pub use manifest::{BatchStage, BatchSummary, DATA_DIR, ItemState, Manifest, ManifestItem};
-pub use settings::{load_quarantine_root, save_quarantine_root, settings_path};
+pub use settings::{
+    load_quarantine_root, load_quarantine_roots, save_quarantine_root, settings_path,
+};
 pub use volumes::{QUARANTINE_DIR_NAME, candidate_volumes, default_root};
 
 /// 整批最多用到源文件大小之和，再预留 2 GiB 给系统和其他程序。
@@ -37,6 +44,9 @@ const MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// 批次存放超过这么多天就提示用户处理。
 pub const OVERDUE_DAYS: u64 = 7;
+
+/// 隔离根目录里的标记文件。没有它的目录不是本程序建的，不能当成隔离区使用。
+pub const ROOT_MARKER: &str = ".cclear-root";
 
 /// 隔离引擎的错误。每种失败都对应“跳过并报告”，不会扩大删除范围。
 #[derive(Debug, Error)]
@@ -77,6 +87,12 @@ pub enum QuarantineError {
     #[error("路径护栏拒绝了这个操作：{0}")]
     Guard(#[from] GuardError),
 
+    #[error("隔离清单已损坏或被修改，未做任何操作")]
+    ManifestRejected,
+
+    #[error("{} 不是 CClear 创建的隔离目录，请换一个卷或先手工处理", .0.display())]
+    RootNotOurs(PathBuf),
+
     #[error("文件操作失败：{0}")]
     Io(#[from] io::Error),
 
@@ -85,20 +101,41 @@ pub enum QuarantineError {
     Injected,
 }
 
+/// 冻结清单里记下的源文件元数据。预检时逐项对照，变了就不隔离。
+#[derive(Clone, Copy, Debug)]
+pub struct FrozenExpect {
+    pub identity: FileIdentity,
+    pub size: u64,
+    pub mtime: u64,
+}
+
 /// 交给隔离引擎的一个条目。元数据在预检时从源文件重新读取，不信任调用方的缓存。
 #[derive(Clone, Debug)]
 pub struct QuarantineItem {
     pub anchor_index: u16,
     pub rel: Vec<OsString>,
+    /// 预览时冻结的元数据。给了它就在预检时对照，用来发现预览之后被替换的文件。
+    pub frozen: Option<FrozenExpect>,
 }
 
 impl QuarantineItem {
-    /// 按锚点序号和相对路径构造条目。
+    /// 按锚点序号和相对路径构造条目。测试和没有冻结值的调用方用它。
     pub fn new(anchor_index: u16, rel: &[&str]) -> Self {
         Self {
             anchor_index,
             rel: rel.iter().map(OsString::from).collect(),
+            frozen: None,
         }
+    }
+
+    /// 带上冻结清单里的身份、大小和修改时间。
+    pub fn with_frozen(mut self, identity: FileIdentity, size: u64, mtime: u64) -> Self {
+        self.frozen = Some(FrozenExpect {
+            identity,
+            size,
+            mtime,
+        });
+        self
     }
 }
 
@@ -167,6 +204,8 @@ pub struct QuarantineRoot {
     free_space: Box<dyn Fn(&Path) -> u64 + Send + Sync>,
     /// 测试注入：复制完第 N 个文件后中断，模拟进程被强行结束。
     crash_after_files: Option<usize>,
+    /// 测试注入：删完第 N 个源文件后中断，模拟删源阶段被打断。
+    crash_after_deletions: Option<usize>,
     /// 测试注入：复制校验完成后、删除源之前调用一次。
     after_copy: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -181,6 +220,7 @@ impl QuarantineRoot {
             requires_admin: false,
             free_space: Box::new(volume::free_space),
             crash_after_files: None,
+            crash_after_deletions: None,
             after_copy: None,
         }
     }
@@ -194,6 +234,7 @@ impl QuarantineRoot {
             requires_admin: false,
             free_space: Box::new(volume::free_space),
             crash_after_files: None,
+            crash_after_deletions: None,
             after_copy: None,
         }
     }
@@ -212,6 +253,26 @@ impl QuarantineRoot {
         Some(Self::open(root))
     }
 
+    /// 设置里记录过的全部隔离根，当前选择排在最前。
+    ///
+    /// 换过卷之后旧批次还在原来的根上，列表、到期提醒和启动恢复都要扫全部记录过的根。
+    pub fn roots_from_settings() -> Vec<Self> {
+        load_quarantine_roots()
+            .unwrap_or_default()
+            .into_iter()
+            .map(Self::open)
+            .collect()
+    }
+
+    /// 某个批次所在的隔离根。批次可能属于以前用过的卷。
+    pub fn find_root_of(batch_id: Uuid) -> Option<Self> {
+        Self::roots_from_settings().into_iter().find(|root| {
+            root.batch_dir(batch_id)
+                .join(manifest::MANIFEST_NAME)
+                .is_file()
+        })
+    }
+
     /// 注入剩余空间来源。测试用它给出“空间不足”或“空间充足”。
     pub fn with_free_space(
         mut self,
@@ -227,6 +288,12 @@ impl QuarantineRoot {
         self
     }
 
+    /// 注入崩溃点：删完第 `count` 个源文件后直接返回错误，模拟删源阶段被打断。
+    pub fn with_crash_after_deletions(mut self, count: usize) -> Self {
+        self.crash_after_deletions = Some(count);
+        self
+    }
+
     /// 注入“复制之后、删源之前”的动作。测试用它改动源文件。
     pub fn with_after_copy(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
         self.after_copy = Some(Box::new(hook));
@@ -238,18 +305,30 @@ impl QuarantineRoot {
         &self.root
     }
 
-    /// 建根目录。首次创建时把 DACL 收紧到 SYSTEM、管理员和当前用户。
+    /// 建根目录。首次创建时把 DACL 收紧到 SYSTEM、管理员和当前用户，并写入标记文件。
+    ///
+    /// 已有的目录必须带标记文件才认：否则用户选中的可能是有别的用途的目录，
+    /// 之后的“彻底删除”会按隔离区语义整棵删掉它。
     pub fn ensure_root(&self) -> Result<(), QuarantineError> {
         if self.root.exists() {
-            return Ok(());
+            if self.root.join(ROOT_MARKER).is_file() {
+                return Ok(());
+            }
+
+            return Err(QuarantineError::RootNotOurs(self.root.clone()));
         }
 
         fs::create_dir_all(&self.root)?;
 
-        if self.apply_acl {
-            win::acl::protect_quarantine_root(&self.root)
-                .map_err(|error| QuarantineError::Io(io::Error::other(error)))?;
+        if self.apply_acl
+            && let Err(error) = win::acl::protect_quarantine_root(&self.root)
+        {
+            // DACL 设置失败时必须撤掉刚建的空目录：留下的目录谁都能写，不能当隔离区。
+            remove_dir_tree(&self.root)?;
+            return Err(QuarantineError::Io(io::Error::other(error)));
         }
+
+        fs::write(self.root.join(ROOT_MARKER), b"CClear quarantine root\n")?;
 
         Ok(())
     }
@@ -302,6 +381,15 @@ impl QuarantineRoot {
                 skipped.push((path, "目录不隔离，已跳过".to_string()));
                 continue;
             }
+            // 预览之后文件被换掉时，隔离下来的不是用户看过的那一份，宁可不做。
+            if let Some(frozen) = item.frozen
+                && (entry.identity != frozen.identity
+                    || entry.size != frozen.size
+                    || entry.mtime != frozen.mtime)
+            {
+                skipped.push((path, "文件在预览之后发生了变化，已跳过".to_string()));
+                continue;
+            }
             // 只读属性会随复制带进隔离区，之后删除源会被护栏拒绝，
             // 而清只读属性是硬性禁止的，所以这类文件在预检就跳过。
             if entry.attributes & FILE_ATTRIBUTE_READONLY.0 != 0 {
@@ -339,10 +427,15 @@ impl QuarantineRoot {
         }
 
         // 隔离区和源同卷时，清理既腾不出空间也挡不住误删，直接拒绝。
-        if !self.allow_same_volume
-            && volume::path_volume_serial(&self.root) == Some(prepared[0].volume_serial)
-        {
-            return Err(QuarantineError::SameVolume);
+        // 逐条比较：一批条目可能来自不同卷，只看第一个会漏掉同卷的那些。
+        if !self.allow_same_volume {
+            let quarantine_serial = volume::path_volume_serial(&self.root);
+            let same_volume = prepared
+                .iter()
+                .any(|item| Some(item.volume_serial) == quarantine_serial);
+            if quarantine_serial.is_some() && same_volume {
+                return Err(QuarantineError::SameVolume);
+            }
         }
 
         // 2. 容量检查。整批拒绝时一行都不写，目标目录里不会留下任何东西。
@@ -494,6 +587,7 @@ impl QuarantineRoot {
         )?;
 
         let mut cancelled = false;
+        let mut deleted_sources = 0usize;
         for index in 0..manifest.items.len() {
             if manifest.items[index].state != ItemState::Copied {
                 continue;
@@ -504,24 +598,48 @@ impl QuarantineRoot {
             }
 
             let item = &mut manifest.items[index];
-            match delete_source(&opened, item, forbidden) {
+            let deleted = match delete_source(&opened, item, forbidden) {
                 Ok(()) => {
                     item.state = ItemState::SourceDeleted;
                     item.note.clear();
+                    true
+                }
+                // 源已经不在原位：副本是唯一的一份，状态要如实反映。
+                Err(GuardError::Gone) => {
+                    mark_source_gone(item, &batch_dir);
+                    false
                 }
                 Err(error) => {
                     // 源已经变了：不删源，副本留着，批次等下按“部分完成”处理。
                     item.state = ItemState::Kept;
                     item.note = format!("源已变化，源和副本都保留：{error}");
+                    false
                 }
+            };
+
+            // 每处理完一个条目就落一次盘：中途被打断时，恢复流程才能看出哪些源已经删了。
+            manifest.save(&batch_dir)?;
+
+            if deleted {
+                deleted_sources += 1;
+            }
+            // 测试注入：模拟在删源中途被强行结束。
+            if deleted && Some(deleted_sources) == self.crash_after_deletions {
+                return Err(QuarantineError::Injected);
             }
         }
 
         let kept = manifest.count_state(ItemState::Kept);
+        let attention = manifest.count_state(ItemState::NeedsAttention);
         let (stage, note) = if cancelled {
             (
                 BatchStage::NeedsAttention,
                 "隔离被取消，已复制的副本仍保留在隔离区".to_string(),
+            )
+        } else if attention > 0 {
+            (
+                BatchStage::NeedsAttention,
+                format!("{attention} 个文件源已不在原位且副本无法确认，请人工处理"),
             )
         } else if kept > 0 {
             (
@@ -539,7 +657,10 @@ impl QuarantineRoot {
         Ok(outcome_of(&manifest, skipped))
     }
 
-    /// 还原整个批次。原位已有同名文件时跳过该条目，绝不覆盖。
+    /// 还原整个批次：经护栏新建临时文件、校验，再不带替换改名回原位。
+    ///
+    /// 原位已有同名文件、路径上出现链接、任何一步失败，都只保留副本并记下原因，绝不覆盖，
+    /// 也不会在原位置留下写了一半的文件。
     pub fn restore(
         &self,
         batch_id: Uuid,
@@ -572,6 +693,8 @@ impl QuarantineRoot {
             journal,
         )?;
 
+        // 隔离区里全是本程序自己写的内容，不需要按用户目录的禁区规则再挡一遍。
+        let forbidden = Forbidden::empty();
         let mut restored = 0u64;
         let mut conflicts: Vec<PathBuf> = Vec::new();
 
@@ -580,42 +703,19 @@ impl QuarantineRoot {
                 continue;
             }
 
-            let item = &mut manifest.items[index];
-            let source = item.source_path();
-            let copy = item.copy_path(&batch_dir);
+            let step = {
+                let item = &mut manifest.items[index];
+                restore_item(&batch_dir, batch_id, item, &forbidden)
+            };
 
-            // 原位已经有同名文件：用户的文件不能被覆盖。
-            if source.exists() {
-                conflicts.push(source);
-                item.note = "原位置已有同名文件，已跳过".to_string();
-                continue;
-            }
-            if !copy.exists() {
-                item.note = "隔离副本已丢失，无法还原".to_string();
-                continue;
+            match step {
+                RestoreStep::Restored => restored += 1,
+                RestoreStep::Conflict(path) => conflicts.push(path),
+                RestoreStep::Skipped => {}
             }
 
-            // 先确认副本本身没坏，再往原位写。
-            if hash_hex(&copy)? != item.hash {
-                item.note = "隔离副本校验不一致，未还原".to_string();
-                continue;
-            }
-
-            if let Some(parent) = source.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&copy, &source)?;
-            win::set_file_times(&source, item.ctime, item.mtime)?;
-
-            if hash_hex(&source)? != item.hash {
-                item.note = "还原后校验不一致，副本仍保留".to_string();
-                continue;
-            }
-
-            remove_file_verified(&batch_dir, &item.copy_rel_path())?;
-            item.state = ItemState::Restored;
-            item.note.clear();
-            restored += 1;
+            // 每还原完一个条目就落一次盘：中途被打断也能看出哪些已经回去了。
+            manifest.save(&batch_dir)?;
         }
 
         let pending = manifest.count_state(ItemState::SourceDeleted);
@@ -714,16 +814,29 @@ impl QuarantineRoot {
                             item.state = ItemState::SourceDeleted;
                             item.note.clear();
                         }
+                        // 源已经不在原位：副本已在上一步校验过，它是唯一的一份。
+                        Err(QuarantineError::Guard(GuardError::Gone)) => {
+                            mark_source_gone(item, &batch_dir)
+                        }
                         Err(error) => {
                             // 复核没通过就两份都留下，绝不拿副本去换源。
                             item.state = ItemState::Kept;
                             item.note = format!("复核未通过，源和副本都保留：{error}");
                         }
                     }
+
+                    // 每处理完一个条目就落一次盘，中断后能看出哪些源已经删了。
+                    manifest.save(&batch_dir)?;
                 }
 
                 let kept = manifest.count_state(ItemState::Kept);
-                let (stage, note) = if kept > 0 {
+                let attention = manifest.count_state(ItemState::NeedsAttention);
+                let (stage, note) = if attention > 0 {
+                    (
+                        BatchStage::NeedsAttention,
+                        format!("{attention} 个文件源已不在原位且副本无法确认，请人工处理"),
+                    )
+                } else if kept > 0 {
                     (
                         BatchStage::NeedsAttention,
                         format!("部分完成：{kept} 个文件复核未通过，源和副本都保留"),
@@ -737,30 +850,33 @@ impl QuarantineRoot {
                 self.set_stage(&batch_dir, &mut manifest, stage, &note, journal)?;
             }
             ResolveAction::Abandon => {
-                self.abandon_copies(&batch_dir, &mut manifest, journal)?;
+                self.abandon_copies(&batch_dir, &mut manifest, forbidden, journal)?;
             }
         }
 
         Ok(outcome_of(&manifest, Vec::new()))
     }
 
-    /// 放弃副本：只删源还在原位的那些副本。
+    /// 放弃副本：只删源确实还在原位、而且没有变化的那些副本。
     ///
     /// 源已经删除的条目，副本是唯一的一份，必须原样保留——否则“放弃”
-    /// 就是把用户的数据删掉。这类条目留着，由用户在隔离区页还原或彻底删除。
+    /// 就是把用户的数据删掉。删副本之前一律先复核源，确认不了就留着。
     fn abandon_copies(
         &self,
         batch_dir: &Path,
         manifest: &mut Manifest,
+        forbidden: &Forbidden,
         journal: &mut dyn JournalSink,
     ) -> Result<(), QuarantineError> {
         let mut removed = 0u64;
 
         for index in 0..manifest.items.len() {
-            // 只有源仍在原位的条目能放弃副本；其余状态一律不动。
             if !matches!(
                 manifest.items[index].state,
-                ItemState::Pending | ItemState::Copied | ItemState::Kept
+                ItemState::Pending
+                    | ItemState::Copied
+                    | ItemState::Kept
+                    | ItemState::NeedsAttention
             ) {
                 continue;
             }
@@ -768,39 +884,68 @@ impl QuarantineRoot {
             let item = &mut manifest.items[index];
             let copy = item.copy_path(batch_dir);
 
+            match check_source(item, forbidden) {
+                // 源已经不在原位：副本是唯一的一份，绝对不能删。
+                SourceState::Gone => {
+                    mark_source_gone(item, batch_dir);
+                    manifest.save(batch_dir)?;
+                    continue;
+                }
+                SourceState::Changed(reason) => {
+                    item.state = ItemState::Kept;
+                    item.note = format!("源已变化，副本保留：{reason}");
+                    manifest.save(batch_dir)?;
+                    continue;
+                }
+                SourceState::Unchanged => {}
+            }
+
             // 副本已经不在了也算处理过：源还在原位，没有任何损失。
             item.state = ItemState::Pending;
             if !copy.exists() {
                 item.note = "副本已不存在，源保持不变".to_string();
+                manifest.save(batch_dir)?;
                 continue;
             }
 
             remove_file_verified(batch_dir, &item.copy_rel_path())?;
             item.note = "已放弃副本".to_string();
             removed += 1;
+
+            // 每删一个就落一次盘：中途被打断也不会把“已删”和“未删”搞混。
+            manifest.save(batch_dir)?;
         }
 
-        // 源已删除的条目必须留在隔离区里，批次也要停在能继续操作的状态上。
+        // 还留着副本的条目有三个来源：源已删除（唯一一份）、源已变化、以及源不在且副本无法确认。
+        // 只要还有任何一种，data 目录就必须原样保留。
         let isolated = manifest.count_state(ItemState::SourceDeleted);
-        let (stage, note) = if isolated == 0 {
+        let kept = manifest.count_state(ItemState::Kept);
+        let attention = manifest.count_state(ItemState::NeedsAttention);
+        let retained = isolated + kept + attention;
+
+        let (stage, note) = if retained == 0 {
             (
                 BatchStage::Aborted,
                 format!("已放弃 {removed} 个副本，源文件保持不变"),
             )
         } else if removed == 0 {
             (
-                BatchStage::Committed,
-                format!("没有可放弃的副本；{isolated} 个文件只剩隔离副本，仍保留在隔离区"),
+                BatchStage::NeedsAttention,
+                format!(
+                    "没有可放弃的副本；{retained} 个文件仍需保留副本（源已删除 {isolated}、源已变化 {kept}、需人工确认 {attention}）"
+                ),
             )
         } else {
             (
-                BatchStage::Committed,
-                format!("已放弃 {removed} 个副本；{isolated} 个文件源已删除，副本仍保留在隔离区"),
+                BatchStage::NeedsAttention,
+                format!(
+                    "已放弃 {removed} 个副本；{retained} 个文件仍需保留副本（源已删除 {isolated}、源已变化 {kept}、需人工确认 {attention}）"
+                ),
             )
         };
         self.set_stage(batch_dir, manifest, stage, &note, journal)?;
 
-        if isolated == 0 {
+        if retained == 0 {
             // 副本都删掉了，顺手清掉空的 data 目录；清不掉也不影响数据安全，
             // 交给“彻底删除”处理。
             let _ = remove_dir_tree(&batch_dir.join(DATA_DIR));
@@ -831,43 +976,89 @@ impl QuarantineRoot {
                 // 清单读不出来就没法判断进度，原样留着让用户自己处理。
                 continue;
             };
-
-            match manifest.stage {
-                // 计划好还没开始写、或者写了一半被打断：副本都是半成品，源没有动过。
-                BatchStage::Planned | BatchStage::Copying => {
-                    remove_dir_tree(&batch_dir.join(DATA_DIR))?;
-                    for item in manifest.items.iter_mut() {
-                        item.state = ItemState::Pending;
-                        item.hash.clear();
-                    }
-                    self.set_stage(
-                        &batch_dir,
-                        &mut manifest,
-                        BatchStage::Aborted,
-                        "上次隔离过程被中断，已删除半成品副本，源文件完好",
-                        journal,
-                    )?;
-                }
-                BatchStage::CopiedVerified | BatchStage::DeletingSource | BatchStage::Restoring => {
-                    self.set_stage(
-                        &batch_dir,
-                        &mut manifest,
-                        BatchStage::NeedsAttention,
-                        "上次操作被中断，请在隔离区页继续或放弃",
-                        journal,
-                    )?;
-                }
-                _ => continue,
+            // 被改过的清单不能照着动手：整批原样留着，由用户自己确认。
+            if manifest.validate().is_err() {
+                continue;
             }
+
+            // 一个批次恢复出错不影响其他批次：记下原因继续处理下一个。
+            let recovered = self.recover_batch(&batch_dir, &mut manifest, journal);
+            let detail = match recovered {
+                Ok(()) => manifest.note.clone(),
+                Err(error) => format!("恢复失败，批次原样保留：{error}"),
+            };
 
             reports.push(RecoveryReport {
                 batch_id: manifest.batch_id,
                 stage: manifest.stage,
-                detail: manifest.note.clone(),
+                detail,
             });
         }
 
         Ok(reports)
+    }
+
+    /// 把单个批次收到一个确定的状态上。出错时只返回错误，由调用方记录并继续。
+    fn recover_batch(
+        &self,
+        batch_dir: &Path,
+        manifest: &mut Manifest,
+        journal: &mut dyn JournalSink,
+    ) -> Result<(), QuarantineError> {
+        match manifest.stage {
+            // 计划好还没开始写、或者写了一半被打断：副本都是半成品，源没有动过。
+            BatchStage::Planned | BatchStage::Copying => {
+                remove_dir_tree(&batch_dir.join(DATA_DIR))?;
+                for item in manifest.items.iter_mut() {
+                    item.state = ItemState::Pending;
+                    item.hash.clear();
+                }
+                self.set_stage(
+                    batch_dir,
+                    manifest,
+                    BatchStage::Aborted,
+                    "上次隔离过程被中断，已删除半成品副本，源文件完好",
+                    journal,
+                )
+            }
+            BatchStage::CopiedVerified | BatchStage::DeletingSource => {
+                // 删源阶段可能已经删掉一部分：逐个核对源是否还在，如实修正条目状态。
+                let forbidden = Forbidden::empty();
+                for index in 0..manifest.items.len() {
+                    if manifest.items[index].state != ItemState::Copied {
+                        continue;
+                    }
+
+                    let item = &mut manifest.items[index];
+                    match check_source(item, &forbidden) {
+                        SourceState::Gone => mark_source_gone(item, batch_dir),
+                        SourceState::Changed(reason) => {
+                            item.state = ItemState::Kept;
+                            item.note = format!("源已变化，源和副本都保留：{reason}");
+                        }
+                        SourceState::Unchanged => {}
+                    }
+
+                    manifest.save(batch_dir)?;
+                }
+
+                self.set_stage(
+                    batch_dir,
+                    manifest,
+                    BatchStage::NeedsAttention,
+                    "上次操作被中断，请在隔离区页继续或放弃",
+                    journal,
+                )
+            }
+            BatchStage::Restoring => self.set_stage(
+                batch_dir,
+                manifest,
+                BatchStage::NeedsAttention,
+                "上次操作被中断，请在隔离区页继续或放弃",
+                journal,
+            ),
+            _ => Ok(()),
+        }
     }
 
     /// 所有批次的概要，按创建时间从新到旧。
@@ -928,8 +1119,20 @@ impl QuarantineRoot {
     }
 
     /// 读批次清单，读不出来时统一报“批次不存在或记录已损坏”。
+    ///
+    /// 读出来之后先校验条目路径：清单在用户可写的隔离区里，被改过的清单不能照着动手。
     fn load_manifest(&self, batch_dir: &Path) -> Result<Manifest, QuarantineError> {
-        Manifest::load(batch_dir).map_err(|_| QuarantineError::MissingBatch)
+        let manifest = Manifest::load(batch_dir).map_err(|_| QuarantineError::MissingBatch)?;
+        manifest
+            .validate()
+            .map_err(|_| QuarantineError::ManifestRejected)?;
+
+        Ok(manifest)
+    }
+
+    /// 读批次清单，供提权 helper 在动手前校验。校验规则同 [`Self::load_manifest`]。
+    pub fn load_batch(&self, batch_id: Uuid) -> Result<Manifest, QuarantineError> {
+        self.load_manifest(&self.batch_dir(batch_id))
     }
 
     /// 状态变化：先写 manifest（恢复的唯一依据），再写日志。
@@ -984,6 +1187,251 @@ impl QuarantineRoot {
     }
 }
 
+/// 一个条目的还原结果。
+enum RestoreStep {
+    /// 已经回到原位。
+    Restored,
+    /// 原位已经有同名文件，没有覆盖。
+    Conflict(PathBuf),
+    /// 没有还原，原因写在条目的说明里。
+    Skipped,
+}
+
+/// 源文件当前的状态。
+enum SourceState {
+    /// 还在原位，而且与记录一致。
+    Unchanged,
+    /// 还在原位但被换掉了，附带原因。
+    Changed(String),
+    /// 已经不在原位。
+    Gone,
+}
+
+/// 还原一个条目：临时文件写好、校验一致之后才不带替换改名回原位。
+///
+/// 任何一步失败都只留下副本，原位置不会出现半截文件，也不会覆盖已有文件。
+fn restore_item(
+    batch_dir: &Path,
+    batch_id: Uuid,
+    item: &mut ManifestItem,
+    forbidden: &Forbidden,
+) -> RestoreStep {
+    let source = item.source_path();
+    let copy = item.copy_path(batch_dir);
+
+    if !copy.exists() {
+        item.note = "隔离副本已丢失，无法还原".to_string();
+        return RestoreStep::Skipped;
+    }
+    // 先确认副本本身没坏，再往原位写。
+    if item.hash.is_empty() || !hash_matches(&copy, &item.hash) {
+        item.note = "隔离副本校验不一致，未还原".to_string();
+        return RestoreStep::Skipped;
+    }
+
+    let (Some(parent_path), Some(name)) = (source.parent(), source.file_name()) else {
+        item.note = "原位置路径不完整，未还原".to_string();
+        return RestoreStep::Skipped;
+    };
+
+    let parent = match open_anchor_creating(parent_path, forbidden) {
+        Ok(parent) => parent,
+        Err(error) => {
+            item.note = format!("无法在原位置准备目录，未还原：{error}");
+            return RestoreStep::Skipped;
+        }
+    };
+
+    // 原位已有同名对象：用户的文件不能被覆盖，按冲突处理。
+    // 只有“确实不存在”（Gone）才继续写；原位是链接或其他异常时直接放弃，连临时文件都不写。
+    let target_rel = vec![name.to_os_string()];
+    match guard::open_rel(&parent, &target_rel, OpenIntent::Inspect, forbidden) {
+        Ok(_) => {
+            item.note = "原位置已有同名文件，已跳过".to_string();
+            return RestoreStep::Conflict(source);
+        }
+        Err(GuardError::Gone) => {}
+        Err(error) => {
+            item.note = format!("原位置无法确认，未还原：{error}");
+            return RestoreStep::Skipped;
+        }
+    }
+
+    // 临时文件名带批次前缀：中途崩溃留下的半截文件一眼能认出属于哪个批次。
+    let temp_name = OsString::from(format!(
+        "{}.cclear-restore-{}",
+        name.to_string_lossy(),
+        &batch_id.to_string()[..8]
+    ));
+    let temp_path = parent.path().join(&temp_name);
+
+    if let Err(error) = write_copy(&parent, &temp_name, &copy) {
+        remove_child(&parent, &temp_name);
+        item.note = format!("写入临时文件失败，未还原：{error}");
+        return RestoreStep::Skipped;
+    }
+
+    if let Err(error) = win::set_file_times(&temp_path, item.ctime, item.mtime) {
+        remove_child(&parent, &temp_name);
+        item.note = format!("还原时无法对齐时间戳，未还原：{error}");
+        return RestoreStep::Skipped;
+    }
+
+    if !hash_matches(&temp_path, &item.hash) {
+        remove_child(&parent, &temp_name);
+        item.note = "还原后校验不一致，副本仍保留".to_string();
+        return RestoreStep::Skipped;
+    }
+
+    if let Err(error) = rename_restored(&parent, &temp_name, name, forbidden) {
+        remove_child(&parent, &temp_name);
+        // 改名失败时原位已经有对象，就是撞上了别人的文件；其余错误按失败处理。
+        match guard::open_rel(&parent, &target_rel, OpenIntent::Inspect, forbidden) {
+            Ok(_) => {
+                item.note = "原位置已有同名文件，已跳过".to_string();
+                return RestoreStep::Conflict(source);
+            }
+            _ => {
+                item.note = format!("改名回原位失败，未还原：{error}");
+                return RestoreStep::Skipped;
+            }
+        }
+    }
+
+    // 副本删不掉不影响数据安全：原位已经有一份校验一致的文件。
+    match remove_file_verified(batch_dir, &item.copy_rel_path()) {
+        Ok(()) => item.note.clear(),
+        Err(error) => item.note = format!("已还原，但副本未能删除：{error}"),
+    }
+    item.state = ItemState::Restored;
+
+    RestoreStep::Restored
+}
+
+/// 在父目录里新建临时文件并写入副本内容，写完刷盘再返回。
+fn write_copy(parent: &DirHandle, name: &OsStr, copy: &Path) -> Result<(), QuarantineError> {
+    let mut target = guard::create_file_in(parent, name)?;
+    let mut source = fs::File::open(copy)?;
+
+    io::copy(&mut source, &mut target)?;
+    // 必须真的落到盘上：否则掉电后恢复出来的文件可能只剩一半。
+    target.sync_all()?;
+
+    Ok(())
+}
+
+/// 通过护栏删掉父目录里的一个条目。只用于清理刚建的临时文件，失败也不往外报。
+fn remove_child(parent: &DirHandle, name: &OsStr) {
+    let forbidden = Forbidden::empty();
+    let rel = vec![name.to_os_string()];
+
+    if let Ok(entry) = guard::open_rel(parent, &rel, OpenIntent::Delete, &forbidden) {
+        let expect = entry.expect();
+        let _ = guard::delete(entry, &expect);
+    }
+}
+
+/// 把临时文件改名成原名。`rename_child` 不带替换标志，目标已存在时由系统拒绝。
+fn rename_restored(
+    parent: &DirHandle,
+    from: &OsStr,
+    to: &OsStr,
+    forbidden: &Forbidden,
+) -> Result<(), GuardError> {
+    let entry = guard::open_rel(
+        parent,
+        &[from.to_os_string()],
+        OpenIntent::Inspect,
+        forbidden,
+    )?;
+    let expect = entry.expect();
+
+    guard::rename_child(parent, from, to, &expect)
+}
+
+/// 文件的哈希是否与记录一致。读不出来按不一致处理。
+fn hash_matches(path: &Path, expected: &str) -> bool {
+    hash_hex(path).is_ok_and(|hash| hash == expected)
+}
+
+/// 打开锚点目录，路径上缺失的部分逐级新建。
+///
+/// 还原要回到原位置，而原位置的中间目录可能已经被删掉了。任何一级是链接时
+/// 都按“路径不合法”拒绝，不会顺着链接把文件写到别的位置。
+fn open_anchor_creating(path: &Path, forbidden: &Forbidden) -> Result<DirHandle, GuardError> {
+    match guard::open_anchor(path, forbidden) {
+        Ok(handle) => return Ok(handle),
+        Err(GuardError::Gone) => {}
+        Err(error) => return Err(error),
+    }
+
+    // 从最深的一级往上找已经存在的目录，缺的部分按原顺序补回来。
+    let mut missing: Vec<OsString> = Vec::new();
+    let mut existing = path.to_path_buf();
+
+    while !dirinfo::is_plain_dir(&existing) {
+        let Some(name) = existing.file_name().map(OsStr::to_os_string) else {
+            return Err(GuardError::InvalidName);
+        };
+        missing.push(name);
+
+        let Some(parent) = existing.parent() else {
+            return Err(GuardError::InvalidName);
+        };
+        existing = parent.to_path_buf();
+    }
+    missing.reverse();
+
+    for name in missing {
+        let handle = guard::open_anchor(&existing, forbidden)?;
+        guard::create_dir_in(&handle, &name)?;
+        existing.push(&name);
+    }
+
+    guard::open_anchor(&existing, forbidden)
+}
+
+/// 检查源文件是否还在原位、而且与清单记录的一致。
+fn check_source(item: &ManifestItem, forbidden: &Forbidden) -> SourceState {
+    let Some(identity) = item.identity() else {
+        return SourceState::Changed("清单里的文件标识不可用".to_string());
+    };
+
+    let anchor_path = PathBuf::from(&item.anchor);
+    let anchor = match guard::open_anchor(&anchor_path, forbidden) {
+        Ok(anchor) => anchor,
+        Err(GuardError::Gone) => return SourceState::Gone,
+        Err(error) => return SourceState::Changed(error.to_string()),
+    };
+
+    let rel: Vec<OsString> = item.rel.iter().map(OsString::from).collect();
+    let entry = match guard::open_rel(&anchor, &rel, OpenIntent::Inspect, forbidden) {
+        Ok(entry) => entry,
+        Err(GuardError::Gone) => return SourceState::Gone,
+        Err(error) => return SourceState::Changed(error.to_string()),
+    };
+
+    if entry.identity != identity || entry.size != item.size || entry.mtime != item.mtime {
+        return SourceState::Changed("源文件与记录不一致".to_string());
+    }
+
+    SourceState::Unchanged
+}
+
+/// 源已不在原位时的条目状态：副本可信就是“已隔离”，否则交给用户确认。
+fn mark_source_gone(item: &mut ManifestItem, batch_dir: &Path) {
+    let copy = item.copy_path(batch_dir);
+    let copy_ok = !item.hash.is_empty() && copy.exists() && hash_matches(&copy, &item.hash);
+
+    if copy_ok {
+        item.state = ItemState::SourceDeleted;
+        item.note = "源已不在原位，隔离副本是唯一的一份".to_string();
+    } else {
+        item.state = ItemState::NeedsAttention;
+        item.note = "源已不在原位，隔离副本无法确认，请人工处理".to_string();
+    }
+}
+
 /// 复制一个文件并用 blake3 校验，返回副本的哈希。目标已存在时报错，不覆盖。
 fn copy_one_verified(source: &Path, target: &Path) -> Result<String, QuarantineError> {
     if target.exists() {
@@ -1009,7 +1457,9 @@ fn copy_one_verified(source: &Path, target: &Path) -> Result<String, QuarantineE
 /// 把源锚点下的一组条目复制到 `dst`，逐个用 blake3 校验。
 ///
 /// 只负责复制和校验：预检、容量检查和源删除由调用方按自己的事务流程处理。
-/// 隔离区自己用它，T13 和 T16 复用同一套复制口径。
+/// 迁移复制旧目录（T13/T16）用它，和隔离区共用同一套复制口径：内容、校验和时间戳。
+///
+/// `rel_items` 里可以有目录条目：目录（包括空目录）只在目标侧建出来，不作为文件记入结果。
 pub fn copy_tree_verified(
     src_anchor: &Path,
     rel_items: &[Vec<OsString>],
@@ -1020,7 +1470,32 @@ pub fn copy_tree_verified(
     for rel in rel_items {
         let source = join_parts(src_anchor, rel);
         let target = join_parts(dst, rel);
+        let metadata = fs::symlink_metadata(&source)?;
+
+        // 链接一律跳过：跟着链接复制会把锚点之外的内容一起搬进来。
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            continue;
+        }
+
+        // 目录条目只在目标侧建出来，空目录也能跟着保留；它不算复制出来的文件。
+        if metadata.is_dir() {
+            fs::create_dir_all(&target)?;
+            continue;
+        }
+
+        // 目标侧的上级目录先建出来，文件才有地方落。
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
         let hash = copy_one_verified(&source, &target)?;
+
+        // `fs::copy` 不保证保留创建时间，这里按源文件补设一次。
+        win::set_file_times(
+            &target,
+            metadata.creation_time(),
+            metadata.last_write_time(),
+        )?;
 
         copied.push(CopiedFile {
             source,

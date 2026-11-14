@@ -4,6 +4,7 @@
 //! 路径在检查之后、使用之前被替换时，句柄仍然指向检查过的那一个对象。
 
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -287,6 +288,34 @@ pub fn rename_child(
         &parent.path.join(to),
         FILE_RENAME_FLAG_POSIX_SEMANTICS,
     )
+}
+
+/// 在已打开的目录里新建一个子目录。同名对象已存在时由系统直接失败，绝不覆盖。
+///
+/// 相对父句柄打开，不经过字符串路径，因此不会顺着路径上的 junction 落到别的位置。
+pub fn create_dir_in(parent: &DirHandle, name: &OsStr) -> Result<(), GuardError> {
+    validate_component(name)?;
+
+    // 句柄只用于创建，返回后立即关闭。
+    let _ = nt_create_dir(&parent.handle, name)?;
+
+    Ok(())
+}
+
+/// 在已打开的目录里新建一个文件，返回可写句柄。
+///
+/// 与 [`create_dir_in`] 一样用 `FILE_CREATE`：同名文件已存在时直接失败，
+/// 调用方拿到的句柄一定指向本次新建的那个文件，不会写进别人的文件里。
+pub fn create_file_in(parent: &DirHandle, name: &OsStr) -> Result<File, GuardError> {
+    validate_component(name)?;
+
+    let access = FILE_WRITE_DATA | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    let options = NTCREATEFILE_CREATE_OPTIONS(FILE_SYNCHRONOUS_IO_NONALERT.0);
+
+    let handle = nt_create(&parent.handle, name, access, FILE_CREATE, options)?;
+
+    // SAFETY: 句柄由 NtCreateFile 成功返回，所有权转交给 File，由它负责关闭。
+    Ok(File::from(handle))
 }
 
 /// 在句柄上执行改名。`FileRenameInfoEx` 不接受 RootDirectory，目标必须给完整路径。
@@ -868,7 +897,7 @@ fn query<T: Default>(
 }
 
 /// 组件名必须是一个普通的单级名字。
-fn validate_component(name: &OsStr) -> Result<(), GuardError> {
+pub(crate) fn validate_component(name: &OsStr) -> Result<(), GuardError> {
     if name.is_empty() {
         return Err(GuardError::InvalidName);
     }

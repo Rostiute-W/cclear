@@ -22,7 +22,7 @@ use crate::rules::resolve::RootMap;
 use crate::win::{KnownFolder, known_folder};
 
 pub use args::{HelperArgs, SystemOp, parse_helper_args};
-pub use helper::helper_main;
+pub use helper::{helper_main, validate_admin_batch};
 pub use launch::command_line;
 pub use progress::OpProgress;
 
@@ -100,6 +100,9 @@ pub struct OpOutcome {
     /// 本次处理的条目数（隔离或还原的文件数）。
     #[serde(default)]
     pub items: u64,
+    /// 还原时原位已有同名文件、因此没有还原的路径。其余操作为空。
+    #[serde(default)]
+    pub conflicts: Vec<String>,
 }
 
 impl OpOutcome {
@@ -122,6 +125,7 @@ impl OpOutcome {
             detail,
             batch_id: None,
             items: 0,
+            conflicts: Vec::new(),
         }
     }
 

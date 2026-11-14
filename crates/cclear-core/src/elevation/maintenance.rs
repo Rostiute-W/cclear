@@ -67,7 +67,8 @@ fn analyze(token: String, tool: &Path) -> OpOutcome {
         "/Cleanup-Image",
         "/AnalyzeComponentStore",
     ];
-    let outcome = command::run(tool, &args, ANALYZE_TIMEOUT);
+    // 提权进程只用系统目录里的干净环境，不继承用户环境变量。
+    let outcome = command::run_clean(tool, &args, ANALYZE_TIMEOUT);
 
     if outcome.timed_out {
         return OpOutcome::failed(
@@ -114,7 +115,7 @@ fn cleanup(token: String, tool: &Path, progress: Option<&Path>) -> OpOutcome {
 
     // DISM 每秒刷新一行 `[==  12.3%  ==]`；进度行可能被拆到两次输出里，这里按整行拼。
     let mut pending = String::new();
-    let outcome = command::run_streaming(tool, &args, CLEANUP_TIMEOUT, &mut |chunk| {
+    let outcome = command::run_streaming_clean(tool, &args, CLEANUP_TIMEOUT, &mut |chunk| {
         pending.push_str(chunk);
         while let Some(end) = pending.find(['\n', '\r']) {
             let line: String = pending.drain(..=end).collect();
@@ -153,16 +154,37 @@ fn delivery_optimization(token: String, tool: &Path, roots: &RootMap) -> OpOutco
     let Some(system_drive) = roots.get(KnownRoot::SystemDrive) else {
         return OpOutcome::failed(token, "无法解析系统盘根目录".to_string());
     };
+    let Some(windows) = roots.get(KnownRoot::Windows) else {
+        return OpOutcome::failed(token, "无法解析 Windows 目录".to_string());
+    };
+
+    // 按绝对路径导入系统自带的模块：用户模块目录里的同名函数进不到提权进程里。
+    let module = windows
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("Modules")
+        .join("DeliveryOptimization")
+        .join("DeliveryOptimization.psd1");
+    if !module.is_file() {
+        return OpOutcome::failed(token, format!("找不到传递优化模块：{}", module.display()));
+    }
 
     let before = volume::free_space(system_drive);
     // 只调用官方 cmdlet，不碰它的私有目录，也不停任何服务。
-    let outcome = command::run(
+    let script = format!(
+        "Import-Module '{}'; DeliveryOptimization\\Delete-DeliveryOptimizationCache -Force",
+        module.display()
+    );
+    let outcome = command::run_clean(
         tool,
         &[
             "-NoProfile",
             "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
             "-Command",
-            "Delete-DeliveryOptimizationCache -Force",
+            &script,
         ],
         DELIVERY_OPTIMIZATION_TIMEOUT,
     );
