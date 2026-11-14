@@ -474,3 +474,53 @@ export interface MigrationCleanupPlan {
   planId: string;
   summary: PlanSummary;
 }
+
+// 目录迁移的阶段，与 Rust 端 DirStage 的 key 一致。
+export type DirMigrationStage =
+  | "precheck"
+  | "copying"
+  | "verified"
+  | "sourceRenamed"
+  | "junctionCreated"
+  | "validated"
+  | "awaitingUserTest"
+  | "backupDeleted"
+  | "done"
+  | "needsAttention"
+  | "returned"
+  | "failed";
+
+// 一条目录迁移记录。
+export interface DirMigration {
+  id: string;
+  source: string;
+  target: string;
+  backup: string;
+  stage: DirMigrationStage;
+  stageLabel: string;
+  note: string;
+  // Unix 秒，界面按本地时区格式化。
+  updatedAt: number;
+  // 目标目录还在。迁回之后它就是等着确认删除的旧副本。
+  targetExists: boolean;
+  // 源位置现在确实是一个 junction，才谈得上迁回。
+  hasJunction: boolean;
+  // 源目录已经被改到备份名下，可以“继续”。
+  resumable: boolean;
+  // 可以确认删除备份：备份还在，而且链接已经建好（或已经迁回）。
+  canDeleteBackup: boolean;
+}
+
+export interface DirMigrationsState {
+  records: DirMigration[];
+  volumes: MigrationVolume[];
+}
+
+// 一个目录的资格检查结果。reasons 为空表示可以迁移。
+export interface JunctionCheck {
+  sourceId: number;
+  path: string;
+  allocated: number;
+  reasons: string[];
+  eligible: boolean;
+}

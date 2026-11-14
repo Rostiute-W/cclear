@@ -16,8 +16,8 @@ use thiserror::Error;
 pub use external::validate_external_path;
 pub use forbidden::Forbidden;
 pub use path::{
-    DirHandle, Entry, Expect, OpenIntent, delete, delete_tree, list_dir, open_anchor, open_rel,
-    replace_in_dir,
+    DirHandle, Entry, Expect, OpenIntent, create_junction, delete, delete_tree, list_dir,
+    open_anchor, open_rel, read_junction_target, remove_junction, rename_child, replace_in_dir,
 };
 
 /// 路径护栏的错误。
@@ -52,6 +52,12 @@ pub enum GuardError {
 
     #[error("路径组件不合法")]
     InvalidName,
+
+    #[error("junction 目标不合法：{0}")]
+    InvalidTarget(String),
+
+    #[error("链接与预期不符，未做任何改动：{}", .0.display())]
+    LinkMismatch(PathBuf),
 
     #[error("系统调用失败：{0}")]
     Io(#[from] io::Error),

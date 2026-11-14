@@ -2,8 +2,16 @@
 //!
 //! 前端只传工具名、模式名和目标卷根。缓存在哪、配置怎么写、用什么命令验证，
 //! 全部由核心库按工具表决定，前端拿不到可执行的命令行。
+//!
+//! 目录迁移（junction）同样只传扫描节点 ID：源路径从上次扫描结果里取，并经护栏校验。
 
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+
+use cclear_core::exec::executor;
+use cclear_core::guard::{Forbidden, validate_external_path};
 use cclear_core::journal::FileJournal;
+use cclear_core::migrate::junction::{self, DirMigration, DirStage, JunctionMigration};
 use cclear_core::migrate::tools::{self, ToolId};
 use cclear_core::migrate::{self, EntryState, Migration, Mode, ToolState};
 use serde::Serialize;
@@ -92,6 +100,49 @@ pub struct MigrationResultDto {
 pub struct MigrationCleanupDto {
     pub plan_id: String,
     pub summary: PlanSummaryDto,
+}
+
+/// 一条目录迁移记录。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirMigrationDto {
+    pub id: String,
+    pub source: String,
+    pub target: String,
+    pub backup: String,
+    pub stage: String,
+    pub stage_label: String,
+    pub note: String,
+    /// Unix 秒，界面按本地时区格式化。
+    pub updated_at: i64,
+    /// 目标目录还在。迁回之后它就是等着确认删除的旧副本。
+    pub target_exists: bool,
+    /// 源位置现在确实是一个 junction，才谈得上迁回。
+    pub has_junction: bool,
+    /// 源目录已经被改到备份名下，可以“继续”。
+    pub resumable: bool,
+    /// 可以确认删除备份：备份还在，而且链接已经建好（或已经迁回）。
+    pub can_delete_backup: bool,
+}
+
+/// 目录迁移页的数据：记录和候选卷。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirMigrationsDto {
+    pub records: Vec<DirMigrationDto>,
+    pub volumes: Vec<MigrationVolumeDto>,
+}
+
+/// 一个目录的资格检查结果。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JunctionCheckDto {
+    pub source_id: u32,
+    pub path: String,
+    pub allocated: u64,
+    /// 拒绝原因的列表，空表示可以迁移。
+    pub reasons: Vec<String>,
+    pub eligible: bool,
 }
 
 #[tauri::command]
@@ -199,6 +250,250 @@ pub async fn migration_revert(
 
 fn parse_tool(tool: &str) -> Result<ToolId, String> {
     ToolId::parse(tool).ok_or_else(|| "没有这个工具".to_string())
+}
+
+// ---- 目录迁移（junction） ----
+
+/// 目录迁移的状态和候选卷。
+#[tauri::command]
+pub async fn junction_state() -> Result<DirMigrationsDto, String> {
+    tauri::async_runtime::spawn_blocking(|| -> Result<DirMigrationsDto, String> {
+        let migration = open_junction()?;
+        let records = migration
+            .list()
+            .map_err(|error| format!("读取目录迁移状态失败：{error}"))?;
+
+        Ok(DirMigrationsDto {
+            records: records
+                .iter()
+                .map(|record| dir_record_dto(&migration, record))
+                .collect(),
+            volumes: migrate::candidate_volumes()
+                .into_iter()
+                .map(volume_dto)
+                .collect(),
+        })
+    })
+    .await
+    .map_err(|error| format!("读取目录迁移状态失败：{error}"))?
+}
+
+/// 对一个扫描节点做资格检查。前端只传节点 ID，路径从上次扫描结果里取。
+#[tauri::command]
+pub async fn junction_check(
+    source_id: u32,
+    state: State<'_, AppState>,
+) -> Result<JunctionCheckDto, String> {
+    let (path, allocated) = scan_path(&state, source_id)?;
+
+    tauri::async_runtime::spawn_blocking(move || -> Result<JunctionCheckDto, String> {
+        let migration = open_junction()?;
+        let reasons = migration.check_eligibility(&path);
+
+        Ok(JunctionCheckDto {
+            source_id,
+            path: path.to_string_lossy().into_owned(),
+            allocated,
+            eligible: reasons.is_empty(),
+            reasons,
+        })
+    })
+    .await
+    .map_err(|error| format!("资格检查失败：{error}"))?
+}
+
+/// 开始把一个目录迁移到其他盘。迁移会复制并改名，和清理类操作共用执行锁。
+#[tauri::command]
+pub async fn junction_start(
+    source_id: u32,
+    volume_root: String,
+    state: State<'_, AppState>,
+) -> Result<DirMigrationDto, String> {
+    let (path, _) = scan_path(&state, source_id)?;
+    let _exec = state.start_exec()?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let migration = open_junction()?;
+        let mut journal =
+            FileJournal::new().map_err(|error| format!("操作日志无法写入：{error}"))?;
+
+        migration
+            .start(&path, &volume_root, &mut journal)
+            .map(|record| dir_record_dto(&migration, &record))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("迁移失败：{error}"))?
+}
+
+/// 继续一次被打断在“源已改名、链接未建”的迁移。
+#[tauri::command]
+pub async fn junction_continue(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<DirMigrationDto, String> {
+    let _exec = state.start_exec()?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let migration = open_junction()?;
+        let mut journal =
+            FileJournal::new().map_err(|error| format!("操作日志无法写入：{error}"))?;
+
+        migration
+            .resume(&id, &mut journal)
+            .map(|record| dir_record_dto(&migration, &record))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("继续迁移失败：{error}"))?
+}
+
+/// 迁回：把目标里的最新数据搬回原来的位置。
+#[tauri::command]
+pub async fn junction_return(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<DirMigrationDto, String> {
+    let _exec = state.start_exec()?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let migration = open_junction()?;
+        let mut journal =
+            FileJournal::new().map_err(|error| format!("操作日志无法写入：{error}"))?;
+
+        migration
+            .return_home(&id, &mut journal)
+            .map(|record| dir_record_dto(&migration, &record))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("迁回失败：{error}"))?
+}
+
+/// 确认删除备份：按冻结清单清理备份目录，再删掉留下的空目录。
+#[tauri::command]
+pub async fn junction_delete_backup(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<DirMigrationDto, String> {
+    let _exec = state.start_exec()?;
+
+    tauri::async_runtime::spawn_blocking(move || -> Result<DirMigrationDto, String> {
+        let migration = open_junction()?;
+        let mut journal =
+            FileJournal::new().map_err(|error| format!("操作日志无法写入：{error}"))?;
+
+        let plan = migration
+            .backup_plan(&id)
+            .map_err(|error| format!("生成备份清理清单失败：{error}"))?;
+
+        // 用户已经按下“确认删除备份”，这里不再走预览，直接执行这份清单。
+        let cancel = AtomicBool::new(false);
+        let report = executor::execute(
+            &plan,
+            &[junction::BACKUP_RULE_ID],
+            &Forbidden::empty(),
+            &|| Vec::new(),
+            &mut journal,
+            &cancel,
+            &|_| {},
+        );
+        if let Some(reason) = report.aborted {
+            return Err(format!("清理备份被中止：{reason}"));
+        }
+
+        let record = migration
+            .finish_backup(&id, &mut journal)
+            .map_err(|error| format!("清理备份失败：{error}"))?;
+
+        Ok(dir_record_dto(&migration, &record))
+    })
+    .await
+    .map_err(|error| format!("清理备份失败：{error}"))?
+}
+
+/// 迁回之后删除目标里的旧副本。必须由用户确认之后调用。
+#[tauri::command]
+pub async fn junction_discard_target(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<DirMigrationDto, String> {
+    let _exec = state.start_exec()?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let migration = open_junction()?;
+        let mut journal =
+            FileJournal::new().map_err(|error| format!("操作日志无法写入：{error}"))?;
+
+        migration
+            .discard_target(&id, &mut journal)
+            .map(|record| dir_record_dto(&migration, &record))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("删除目标副本失败：{error}"))?
+}
+
+/// 启动时把上次没有做完的目录迁移收到确定的状态上。
+///
+/// 拿到执行锁才会动手：恢复要改名和删目录，不能和用户刚发起的操作抢同一个目录。
+pub fn recover_on_startup(state: &AppState) {
+    let Ok(_exec) = state.start_exec() else {
+        return;
+    };
+    let Ok(migration) = JunctionMigration::open() else {
+        return;
+    };
+    let Ok(mut journal) = FileJournal::new() else {
+        return;
+    };
+
+    // 恢复失败只影响这一次启动的提示，不影响界面其他功能。
+    let _ = migration.recover_pending(&mut journal);
+}
+
+fn open_junction() -> Result<JunctionMigration, String> {
+    JunctionMigration::open().map_err(|error| error.to_string())
+}
+
+/// 扫描节点对应的路径和占盘大小。只接受节点 ID，路径一律从最近一次扫描结果里取。
+fn scan_path(state: &AppState, source_id: u32) -> Result<(PathBuf, u64), String> {
+    let result = state
+        .result()
+        .ok_or_else(|| "还没有扫描结果，请先到总览页扫描".to_string())?;
+    let Some(node) = result.nodes.get(source_id as usize) else {
+        return Err("目录不存在".to_string());
+    };
+
+    let path = validate_external_path(&result.path_of(source_id).to_string_lossy())
+        .map_err(|error| error.to_string())?;
+
+    Ok((path, node.size.allocated))
+}
+
+fn dir_record_dto(migration: &JunctionMigration, record: &DirMigration) -> DirMigrationDto {
+    let backup_exists = record.backup_path().exists();
+    let target_exists = record.target_path().exists();
+    let resumable =
+        record.stage == DirStage::NeedsAttention && backup_exists && !record.source_path().exists();
+    // 链接是否存在要回到磁盘上确认：NeedsAttention 也可能停在建链接失败的那一刻。
+    let has_junction = migration.source_is_junction(record);
+
+    DirMigrationDto {
+        id: record.id.clone(),
+        source: record.source.clone(),
+        target: record.target.clone(),
+        backup: record.backup.clone(),
+        stage: record.stage.key().to_string(),
+        stage_label: record.stage.label().to_string(),
+        note: record.note.clone(),
+        updated_at: record.updated_at,
+        target_exists,
+        has_junction,
+        resumable,
+        // 已经迁回时源位置是普通目录，但备份仍然可以删；其余情况必须有链接才允许删备份。
+        can_delete_backup: backup_exists && (has_junction || record.stage == DirStage::Returned),
+    }
 }
 
 fn tool_dto(state: &ToolState) -> MigrationToolDto {

@@ -23,10 +23,12 @@ pub fn run() {
                 .data_directory(data_directory)
                 .build()?;
 
-            // 上次没有做完的隔离批次要在用户操作之前收到确定状态，放到后台线程里做。
+            // 上次没有做完的隔离批次和目录迁移要在用户操作之前收到确定状态，放到后台线程里做。
+            // 两者都要拿执行锁，所以放在同一个线程里依次执行。
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
                 commands::quarantine::recover_on_startup(&handle.state::<state::AppState>());
+                commands::migrate::recover_on_startup(&handle.state::<state::AppState>());
             });
 
             Ok(())
@@ -45,6 +47,13 @@ pub fn run() {
             commands::migrate::migration_start,
             commands::migrate::migration_cleanup_old,
             commands::migrate::migration_revert,
+            commands::migrate::junction_state,
+            commands::migrate::junction_check,
+            commands::migrate::junction_start,
+            commands::migrate::junction_continue,
+            commands::migrate::junction_return,
+            commands::migrate::junction_delete_backup,
+            commands::migrate::junction_discard_target,
             commands::plan::plan_build,
             commands::plan::plan_items,
             commands::plan::plan_execute,

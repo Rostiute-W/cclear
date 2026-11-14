@@ -14,7 +14,7 @@ const TOP_FILE_LIMIT = 200;
 
 type Tab = "dirs" | "graph" | "files";
 
-export function SpacePage() {
+export function SpacePage({ onMigrate }: { onMigrate: (nodeId: number) => void }) {
   const [summary, setSummary] = useState<ScanSummary | null>(null);
   const [tab, setTab] = useState<Tab>("dirs");
   // 面包屑：从根目录逐级进入的节点，空数组表示还停在根层。
@@ -169,6 +169,14 @@ export function SpacePage() {
                     }
                   >
                     打开位置
+                  </button>
+                  <button
+                    type="button"
+                    className="link"
+                    disabled={!node.hasChildren}
+                    onClick={() => onMigrate(node.id)}
+                  >
+                    迁移到其他盘…
                   </button>
                 </td>
               </tr>
