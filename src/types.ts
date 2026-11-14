@@ -112,8 +112,7 @@ export interface CandidateInfo {
 }
 
 // 占用检测结果。complete 为 false 表示还有文件没查过，不能当成“没有占用”。
-export interface LockReport {
-  checked: number;
+export interface LockReport {  checked: number;
   total: number;
   complete: boolean;
   lockers: LockerInfo[];
@@ -230,6 +229,8 @@ export interface PlanHistoryEntry {
   freedAllocated: number;
   skipped: number;
   finished: boolean;
+  // 用户取消了这次执行。
+  cancelled: boolean;
 }
 
 export interface PlanHistory {
@@ -245,6 +246,8 @@ export interface PlanDetail {
   freeBefore: number;
   freeAfter: number;
   finished: boolean;
+  // 用户取消了这次执行。
+  cancelled: boolean;
   rules: PlanDetailRule[];
   skipped: ExecSkip[];
   skippedTotal: number;
@@ -256,4 +259,10 @@ export interface PlanDetailRule {
   deletedDirs: number;
   freedAllocated: number;
   skipped: number;
+}
+
+// C 盘回收站当前内容。清空前要把这份数值回传给后端，对不上就不动。
+export interface RecycleBinInfo {
+  items: number;
+  bytes: number;
 }

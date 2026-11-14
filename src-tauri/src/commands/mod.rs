@@ -4,5 +4,6 @@ pub mod app;
 pub mod clean;
 pub mod env;
 pub mod plan;
+pub mod recycle;
 pub mod rules;
 pub mod scan;

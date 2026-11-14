@@ -175,12 +175,19 @@ struct ScannedFile {
 impl Walker<'_> {
     /// 递归遍历 `rel` 指向的目录。`own` 是父目录枚举时看到的自己，锚点自身为 None。
     fn walk(&mut self, rel: &mut Vec<OsString>, own: Option<&EntryInfo>) {
-        // 读不到的目录整棵跳过：看不到内容就不能进清单。
-        let Ok(entries) = guard::list_dir(self.anchor, rel, self.forbidden) else {
-            return;
+        let dir_path = join_all(self.anchor_path, rel);
+
+        // 读不到的目录整棵跳过：看不到内容就不能进清单，但必须留下原因，
+        // 否则清单会比评估统计少却看不出少了什么。
+        let entries = match guard::list_dir(self.anchor, rel, self.forbidden) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.skipped
+                    .push((dir_path, format!("无法读取目录，已跳过：{error}")));
+                return;
+            }
         };
 
-        let dir_path = join_all(self.anchor_path, rel);
         let at_anchor = own.is_none();
         let mut files: Vec<ScannedFile> = Vec::new();
         let mut subdirs: Vec<EntryInfo> = Vec::new();

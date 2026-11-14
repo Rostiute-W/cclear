@@ -27,9 +27,11 @@ interface PlanPreviewProps {
   planId: string;
   // plan_build 的返回值，用来渲染规则行；执行和取条目只用 planId。
   summary: PlanSummary;
+  // 执行结束后通知调用方，清理页据此重新评估。
+  onFinished?: () => void;
 }
 
-export function PlanPreview({ planId, summary }: PlanPreviewProps) {
+export function PlanPreview({ planId, summary, onFinished }: PlanPreviewProps) {
   // 清单里只有规则 ID，名称取自内置规则目录；取不到就退回显示 ID。
   const [ruleNames, setRuleNames] = useState<Map<string, string>>(new Map());
   const [openRule, setOpenRule] = useState<string | null>(null);
@@ -82,7 +84,11 @@ export function PlanPreview({ planId, summary }: PlanPreviewProps) {
     )
       .then(setReport)
       .catch((reason) => setError(String(reason)))
-      .finally(() => setRunning(false));
+      .finally(() => {
+        setRunning(false);
+        // 清理已经结束，界面上的候选统计需要重新评估。
+        onFinished?.();
+      });
   };
 
   const cancel = () => {

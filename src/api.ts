@@ -13,6 +13,7 @@ import type {
   PlanHistory,
   PlanItem,
   PlanSummary,
+  RecycleBinInfo,
   RuleInfo,
   ScanProgress,
   ScanRoot,
@@ -113,6 +114,15 @@ export function planExecute(
 
 export function historyList(days: number): Promise<PlanHistory> {
   return invoke<PlanHistory>("history_list", { days });
+}
+
+// 回收站：只传上次查询到的条目数和大小，路径固定是 C 盘，界面不拼路径。
+export function recycleBinQuery(): Promise<RecycleBinInfo> {
+  return invoke<RecycleBinInfo>("recycle_bin_query");
+}
+
+export function recycleBinEmpty(items: number, bytes: number): Promise<RecycleBinInfo> {
+  return invoke<RecycleBinInfo>("recycle_bin_empty", { expectedItems: items, expectedBytes: bytes });
 }
 
 // 历史详情只传计划 ID：条目和跳过原因都从日志里读，界面不拼路径。

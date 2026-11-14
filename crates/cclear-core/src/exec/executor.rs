@@ -182,6 +182,8 @@ pub fn execute(
             deleted_dirs: report.total_deleted_dirs(),
             freed_allocated: report.total_freed_allocated(),
             skipped: report.skipped_total,
+            // 取消的执行在历史里要显示成“已取消”，不能当成正常结束。
+            cancelled: report.cancelled,
         };
         if journal.append(&finished).is_err() || journal.finish().is_err() {
             report.aborted = Some(LOG_ABORT.to_string());

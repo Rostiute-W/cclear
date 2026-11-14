@@ -27,9 +27,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_STANDARD_INFO, FILE_TRAVERSE, FileBasicInfo, FileDispositionInfoEx, FileIdInfo,
-    FileStandardInfo, GetFileInformationByHandleEx, OPEN_EXISTING, SYNCHRONIZE,
-    SetFileInformationByHandle,
+    FILE_STANDARD_INFO, FileBasicInfo, FileDispositionInfoEx, FileIdInfo, FileStandardInfo,
+    GetFileInformationByHandleEx, OPEN_EXISTING, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::core::PCWSTR;
@@ -211,7 +210,7 @@ pub fn delete(entry: Entry, expect: &Expect) -> Result<(), GuardError> {
 /// 组件在相对打开时的角色。
 #[derive(Clone, Copy)]
 enum Role {
-    /// 中间组件：必须是目录，只要能列目录和穿过。
+    /// 中间组件：必须是目录，只要能列目录和读属性。
     Directory,
     /// 最后一级只读打开：文件或目录都可以。
     Inspect,
@@ -222,9 +221,9 @@ enum Role {
 impl Role {
     fn access(self) -> FILE_ACCESS_RIGHTS {
         match self {
-            Role::Directory => {
-                FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
-            }
+            // 中间组件只需要列目录和读属性：相对打开用的是父句柄 + 单个名字，
+            // 不要求父句柄带遍历权限，而安装程序留下的目录常常只给列目录和读属性。
+            Role::Directory => FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             Role::Inspect => FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             Role::Delete => DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         }
@@ -367,7 +366,8 @@ fn open_volume_root(root: &str) -> Result<OwnedHandle, GuardError> {
     let mut wide: Vec<u16> = root.encode_utf16().collect();
     wide.push(0);
 
-    let access = FILE_LIST_DIRECTORY.0 | FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0;
+    // 卷根只需要列目录和读属性：之后的每一级都相对它打开，不用遍历权限。
+    let access = FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0;
 
     // SAFETY: wide 以 NUL 结尾且在调用期间存活；不传安全属性和模板句柄；
     // 共享模式放开读/写/删，避免因为别人正在写而打不开目录。

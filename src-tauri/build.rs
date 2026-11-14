@@ -11,6 +11,8 @@ fn main() {
             "plan_cancel",
             "history_list",
             "history_detail",
+            "recycle_bin_query",
+            "recycle_bin_empty",
             "rules_catalog",
             "rules_evaluate",
             "volume_info",

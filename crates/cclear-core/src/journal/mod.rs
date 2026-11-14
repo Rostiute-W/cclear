@@ -55,6 +55,18 @@ pub enum Record {
         deleted_dirs: u64,
         freed_allocated: u64,
         skipped: u64,
+        /// 用户取消了这次执行。旧日志行没有这个字段，按 false 读。
+        #[serde(default)]
+        cancelled: bool,
+    },
+    /// 不走冻结清单的特殊操作，例如清空 C 盘回收站。
+    SpecialAction {
+        /// Unix 秒，方便按时间排序和显示。
+        at: i64,
+        /// 操作名，界面按它选文案。
+        action: String,
+        /// 结果说明，写清楚做了什么、影响多少内容。
+        detail: String,
     },
 }
 
@@ -82,6 +94,8 @@ pub struct PlanSummary {
     pub skipped: u64,
     /// 计划没有写完 PlanFinished 时是中断的执行。
     pub finished: bool,
+    /// 这次执行被用户取消。
+    pub cancelled: bool,
 }
 
 /// 一次执行的详情：每条规则删了什么、跳过了什么。
@@ -91,6 +105,8 @@ pub struct PlanDetail {
     pub free_before: u64,
     pub free_after: u64,
     pub finished: bool,
+    /// 这次执行被用户取消。
+    pub cancelled: bool,
     pub rules: Vec<RuleDetail>,
     /// 跳过明细，最多 `MAX_SKIPPED_DETAILS` 条；`skipped_total` 是实际总数。
     pub skipped: Vec<SkippedItem>,
@@ -212,7 +228,11 @@ pub fn read_summaries(days: usize) -> io::Result<(Vec<PlanSummary>, usize)> {
                 continue;
             };
 
-            apply(&mut plans, &mut index, record);
+            // 回收站这类特殊操作不属于任何清理计划，不进历史列表。
+            let Some(plan_id) = record_plan_id(&record) else {
+                continue;
+            };
+            apply(&mut plans, &mut index, plan_id, record);
         }
     }
 
@@ -239,7 +259,7 @@ pub fn read_detail(days: usize, plan_id: Uuid) -> io::Result<Option<PlanDetail>>
             let Ok(record) = serde_json::from_str::<Record>(line) else {
                 continue;
             };
-            if record_plan_id(&record) != plan_id {
+            if record_plan_id(&record) != Some(plan_id) {
                 continue;
             }
 
@@ -250,6 +270,7 @@ pub fn read_detail(days: usize, plan_id: Uuid) -> io::Result<Option<PlanDetail>>
                     free_before: 0,
                     free_after: 0,
                     finished: false,
+                    cancelled: false,
                     rules: Vec::new(),
                     skipped: Vec::new(),
                     skipped_total: 0,
@@ -286,9 +307,12 @@ fn journal_files(days: usize) -> io::Result<Vec<PathBuf>> {
 }
 
 /// 把一条记录并入对应的计划摘要。
-fn apply(plans: &mut Vec<PlanSummary>, index: &mut HashMap<Uuid, usize>, record: Record) {
-    let plan_id = record_plan_id(&record);
-
+fn apply(
+    plans: &mut Vec<PlanSummary>,
+    index: &mut HashMap<Uuid, usize>,
+    plan_id: Uuid,
+    record: Record,
+) {
     let position = *index.entry(plan_id).or_insert_with(|| {
         plans.push(PlanSummary {
             plan_id,
@@ -301,6 +325,7 @@ fn apply(plans: &mut Vec<PlanSummary>, index: &mut HashMap<Uuid, usize>, record:
             freed_allocated: 0,
             skipped: 0,
             finished: false,
+            cancelled: false,
         });
         plans.len() - 1
     });
@@ -331,6 +356,7 @@ fn apply(plans: &mut Vec<PlanSummary>, index: &mut HashMap<Uuid, usize>, record:
             deleted_dirs,
             freed_allocated,
             skipped,
+            cancelled,
             ..
         } => {
             summary.free_before = free_before;
@@ -340,18 +366,22 @@ fn apply(plans: &mut Vec<PlanSummary>, index: &mut HashMap<Uuid, usize>, record:
             summary.freed_allocated = freed_allocated;
             summary.skipped = skipped;
             summary.finished = true;
+            summary.cancelled = cancelled;
         }
+        // 特殊操作不属于任何计划，不会走到这里。
+        Record::SpecialAction { .. } => {}
     }
 }
 
-/// 记录所属的计划 ID。
-fn record_plan_id(record: &Record) -> Uuid {
+/// 记录所属的计划 ID。回收站这类特殊操作不属于任何计划，返回 None。
+fn record_plan_id(record: &Record) -> Option<Uuid> {
     match record {
         Record::PlanStarted { plan_id, .. }
         | Record::ItemDone { plan_id, .. }
         | Record::ItemSkipped { plan_id, .. }
         | Record::RuleSkipped { plan_id, .. }
-        | Record::PlanFinished { plan_id, .. } => *plan_id,
+        | Record::PlanFinished { plan_id, .. } => Some(*plan_id),
+        Record::SpecialAction { .. } => None,
     }
 }
 
@@ -414,12 +444,16 @@ fn apply_detail(detail: &mut PlanDetail, record: Record) {
         Record::PlanFinished {
             free_before,
             free_after,
+            cancelled,
             ..
         } => {
             detail.free_before = free_before;
             detail.free_after = free_after;
             detail.finished = true;
+            detail.cancelled = cancelled;
         }
+        // 特殊操作不属于任何计划，不会走到这里。
+        Record::SpecialAction { .. } => {}
     }
 }
 
