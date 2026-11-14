@@ -22,7 +22,7 @@ use crate::win::dirinfo;
 pub use crate::win::dirinfo::EntryInfo;
 
 /// 硬链接去重集合的分片数：分片加锁，避免所有线程抢同一把锁。
-const HARD_LINK_SHARDS: usize = 64;
+pub(crate) const HARD_LINK_SHARDS: usize = 64;
 
 /// 文件过滤器：返回 false 的文件不计入任何统计，规则子集可以复用它统计大小。
 pub type FileFilter = Arc<dyn Fn(&EntryInfo) -> bool + Send + Sync>;
@@ -388,19 +388,21 @@ struct DirScan {
 }
 
 /// 硬链接去重：分片加锁的集合，记录已经统计过的文件身份。
-struct HardLinkSet {
+///
+/// 规则候选的并行枚举也用它，去重口径必须和扫描器一致。
+pub(crate) struct HardLinkSet {
     shards: Vec<Mutex<HashSet<FileIdentity>>>,
 }
 
 impl HardLinkSet {
-    fn new(shards: usize) -> Self {
+    pub(crate) fn new(shards: usize) -> Self {
         Self {
             shards: (0..shards).map(|_| Mutex::new(HashSet::new())).collect(),
         }
     }
 
     /// 第一次见到这个文件返回 true，之后同名硬链接返回 false。
-    fn insert(&self, identity: FileIdentity) -> bool {
+    pub(crate) fn insert(&self, identity: FileIdentity) -> bool {
         let mut hasher = DefaultHasher::new();
         identity.hash(&mut hasher);
         let index = (hasher.finish() as usize) % self.shards.len();

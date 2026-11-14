@@ -19,3 +19,4 @@ tauri-build = { version = "2", features = [] }
 cclear-core = { path = "../crates/cclear-core" }
 serde.workspace = true
 tauri = { version = "2", features = [] }
+uuid.workspace = true

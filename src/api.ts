@@ -5,8 +5,13 @@ import type {
   CandidateInfo,
   DirNode,
   EnvState,
+  ExecProgress,
+  ExecReport,
   FileEntry,
   LockReport,
+  PlanHistory,
+  PlanItem,
+  PlanSummary,
   RuleInfo,
   ScanProgress,
   ScanRoot,
@@ -72,6 +77,41 @@ export function openNodeInExplorer(nodeId: number): Promise<void> {
 
 export function openTopFileInExplorer(index: number): Promise<void> {
   return invoke<void>("open_top_file_in_explorer", { index });
+}
+
+// 冻结清单：只传规则 ID，清单内容由后端持有，界面拿不到执行路径。
+export function planBuild(ruleIds: string[]): Promise<PlanSummary> {
+  return invoke<PlanSummary>("plan_build", { ruleIds });
+}
+
+export function planItems(
+  planId: string,
+  ruleId: string,
+  offset: number,
+  limit: number,
+): Promise<PlanItem[]> {
+  return invoke<PlanItem[]>("plan_items", { planId, ruleId, offset, limit });
+}
+
+export function planCancel(): Promise<void> {
+  return invoke<void>("plan_cancel");
+}
+
+export function planExecute(
+  planId: string,
+  ruleIds: string[],
+  onProgress: (progress: ExecProgress) => void,
+): Promise<ExecReport> {
+  const channel = new Channel<ExecProgress>();
+  channel.onmessage = (progress) => {
+    onProgress(progress);
+  };
+
+  return invoke<ExecReport>("plan_execute", { planId, ruleIds, onProgress: channel });
+}
+
+export function historyList(days: number): Promise<PlanHistory> {
+  return invoke<PlanHistory>("history_list", { days });
 }
 
 type ScanListener = (progress: ScanProgress) => void;

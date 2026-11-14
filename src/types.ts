@@ -146,3 +146,85 @@ export interface EnvState {
   knownFolders: EnvLocation[];
   onedrive: EnvLocation | null;
 }
+
+// 冻结清单里一条规则的概要。清单是执行的唯一输入，执行时逐项复核。
+export interface PlanRuleSummary {
+  ruleId: string;
+  recovery: Recovery;
+  anchors: string[];
+  items: number;
+  logical: number;
+  allocated: number;
+  files: number;
+  dirs: number;
+  skippedAtBuild: number;
+}
+
+export interface PlanSummary {
+  planId: string;
+  // Unix 秒，界面按本地时区格式化。
+  createdAt: number;
+  rules: PlanRuleSummary[];
+}
+
+export interface PlanItem {
+  itemId: number;
+  ruleId: string;
+  path: string;
+  isDir: boolean;
+  allocated: number;
+  // Unix 秒，0 表示时间不可用。
+  lastWrite: number;
+}
+
+export interface ExecProgress {
+  ruleId: string;
+  deletedFiles: number;
+  deletedDirs: number;
+  freedAllocated: number;
+  skipped: number;
+  done: boolean;
+}
+
+export interface ExecRuleReport {
+  ruleId: string;
+  deletedFiles: number;
+  deletedDirs: number;
+  freedAllocated: number;
+  skipped: number;
+}
+
+export interface ExecSkip {
+  ruleId: string;
+  path: string;
+  reason: string;
+}
+
+export interface ExecReport {
+  rules: ExecRuleReport[];
+  skipped: ExecSkip[];
+  skippedTotal: number;
+  freeBefore: number;
+  freeAfter: number;
+  cancelled: boolean;
+  // 中止原因，null 表示正常跑完。
+  aborted: string | null;
+}
+
+export interface PlanHistoryEntry {
+  planId: string;
+  startedAt: number;
+  freeBefore: number;
+  freeAfter: number;
+  deletedFiles: number;
+  deletedDirs: number;
+  freedAllocated: number;
+  skipped: number;
+  finished: boolean;
+}
+
+export interface PlanHistory {
+  plans: PlanHistoryEntry[];
+  // 解析失败的日志行数，大于 0 说明历史不完整。
+  skippedLines: number;
+}
