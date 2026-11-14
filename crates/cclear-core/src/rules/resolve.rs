@@ -2,13 +2,14 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{CoreError, Result};
 use crate::model::{FileIdentity, KnownRoot, Phase, SizeInfo, Tier};
 use crate::rules::catalog::{ENABLED_PHASES, Rule, SelectKind, Selector, Target};
 use crate::rules::forbidden;
-use crate::scan::{FileCount, classify_file};
+use crate::scan::{FileCount, HARD_LINK_SHARDS, HardLinkSet, classify_file};
 use crate::win::process::ProcInfo;
 use crate::win::restart_manager::{LockReport, query_lockers};
 use crate::win::{KnownFolder, dirinfo, known_folder};
@@ -404,7 +405,7 @@ fn missing_layout_marker(rule: &Rule, roots: &RootMap) -> Option<String> {
 }
 
 /// 路径类规则的选择器。其余目标没有选择器，按全部内容处理。
-fn selector_of(rule: &Rule) -> Selector {
+pub fn selector_of(rule: &Rule) -> Selector {
     match &rule.target {
         Target::Paths { selector, .. } => *selector,
         _ => Selector {
@@ -449,11 +450,12 @@ fn measure(anchors: &[PathBuf], selector: &Selector, now: SystemTime) -> (SizeIn
 ///
 /// 统计和占用检查都走这里，两者看到的文件集合才不会出现差异。
 fn collect_all(anchors: &[PathBuf], selector: &Selector) -> Vec<DirFiles> {
-    let mut dirs = Vec::new();
     // 硬链接的多个名字只算一次，和扫描器的去重口径一致。
-    let mut seen = HashSet::new();
+    let seen = HardLinkSet::new(HARD_LINK_SHARDS);
+    let mut dirs = Vec::new();
+
     for anchor in anchors {
-        collect_dirs(anchor, true, selector, &mut seen, &mut dirs);
+        dirs.extend(collect_tree(anchor, true, selector, &seen));
     }
 
     dirs
@@ -494,7 +496,7 @@ fn allowed_ids(dirs: &[DirFiles], selector: &Selector, now: SystemTime) -> HashS
 /// 锚点下一层的子目录是否整棵纳入统计。
 ///
 /// `TopFiles` 只匹配锚点直属的文件，所以一个子目录都不进；`ChildDirs` 只进名字匹配的那些。
-fn descend_into(selector: &Selector, name: &str) -> bool {
+pub(crate) fn descend_into(selector: &Selector, name: &str) -> bool {
     match selector.kind {
         SelectKind::AllContents => true,
         SelectKind::TopFiles(_) => false,
@@ -505,7 +507,7 @@ fn descend_into(selector: &Selector, name: &str) -> bool {
 }
 
 /// 锚点直属的文件是否纳入统计。`TopFiles` 只收名字匹配的，`ChildDirs` 一个都不收。
-fn keep_anchor_file(selector: &Selector, name: &str) -> bool {
+pub(crate) fn keep_anchor_file(selector: &Selector, name: &str) -> bool {
     match selector.kind {
         SelectKind::AllContents => true,
         SelectKind::ChildDirs(_) => false,
@@ -516,7 +518,7 @@ fn keep_anchor_file(selector: &Selector, name: &str) -> bool {
 }
 
 /// 锚点下一层按名称排除的子目录。
-fn is_excluded_child_dir(selector: &Selector, name: &str) -> bool {
+pub(crate) fn is_excluded_child_dir(selector: &Selector, name: &str) -> bool {
     selector
         .exclude_child_dirs
         .iter()
@@ -540,16 +542,18 @@ struct DirFiles {
     files: Vec<ScannedFile>,
 }
 
-/// 递归枚举锚点子树，只收集选择器选中的文件。读不到的目录直接跳过，和扫描器的处理一致。
-fn collect_dirs(
+/// 递归枚举一棵子树，返回本目录和各级子目录的文件列表。
+///
+/// 子目录用 rayon 并行枚举：全部规则评估原来要 8 秒，单线程递归是主要开销。
+/// 返回顺序仍是“本目录在前，子目录按枚举顺序在后”，和单线程遍历一致。
+fn collect_tree(
     dir: &Path,
     is_anchor: bool,
     selector: &Selector,
-    seen: &mut HashSet<FileIdentity>,
-    dirs: &mut Vec<DirFiles>,
-) {
+    seen: &HardLinkSet,
+) -> Vec<DirFiles> {
     let Ok(handle) = dirinfo::open_dir(dir) else {
-        return;
+        return Vec::new();
     };
 
     // 文件身份按“卷序列号 + 文件 ID”判断同一个文件，卷序列号取目录所在卷的。
@@ -611,11 +615,31 @@ fn collect_dirs(
 
     // 句柄在递归前释放，避免深层目录同时占用大量句柄。
     drop(handle);
-    dirs.push(current);
 
-    for subdir in subdirs {
-        collect_dirs(&subdir, false, selector, seen, dirs);
+    let children: Mutex<Vec<(usize, Vec<DirFiles>)>> = Mutex::new(Vec::new());
+    if !subdirs.is_empty() {
+        rayon::scope(|scope| {
+            for (index, child) in subdirs.into_iter().enumerate() {
+                let children = &children;
+                scope.spawn(move |_| {
+                    let subtree = collect_tree(&child, false, selector, seen);
+                    children.lock().unwrap().push((index, subtree));
+                });
+            }
+        });
     }
+
+    // 按枚举顺序还原，结果才和目录里的实际顺序一致。
+    let mut collected = children.into_inner().unwrap();
+    collected.sort_by_key(|(index, _)| *index);
+
+    let mut result = Vec::with_capacity(collected.len() + 1);
+    result.push(current);
+    for (_, subtree) in collected {
+        result.extend(subtree);
+    }
+
+    result
 }
 
 /// 展开相对路径里的通配符组件，只保留实际存在的目录。
@@ -715,13 +739,13 @@ fn matches_pattern(pattern: &str, text: &str) -> bool {
 }
 
 /// 文件年龄（小时）= now − max(CreationTime, LastWriteTime)。
-fn age_hours(creation_time: u64, last_write_time: u64, now: u64) -> u64 {
+pub(crate) fn age_hours(creation_time: u64, last_write_time: u64, now: u64) -> u64 {
     let newest = creation_time.max(last_write_time);
     now.saturating_sub(newest) / TICKS_PER_SECOND / 3600
 }
 
 /// `SystemTime` 换算成 FILETIME 的计时单位，好和目录项里的时间直接比较。
-fn system_time_ticks(time: SystemTime) -> u64 {
+pub(crate) fn system_time_ticks(time: SystemTime) -> u64 {
     let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let ticks = since_epoch.as_nanos() / 100;
     TICKS_TO_UNIX_EPOCH.saturating_add(u64::try_from(ticks).unwrap_or(u64::MAX))

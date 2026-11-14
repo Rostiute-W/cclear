@@ -8,6 +8,8 @@ rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true, features = ["local-offset"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
 windows = { workspace = true, features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",

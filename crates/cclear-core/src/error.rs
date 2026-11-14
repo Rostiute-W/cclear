@@ -12,6 +12,10 @@ pub enum CoreError {
     /// 系统目录解析失败。缺根目录会让规则静默失效，所以直接报错。
     #[error("无法解析系统目录「{0}」，请重新启动 CClear")]
     KnownFolder(&'static str),
+
+    /// 这条规则不走冻结清单（命令、隔离、特殊或系统操作），不能生成清理清单。
+    #[error("规则「{0}」不支持按清单执行")]
+    RuleNotPlannable(&'static str),
 }
 
 /// 核心库统一使用的结果类型。

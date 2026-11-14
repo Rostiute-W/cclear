@@ -168,11 +168,13 @@ pub fn delete(entry: Entry, expect: &Expect) -> Result<(), GuardError> {
 
     // 句柄会一直指向打开时的那个对象，所以同名替换不会改变 identity；
     // 名字被摘掉（同名替换、别处已经删掉）时只能从 delete pending 上看得出来。
-    if info.delete_pending
-        || info.identity != expect.identity
-        || info.size != expect.size
-        || info.last_write_time != expect.mtime
-    {
+    if info.delete_pending || info.identity != expect.identity {
+        return Err(GuardError::Changed);
+    }
+
+    // 目录的修改时间会随子项删除而变化，大小也没有意义，所以目录只按身份复核：
+    // 删除目录本身的安全性来自逐级相对打开（无链接、无禁区）和非空检查。
+    if !info.is_dir && (info.size != expect.size || info.last_write_time != expect.mtime) {
         return Err(GuardError::Changed);
     }
 
