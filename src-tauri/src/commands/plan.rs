@@ -271,6 +271,13 @@ fn build(rule_ids: &[String]) -> Result<FrozenPlan, String> {
     let mut rules = Vec::with_capacity(rule_ids.len());
     for id in rule_ids {
         let rule = find(id).ok_or_else(|| format!("没有这条清理规则：{id}"))?;
+        // 需要管理员权限的规则由提权 helper 单独执行，普通清单执行到这里会全部跳过。
+        if rule.admin {
+            return Err(format!(
+                "「{}」需要管理员权限，请在清理页单独执行",
+                rule.name
+            ));
+        }
         // 界面上的可执行状态是评估时算的，这里按当前状态再确认一次。
         if !evaluate(rule, &roots, &procs, now).executable {
             return Err(format!(

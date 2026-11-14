@@ -323,6 +323,8 @@ export interface QuarantineBatch {
   size: number;
   // 已经存放了多少天。
   ageDays: number;
+  // 批次来自提权 helper，还原和彻底删除会再弹一次 UAC。
+  requiresAdmin: boolean;
 }
 
 // 异常批次的人工处理方式。
@@ -345,6 +347,24 @@ export interface QuarantineResolveResult {
   moved: number;
   // 源发生变化、源和副本都保留的条目数。
   kept: number;
+}
+
+// 提权 helper 执行一个内置操作的结果。
+export interface ElevatedOpResult {
+  // 操作的字符串形式，例如 leappstore-cicada。
+  op: string;
+  // done 表示完成，skipped 表示按规则跳过，failed 表示出错。
+  status: "done" | "skipped" | "failed";
+  detail: string;
+  // 隔离批次的 ID，只有隔离类操作有。
+  batchId: string | null;
+  // 本次处理的条目数。
+  items: number;
+}
+
+// 一次提权执行的完整结果。
+export interface ElevatedResult {
+  ops: ElevatedOpResult[];
 }
 
 // 命令执行的进度。命令没有分项进度，只有开始和结束两个阶段。

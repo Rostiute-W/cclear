@@ -134,8 +134,9 @@ pub enum SystemOpId {
     DeliveryOptimization,
 }
 
-/// 允许执行清理的阶段。M3 开放 safe 和 caution 的文件类规则，M4 开放多版本残留。
-pub const ENABLED_PHASES: &[Phase] = &[Phase::M3a, Phase::M3b, Phase::M4];
+/// 允许执行清理的阶段。M3 开放 safe 和 caution 的文件类规则，M4 开放多版本残留，
+/// M5a 开放两个需要管理员权限的 ProgramData 残留。
+pub const ENABLED_PHASES: &[Phase] = &[Phase::M3a, Phase::M3b, Phase::M4, Phase::M5a];
 
 /// 递归清理锚点下的全部内容。
 const ALL_CONTENTS: Selector = Selector {
@@ -875,7 +876,7 @@ static CATALOG: &[Rule] = &[
         phase: Phase::M5a,
         admin: true,
         default_selected: false,
-        processes: &[],
+        processes: &["LeASLane.exe", "LenovoAppStoreNotify.exe"],
         layout_markers: &[],
         warning: Some("需要管理员权限"),
         target: Target::Adapter(AdapterId::LeAppStoreCicada),
@@ -890,7 +891,7 @@ static CATALOG: &[Rule] = &[
         phase: Phase::M5a,
         admin: true,
         default_selected: false,
-        processes: &[],
+        processes: &["NVIDIA App.exe", "NVIDIA Overlay.exe"],
         layout_markers: &[],
         warning: Some("需要管理员权限"),
         target: Target::Adapter(AdapterId::NvidiaAppOtaArtifacts),

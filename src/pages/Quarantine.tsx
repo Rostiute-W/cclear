@@ -177,6 +177,9 @@ export function QuarantinePage({ onChanged }: { onChanged: () => void }) {
                     <td>{formatSize(batch.size)}</td>
                     <td>
                       <span className="status-badge">{batch.stageLabel}</span>
+                      {batch.requiresAdmin && (
+                        <span className="status-badge">需要管理员</span>
+                      )}
                       {batch.note && <div className="muted">{batch.note}</div>}
                     </td>
                     <td>{batch.ageDays}</td>

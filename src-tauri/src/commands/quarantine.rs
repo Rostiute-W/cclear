@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use cclear_core::elevation::{SystemOp, run_elevated};
 use cclear_core::journal::FileJournal;
 use cclear_core::quarantine::{
     QuarantineRoot, ResolveAction, candidate_volumes, default_root, save_quarantine_root,
@@ -54,6 +55,8 @@ pub struct QuarantineBatchDto {
     pub size: u64,
     /// 已经存放了多少天。
     pub age_days: u64,
+    /// 批次来自提权 helper，还原和彻底删除要重新提权。
+    pub requires_admin: bool,
 }
 
 /// 还原结果。
@@ -168,6 +171,12 @@ pub async fn quarantine_restore(
 
     tauri::async_runtime::spawn_blocking(move || {
         let root = require_root()?;
+
+        // 提权 helper 创建的批次，源在 ProgramData 下，还原也必须回到 helper 里执行。
+        if batch_requires_admin(&root, id)? {
+            return restore_with_helper(&root, id);
+        }
+
         let mut journal =
             FileJournal::new().map_err(|error| format!("操作日志无法写入：{error}"))?;
 
@@ -198,6 +207,12 @@ pub async fn quarantine_purge(batch_id: String, state: State<'_, AppState>) -> R
 
     tauri::async_runtime::spawn_blocking(move || {
         let root = require_root()?;
+
+        // 提权批次连批次目录本身都可能有 ACL 限制，彻底删除同样交给 helper。
+        if batch_requires_admin(&root, id)? {
+            return purge_with_helper(&root, id);
+        }
+
         let mut journal =
             FileJournal::new().map_err(|error| format!("操作日志无法写入：{error}"))?;
 
@@ -313,8 +328,72 @@ fn configured_root() -> Option<QuarantineRoot> {
 }
 
 /// 执行类命令必须有隔离根，没有就明确告诉用户去选卷。
-fn require_root() -> Result<QuarantineRoot, String> {
+///
+/// 提权清理命令也复用它：第一次直接点管理员项时同样会建好默认隔离区。
+pub(crate) fn require_root() -> Result<QuarantineRoot, String> {
     configured_root().ok_or_else(|| "还没有选择隔离区位置，请先在隔离区页选择保存卷".to_string())
+}
+
+/// 这个批次是不是提权 helper 创建的。列表里没有它时返回 false，
+/// 后面的本地流程会给出“批次不存在”的准确错误。
+fn batch_requires_admin(root: &QuarantineRoot, batch_id: Uuid) -> Result<bool, String> {
+    let batches = root
+        .batches()
+        .map_err(|error| format!("读取隔离批次失败：{error}"))?;
+
+    Ok(batches
+        .into_iter()
+        .find(|batch| batch.batch_id == batch_id)
+        .is_some_and(|batch| batch.requires_admin))
+}
+
+/// 通过提权 helper 还原批次。
+///
+/// 用户取消 UAC 时 helper 返回“已取消授权”，这里原样传给界面。
+fn restore_with_helper(
+    root: &QuarantineRoot,
+    batch_id: Uuid,
+) -> Result<QuarantineRestoreDto, String> {
+    let result = run_elevated(&[SystemOp::RestoreBatch(batch_id)], root.path())
+        .map_err(|error| error.to_string())?;
+
+    let Some(outcome) = result.first() else {
+        return Err("提权 helper 没有返回结果".to_string());
+    };
+    // helper 自己失败（例如隔离根不可用）时不能当成“还原了 0 个文件”。
+    if outcome.status == "failed" {
+        return Err(outcome.detail.clone());
+    }
+
+    // helper 只回一个总体状态：全部还原成功才算已还原，其余按“需要处理”交给用户再看一次。
+    let stage = if outcome.is_done() {
+        ("restored", "已还原")
+    } else {
+        ("needsAttention", "需要处理")
+    };
+
+    Ok(QuarantineRestoreDto {
+        batch_id: batch_id.to_string(),
+        stage: stage.0.to_string(),
+        stage_label: stage.1.to_string(),
+        restored: outcome.items,
+        conflicts: Vec::new(),
+    })
+}
+
+/// 通过提权 helper 彻底删除批次。
+fn purge_with_helper(root: &QuarantineRoot, batch_id: Uuid) -> Result<(), String> {
+    let result = run_elevated(&[SystemOp::PurgeBatch(batch_id)], root.path())
+        .map_err(|error| error.to_string())?;
+
+    let Some(outcome) = result.first() else {
+        return Err("提权 helper 没有返回结果".to_string());
+    };
+    if !outcome.is_done() {
+        return Err(outcome.detail.clone());
+    }
+
+    Ok(())
 }
 
 /// 隔离区在用户目录里，禁区规则不该挡住还原和异常处理。
@@ -351,5 +430,6 @@ fn batch_dto(batch: cclear_core::quarantine::BatchSummary) -> QuarantineBatchDto
         items: batch.items,
         size: batch.size,
         age_days: batch.age_days,
+        requires_admin: batch.requires_admin,
     }
 }

@@ -3,6 +3,7 @@
 pub mod app;
 pub mod clean;
 pub mod devcache;
+pub mod elevated;
 pub mod env;
 pub mod migrate;
 pub mod plan;

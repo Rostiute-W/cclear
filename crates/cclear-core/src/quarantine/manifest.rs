@@ -187,6 +187,10 @@ pub struct Manifest {
     pub stage: BatchStage,
     /// 当前状态说明，异常时写清楚为什么停在这里。
     pub note: String,
+    /// 批次由提权 helper 创建，还原和彻底删除也必须交回 helper 执行。
+    /// 旧清单没有这个字段，按 false 读。
+    #[serde(default)]
+    pub requires_admin: bool,
     pub items: Vec<ManifestItem>,
 }
 
@@ -240,4 +244,6 @@ pub struct BatchSummary {
     pub size: u64,
     /// 已经存放了多少天，界面用来提示超过 7 天的批次。
     pub age_days: u64,
+    /// 批次来自提权 helper，还原和彻底删除需要管理员权限。
+    pub requires_admin: bool,
 }
