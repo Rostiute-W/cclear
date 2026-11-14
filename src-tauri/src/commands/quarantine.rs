@@ -5,11 +5,14 @@
 use std::path::PathBuf;
 
 use cclear_core::elevation::{SystemOp, run_elevated};
+use cclear_core::guard::Forbidden;
 use cclear_core::journal::FileJournal;
 use cclear_core::quarantine::{
-    QuarantineRoot, ResolveAction, candidate_volumes, default_root, save_quarantine_root,
+    BatchSummary, OVERDUE_DAYS, QuarantineRoot, ResolveAction, candidate_volumes, default_root,
+    save_quarantine_root,
 };
 use cclear_core::rules::catalog::find;
+use cclear_core::rules::resolve::RootMap;
 use cclear_core::win::volume;
 use cclear_core::win::{KnownFolder, equals_ignore_case, known_folder};
 use serde::Serialize;
@@ -113,12 +116,13 @@ pub async fn quarantine_set_volume(
         let root = chosen
             .root
             .join(cclear_core::quarantine::QUARANTINE_DIR_NAME);
-        save_quarantine_root(&root).map_err(|error| format!("保存隔离区设置失败：{error}"))?;
 
         // 目录现在就建起来：DACL 设置失败要立刻让用户看到，而不是等到第一次隔离。
-        QuarantineRoot::open(root)
+        // 建成功之后才保存设置，否则用户会留下一个指向上次失败的隔离根。
+        QuarantineRoot::open(root.clone())
             .ensure_root()
             .map_err(|error| format!("创建隔离区目录失败：{error}"))?;
+        save_quarantine_root(&root).map_err(|error| format!("保存隔离区设置失败：{error}"))?;
 
         current_state()
     })
@@ -129,14 +133,7 @@ pub async fn quarantine_set_volume(
 #[tauri::command]
 pub async fn quarantine_batches() -> Result<Vec<QuarantineBatchDto>, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        let Some(root) = configured_root() else {
-            return Ok(Vec::new());
-        };
-
-        let batches = root
-            .batches()
-            .map_err(|error| format!("读取隔离批次失败：{error}"))?;
-
+        let batches = all_batches()?;
         Ok(batches.into_iter().map(batch_dto).collect())
     })
     .await
@@ -147,15 +144,12 @@ pub async fn quarantine_batches() -> Result<Vec<QuarantineBatchDto>, String> {
 #[tauri::command]
 pub async fn quarantine_overdue() -> Result<Vec<QuarantineBatchDto>, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        let Some(root) = configured_root() else {
-            return Ok(Vec::new());
-        };
+        let overdue = all_batches()?
+            .into_iter()
+            .filter(|batch| batch.age_days > OVERDUE_DAYS)
+            .collect::<Vec<BatchSummary>>();
 
-        let batches = root
-            .overdue()
-            .map_err(|error| format!("读取隔离批次失败：{error}"))?;
-
-        Ok(batches.into_iter().map(batch_dto).collect())
+        Ok(overdue.into_iter().map(batch_dto).collect())
     })
     .await
     .map_err(|error| format!("读取隔离批次失败：{error}"))?
@@ -170,7 +164,7 @@ pub async fn quarantine_restore(
     let _exec = state.start_exec()?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let root = require_root()?;
+        let root = root_for_batch(id)?;
 
         // 提权 helper 创建的批次，源在 ProgramData 下，还原也必须回到 helper 里执行。
         if batch_requires_admin(&root, id)? {
@@ -206,7 +200,7 @@ pub async fn quarantine_purge(batch_id: String, state: State<'_, AppState>) -> R
     let _exec = state.start_exec()?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let root = require_root()?;
+        let root = root_for_batch(id)?;
 
         // 提权批次连批次目录本身都可能有 ACL 限制，彻底删除同样交给 helper。
         if batch_requires_admin(&root, id)? {
@@ -235,12 +229,12 @@ pub async fn quarantine_resolve(
     let _exec = state.start_exec()?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let root = require_root()?;
+        let root = root_for_batch(id)?;
         let mut journal =
             FileJournal::new().map_err(|error| format!("操作日志无法写入：{error}"))?;
 
         let outcome = root
-            .resolve(id, action, &forbidden(), &mut journal)
+            .resolve(id, action, &forbidden()?, &mut journal)
             .map_err(|error| format!("处理异常批次失败：{error}"))?;
 
         Ok(QuarantineResolveDto {
@@ -257,12 +251,10 @@ pub async fn quarantine_resolve(
 
 /// 启动时把上次没有做完的隔离批次收到确定的状态上。
 ///
+/// 换过卷之后旧隔离根上的批次也要恢复，所以扫设置里记录过的每一个根。
 /// 拿到执行锁才会动手，避免和用户刚发起的操作抢同一批文件。
 pub fn recover_on_startup(state: &AppState) {
     let Ok(_exec) = state.start_exec() else {
-        return;
-    };
-    let Some(root) = QuarantineRoot::from_settings() else {
         return;
     };
     let Ok(mut journal) = FileJournal::new() else {
@@ -270,7 +262,24 @@ pub fn recover_on_startup(state: &AppState) {
     };
 
     // 恢复失败只影响这一次启动的提示，不影响界面其他功能。
-    let _ = root.recover_pending(&mut journal);
+    for root in QuarantineRoot::roots_from_settings() {
+        let _ = root.recover_pending(&mut journal);
+    }
+}
+
+/// 设置里记录过的全部隔离根上的批次，按创建时间从新到旧。
+fn all_batches() -> Result<Vec<BatchSummary>, String> {
+    let mut batches = Vec::new();
+
+    for root in QuarantineRoot::roots_from_settings() {
+        let read = root
+            .batches()
+            .map_err(|error| format!("读取隔离批次失败：{error}"))?;
+        batches.extend(read);
+    }
+
+    batches.sort_by_key(|batch| std::cmp::Reverse(batch.created_at));
+    Ok(batches)
 }
 
 /// 当前系统盘根目录，隔离区的源卷就是它。
@@ -334,6 +343,12 @@ pub(crate) fn require_root() -> Result<QuarantineRoot, String> {
     configured_root().ok_or_else(|| "还没有选择隔离区位置，请先在隔离区页选择保存卷".to_string())
 }
 
+/// 批次所在的隔离根。批次可能属于以前用过的卷，按设置里记录过的根逐个找。
+fn root_for_batch(batch_id: Uuid) -> Result<QuarantineRoot, String> {
+    QuarantineRoot::find_root_of(batch_id)
+        .ok_or_else(|| "这个隔离批次不存在，请刷新列表".to_string())
+}
+
 /// 这个批次是不是提权 helper 创建的。列表里没有它时返回 false，
 /// 后面的本地流程会给出“批次不存在”的准确错误。
 fn batch_requires_admin(root: &QuarantineRoot, batch_id: Uuid) -> Result<bool, String> {
@@ -377,7 +392,7 @@ fn restore_with_helper(
         stage: stage.0.to_string(),
         stage_label: stage.1.to_string(),
         restored: outcome.items,
-        conflicts: Vec::new(),
+        conflicts: outcome.conflicts.clone(),
     })
 }
 
@@ -397,8 +412,12 @@ fn purge_with_helper(root: &QuarantineRoot, batch_id: Uuid) -> Result<(), String
 }
 
 /// 隔离区在用户目录里，禁区规则不该挡住还原和异常处理。
-fn forbidden() -> cclear_core::guard::Forbidden {
-    cclear_core::guard::Forbidden::empty()
+///
+/// 但“继续”会回到源目录去删源，源目录在用户目录里，禁区规则必须照常生效，
+/// 所以这里按规则里的禁区根目录建集合，而不是传空集合。
+fn forbidden() -> Result<Forbidden, String> {
+    let roots = RootMap::system().map_err(|error| error.to_string())?;
+    Ok(Forbidden::from_rules(&roots))
 }
 
 fn parse_batch_id(batch_id: &str) -> Result<Uuid, String> {

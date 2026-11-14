@@ -85,9 +85,10 @@ export function commandExecute(
   });
 }
 
-// 需要管理员权限的清理项：只传规则 ID，内置操作和安全路径都由后端决定。
-export function elevatedExecute(ruleId: string): Promise<ElevatedResult> {
-  return invoke<ElevatedResult>("elevated_execute", { ruleId });
+// 需要管理员权限的清理项：只传规则 ID 列表，内置操作和安全路径都由后端决定。
+// 多条规则合成一次提权调用，只弹一次授权。
+export function elevatedExecute(ruleIds: string[]): Promise<ElevatedResult> {
+  return invoke<ElevatedResult>("elevated_execute", { ruleIds });
 }
 
 // 分析组件存储（DISM，只读）。会弹一次授权提示。

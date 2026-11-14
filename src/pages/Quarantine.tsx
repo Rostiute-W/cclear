@@ -86,7 +86,9 @@ export function QuarantinePage({ onChanged }: { onChanged: () => void }) {
   const onResolve = (batch: QuarantineBatch, action: "continue" | "abandon") => {
     if (
       action === "abandon" &&
-      !window.confirm("放弃这个批次？隔离副本会被删除，源文件保持不变。")
+      !window.confirm(
+        "放弃这个批次？只会删除源文件仍在原位且未变化的副本；源已不在的条目会保留在隔离区。",
+      )
     ) {
       return;
     }

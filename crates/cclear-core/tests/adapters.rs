@@ -52,6 +52,23 @@ fn write_commit(base: &Path, name: &str, version: &str, commit: &str) {
     .unwrap();
 }
 
+/// 把一个路径的创建时间和修改时间设成“现在往前 seconds 秒”。
+///
+/// 适配器按修改时间判断哪个目录更新，测试不能依赖连续创建的时间先后：
+/// 同一毫秒内建出来的几个目录时间可能完全相同。
+fn set_age(path: &Path, seconds: u64) {
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    const UNIX_EPOCH_TO_1601: u64 = 11_644_473_600;
+
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let ticks = (now - seconds + UNIX_EPOCH_TO_1601) * TICKS_PER_SECOND;
+
+    cclear_core::win::set_file_times(path, ticks, ticks).unwrap();
+}
+
 #[test]
 fn codex_runtimes_keep_primary_and_skip_newer_install() {
     let temp = tempdir().unwrap();
@@ -61,24 +78,33 @@ fn codex_runtimes_keep_primary_and_skip_newer_install() {
         .unwrap()
         .join(".cache\\codex-runtimes");
 
-    // 目录的修改时间随创建顺序递增：先建旧安装目录，再建当前运行时，最后建比它新的安装目录。
-    fs::create_dir_all(base.join("codex-runtime-install-old")).unwrap();
-    fs::create_dir_all(
-        base.join("codex-primary-runtime.previous-11111111-2222-3333-4444-555555555555"),
-    )
-    .unwrap();
-    fs::create_dir_all(base.join("codex-primary-runtime")).unwrap();
-    fs::create_dir_all(base.join("codex-runtime-install-new")).unwrap();
+    let previous = "codex-primary-runtime.previous-11111111-2222-3333-4444-555555555555";
+    for name in [
+        "codex-runtime-install-old",
+        previous,
+        "codex-primary-runtime",
+        "codex-runtime-install-new",
+    ] {
+        fs::create_dir_all(base.join(name)).unwrap();
+    }
+
+    // 各目录的修改时间显式设定：旧安装目录早于当前运行时，新安装目录晚于它。
+    const DAY: u64 = 24 * 3600;
+    set_age(&base.join("codex-runtime-install-old"), 3 * DAY);
+    set_age(&base.join(previous), 3 * DAY);
+    set_age(&base.join("codex-primary-runtime"), 2 * 3600);
+    set_age(&base.join("codex-runtime-install-new"), 3600);
 
     // 把“现在”往后推两天：24 小时的年龄条件才会成立。
     let now = SystemTime::now() + Duration::from_secs(48 * 3600);
     let probe = FixedVersion("1.0.0");
 
-    let previous = evaluate_adapter(AdapterId::CodexPreviousRuntime, &roots, &[], &probe, now);
-    assert_eq!(previous.status, CandidateStatus::Ready);
+    let previous_result =
+        evaluate_adapter(AdapterId::CodexPreviousRuntime, &roots, &[], &probe, now);
+    assert_eq!(previous_result.status, CandidateStatus::Ready);
     assert_eq!(
-        item_names(&previous),
-        vec!["codex-primary-runtime.previous-11111111-2222-3333-4444-555555555555".to_string()],
+        item_names(&previous_result),
+        vec![previous.to_string()],
         "当前运行时不能选中，只剩下 previous-* 目录"
     );
 

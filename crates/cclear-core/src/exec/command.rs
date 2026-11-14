@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -90,7 +90,7 @@ pub fn resolve_tool(name: &str) -> Option<PathBuf> {
 ///
 /// 超时只报告，不结束进程：强杀别的工具的进程可能留下半个缓存，也可能打断它自己的清理。
 pub fn run(tool: &Path, args: &[&str], timeout: Duration) -> CmdOutcome {
-    run_with_env(tool, args, timeout, &[])
+    run_inner(tool, args, timeout, &[], false)
 }
 
 /// 同 [`run`]，但先覆盖几个环境变量再启动。
@@ -103,24 +103,27 @@ pub fn run_with_env(
     timeout: Duration,
     env: &[(&str, String)],
 ) -> CmdOutcome {
-    let mut command = match command_for(tool) {
-        Ok(command) => command,
-        Err(error) => return failed(&error),
-    };
+    run_inner(tool, args, timeout, env, false)
+}
 
-    // 参数只有内置常量，std 默认的转义在这里足够；stdin 给 null，
-    // 免得不小心读到界面进程的输入而卡住。
-    command
-        .args(args)
-        .envs(env.iter().map(|(name, value)| (*name, value.as_str())))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW);
+/// 同 [`run`]，但用干净的环境启动：不继承本进程的任何环境变量。
+///
+/// 提权 helper 用它启动 DISM 和 PowerShell：用户目录里的同名 PowerShell 函数，
+/// 或者 `HKCU\Environment` 里注入的变量，都不该在管理员进程里起作用。
+pub fn run_clean(tool: &Path, args: &[&str], timeout: Duration) -> CmdOutcome {
+    run_inner(tool, args, timeout, &[], true)
+}
 
-    let mut child = match command.spawn() {
+fn run_inner(
+    tool: &Path,
+    args: &[&str],
+    timeout: Duration,
+    env: &[(&str, String)],
+    clean: bool,
+) -> CmdOutcome {
+    let mut child = match spawn_command(tool, args, env, clean) {
         Ok(child) => child,
-        Err(error) => return failed(&format!("无法启动命令：{error}")),
+        Err(outcome) => return outcome,
     };
 
     // 输出必须边跑边读：等进程结束再读管道，输出多时双方会互相等死。
@@ -176,21 +179,29 @@ pub fn run_streaming(
     timeout: Duration,
     on_stdout: &mut dyn FnMut(&str),
 ) -> CmdOutcome {
-    let mut command = match command_for(tool) {
-        Ok(command) => command,
-        Err(error) => return failed(&error),
-    };
+    run_streaming_inner(tool, args, timeout, on_stdout, false)
+}
 
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW);
+/// 同 [`run_streaming`]，但用干净的环境启动。helper 跑 DISM 清理时用它。
+pub fn run_streaming_clean(
+    tool: &Path,
+    args: &[&str],
+    timeout: Duration,
+    on_stdout: &mut dyn FnMut(&str),
+) -> CmdOutcome {
+    run_streaming_inner(tool, args, timeout, on_stdout, true)
+}
 
-    let mut child = match command.spawn() {
+fn run_streaming_inner(
+    tool: &Path,
+    args: &[&str],
+    timeout: Duration,
+    on_stdout: &mut dyn FnMut(&str),
+    clean: bool,
+) -> CmdOutcome {
+    let mut child = match spawn_command(tool, args, &[], clean) {
         Ok(child) => child,
-        Err(error) => return failed(&format!("无法启动命令：{error}")),
+        Err(outcome) => return outcome,
     };
 
     // 标准输出走通道回到本线程：读取线程只负责读，调用方的回调在本线程里执行。
@@ -289,6 +300,85 @@ fn drain_to_channel(pipe: Option<impl Read + Send + 'static>, sender: Sender<Str
             }
         }
     });
+}
+
+/// 组装命令行并启动进程。`clean` 为真时只带系统目录里的固定环境变量。
+fn spawn_command(
+    tool: &Path,
+    args: &[&str],
+    env: &[(&str, String)],
+    clean: bool,
+) -> Result<Child, CmdOutcome> {
+    let mut command = match command_for(tool) {
+        Ok(command) => command,
+        Err(error) => return Err(failed(&error)),
+    };
+
+    // 参数只有内置常量，std 默认的转义在这里足够；stdin 给 null，
+    // 免得不小心读到界面进程的输入而卡住。
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW);
+
+    if clean {
+        let variables = match clean_environment() {
+            Ok(variables) => variables,
+            Err(error) => return Err(failed(&error)),
+        };
+        // 先清空再设置：用户环境里的变量一个都不该进入提权进程。
+        command.env_clear().envs(variables);
+    } else {
+        command.envs(env.iter().map(|(name, value)| (*name, value.as_str())));
+    }
+
+    command
+        .spawn()
+        .map_err(|error| failed(&format!("无法启动命令：{error}")))
+}
+
+/// 干净的环境变量集合。
+///
+/// 只给系统目录里必须有的那几项：用户目录里的同名 PowerShell 函数，
+/// 以及 `HKCU\Environment` 里注入的变量（例如 `COR_ENABLE_PROFILING`），
+/// 都不能在提权进程里生效。
+fn clean_environment() -> Result<Vec<(&'static str, String)>, String> {
+    let windows =
+        known_folder(KnownFolder::Windows).map_err(|error| format!("无法定位系统目录：{error}"))?;
+    let system32 = windows.join("System32");
+    let powershell = system32.join("WindowsPowerShell").join("v1.0");
+
+    let path_value = [system32.clone(), system32.join("Wbem"), powershell.clone()]
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect::<Vec<String>>()
+        .join(";");
+
+    let system_drive = windows
+        .parent()
+        .map(|root| root.to_string_lossy().into_owned())
+        .unwrap_or_else(|| windows.to_string_lossy().into_owned());
+    // 盘根带结尾分隔符（`C:\`），这个变量只认 `C:`。
+    let system_drive = system_drive.trim_end_matches(['\\', '/']).to_string();
+
+    Ok(vec![
+        ("SystemRoot", windows.to_string_lossy().into_owned()),
+        ("windir", windows.to_string_lossy().into_owned()),
+        ("SystemDrive", system_drive),
+        (
+            "ComSpec",
+            system32.join("cmd.exe").to_string_lossy().into_owned(),
+        ),
+        ("TEMP", windows.join("Temp").to_string_lossy().into_owned()),
+        ("TMP", windows.join("Temp").to_string_lossy().into_owned()),
+        ("PATH", path_value),
+        (
+            "PSModulePath",
+            powershell.join("Modules").to_string_lossy().into_owned(),
+        ),
+    ])
 }
 
 /// 组装要执行的命令。`.cmd` 和 `.bat` 是批处理脚本，必须交给 cmd.exe 解释。

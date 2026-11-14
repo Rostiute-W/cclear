@@ -23,6 +23,8 @@ pub struct ElevatedOpDto {
     pub detail: String,
     pub batch_id: Option<String>,
     pub items: u64,
+    /// 还原时原位已有同名文件、因此没有还原的路径。
+    pub conflicts: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -31,37 +33,45 @@ pub struct ElevatedResultDto {
     pub ops: Vec<ElevatedOpDto>,
 }
 
-/// 以管理员权限执行一条规则。用户取消 UAC 时返回“已取消授权”。
+/// 以管理员权限执行一组规则，只弹一次授权。用户取消 UAC 时返回“已取消授权”。
 #[tauri::command]
 pub async fn elevated_execute(
-    rule_id: String,
+    rule_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<ElevatedResultDto, String> {
     // 提权执行也是清理类操作，和清单、命令共用同一把执行锁。
     let _exec = state.start_exec()?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let rule = find(&rule_id).ok_or_else(|| "没有这条清理规则".to_string())?;
-        if !rule.admin {
-            return Err("这条规则不需要管理员权限，请在清理页直接执行".to_string());
+        if rule_ids.is_empty() {
+            return Err("没有要执行的清理规则".to_string());
         }
-
-        let op = system_op(rule)?;
 
         // 界面上点按钮时状态可能已经变了，这里按当前状态再确认一次。
         let roots = RootMap::system().map_err(|error| error.to_string())?;
         let procs = running_processes();
-        let candidate = evaluate(rule, &roots, &procs, SystemTime::now());
-        if !candidate.executable {
-            let reason = candidate
-                .status
-                .detail()
-                .unwrap_or_else(|| "请重新评估后再试".to_string());
-            return Err(format!("「{}」现在没有执行资格：{reason}", rule.name));
+        let mut ops = Vec::with_capacity(rule_ids.len());
+
+        for rule_id in &rule_ids {
+            let rule = find(rule_id).ok_or_else(|| "没有这条清理规则".to_string())?;
+            if !rule.admin {
+                return Err("这条规则不需要管理员权限，请在清理页直接执行".to_string());
+            }
+
+            let candidate = evaluate(rule, &roots, &procs, SystemTime::now());
+            if !candidate.executable {
+                let reason = candidate
+                    .status
+                    .detail()
+                    .unwrap_or_else(|| "请重新评估后再试".to_string());
+                return Err(format!("「{}」现在没有执行资格：{reason}", rule.name));
+            }
+
+            ops.push(system_op(rule)?);
         }
 
         let root = crate::commands::quarantine::require_root()?;
-        let result = run_elevated(&[op], root.path()).map_err(|error| error.to_string())?;
+        let result = run_elevated(&ops, root.path()).map_err(|error| error.to_string())?;
 
         Ok(result_dto(result))
     })
@@ -94,6 +104,7 @@ pub(crate) fn result_dto(result: HelperResult) -> ElevatedResultDto {
                 detail: op.detail,
                 batch_id: op.batch_id,
                 items: op.items,
+                conflicts: op.conflicts,
             })
             .collect(),
     }

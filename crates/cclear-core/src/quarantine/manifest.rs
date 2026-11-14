@@ -3,7 +3,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -98,6 +98,8 @@ pub enum ItemState {
     Kept,
     /// 已经还原回原位。
     Restored,
+    /// 源和副本都对不上，需要用户自己确认后才能处理。
+    NeedsAttention,
 }
 
 impl ItemState {
@@ -109,6 +111,7 @@ impl ItemState {
             ItemState::SourceDeleted => "已隔离",
             ItemState::Kept => "源保留",
             ItemState::Restored => "已还原",
+            ItemState::NeedsAttention => "需要处理",
         }
     }
 }
@@ -202,11 +205,17 @@ impl Manifest {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
-    /// 原子写入清单：先写临时文件，再用护栏的目录句柄替换正式文件。
+    /// 原子写入清单：先写临时文件并刷盘，再用护栏的目录句柄替换正式文件。
     pub fn save(&self, batch_dir: &Path) -> Result<(), GuardError> {
         let json = serde_json::to_vec_pretty(self)
             .map_err(|error| GuardError::Io(io::Error::other(error)))?;
-        fs::write(batch_dir.join(MANIFEST_TMP_NAME), json)?;
+
+        // 必须先把内容落到磁盘再替换：否则掉电后可能换上一个空文件。
+        {
+            let mut file = fs::File::create(batch_dir.join(MANIFEST_TMP_NAME))?;
+            io::Write::write_all(&mut file, &json)?;
+            file.sync_all()?;
+        }
 
         let dir = open_anchor(batch_dir, &Forbidden::empty())?;
         replace_in_dir(
@@ -214,6 +223,30 @@ impl Manifest {
             OsStr::new(MANIFEST_TMP_NAME),
             OsStr::new(MANIFEST_NAME),
         )
+    }
+
+    /// 校验每个条目的路径。清单在普通用户可写的隔离区里，被动过之后不能照着它动手。
+    ///
+    /// 只要有一个条目不合格就整批拒绝：漏过一条就可能把文件写到清单之外的位置。
+    pub fn validate(&self) -> Result<(), String> {
+        for item in &self.items {
+            if !is_local_path(&item.anchor) {
+                return Err(format!("锚点不是本地盘符路径：{}", item.anchor));
+            }
+
+            // 空的 rel 会让源路径退化成锚点目录、副本路径退化成 data\<序号>，都不该出现。
+            if item.rel.is_empty() {
+                return Err(format!("条目「{}」没有相对路径", item.anchor));
+            }
+
+            for part in &item.rel {
+                crate::guard::validate_component(OsStr::new(part)).map_err(|_| {
+                    format!("条目「{}」包含不合法的路径组件「{part}」", item.anchor)
+                })?;
+            }
+        }
+
+        Ok(())
     }
 
     /// 条目数。
@@ -230,6 +263,30 @@ impl Manifest {
     pub fn count_state(&self, state: ItemState) -> u64 {
         self.items.iter().filter(|item| item.state == state).count() as u64
     }
+}
+
+/// 锚点是否是一个普通的本地盘符绝对路径。
+///
+/// `Prefix::Disk` 只匹配 `X:\...`：`\\?\X:\` 走的是 `VerbatimDisk`，UNC 是 `UNC`，
+/// 两者都会被拒绝。`.`、`..` 和带冒号的组件不是 `Normal`，同样被拒绝；
+/// 剩下的每一段还要过护栏的组件校验，避免把带 ADS 之类的名字当成正常目录名。
+fn is_local_path(text: &str) -> bool {
+    let mut components = Path::new(text).components();
+
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return false;
+    };
+    if !matches!(prefix.kind(), Prefix::Disk(_)) {
+        return false;
+    }
+    if components.next() != Some(Component::RootDir) {
+        return false;
+    }
+
+    components.all(|component| match component {
+        Component::Normal(name) => crate::guard::validate_component(name).is_ok(),
+        _ => false,
+    })
 }
 
 /// 列表里一个批次的概要。

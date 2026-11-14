@@ -297,28 +297,51 @@ export function CleanPage() {
       });
   };
 
-  // 需要管理员权限的清理项：一次只执行一条规则，所以只会弹一次 UAC。
-  const runElevated = (rule: RuleInfo) => {
-    const text = `「${rule.name}」需要管理员权限，执行时会弹出一次授权提示；清理结果先进入隔离区。确认继续？`;
+  // 需要管理员权限的清理项：一次调用可以带多条规则，helper 只弹一次授权。
+  const runElevated = (targets: RuleInfo[]) => {
+    if (targets.length === 0) {
+      return;
+    }
+
+    const names = targets.map((rule) => `「${rule.name}」`).join("、");
+    const text = `${names} 需要管理员权限，执行时会弹出一次授权提示；清理结果先进入隔离区。确认继续？`;
     if (!window.confirm(text)) {
       return;
     }
 
-    setElevatedStates((previous) => ({ ...previous, [rule.id]: { phase: "running" } }));
-    elevatedExecute(rule.id)
+    const ruleIds = targets.map((rule) => rule.id);
+    setElevatedStates((previous) => {
+      const next = { ...previous };
+      for (const ruleId of ruleIds) {
+        next[ruleId] = { phase: "running" };
+      }
+      return next;
+    });
+
+    elevatedExecute(ruleIds)
       .then((result) => {
-        setElevatedStates((previous) => ({
-          ...previous,
-          [rule.id]: { phase: "done", result },
-        }));
+        setElevatedStates((previous) => {
+          const next = { ...previous };
+          // 结果与传入的规则按顺序一一对应，每条规则只显示属于自己的那一项。
+          ruleIds.forEach((ruleId, index) => {
+            const op = result.ops[index];
+            next[ruleId] = op
+              ? { phase: "done", result: { ops: [op] } }
+              : { phase: "failed", message: "提权 helper 没有返回这一项的结果" };
+          });
+          return next;
+        });
         // 内容已经移入隔离区，重新评估一次，界面上的数字才是当前的。
         evaluate();
       })
       .catch((reason) => {
-        setElevatedStates((previous) => ({
-          ...previous,
-          [rule.id]: { phase: "failed", message: String(reason) },
-        }));
+        setElevatedStates((previous) => {
+          const next = { ...previous };
+          for (const ruleId of ruleIds) {
+            next[ruleId] = { phase: "failed", message: String(reason) };
+          }
+          return next;
+        });
       });
   };
 
@@ -408,6 +431,15 @@ export function CleanPage() {
     .filter((rule) => maintenanceSelected.has(rule.id))
     .map((rule) => rule.id);
 
+  // 残留层里需要管理员权限、当前可以执行的规则。合成一次提权调用，只弹一次授权。
+  const adminLeftoverRules = rules.filter(
+    (rule) =>
+      rule.tier === "leftover" &&
+      rule.admin &&
+      isPlanRule(rule) &&
+      candidates.get(rule.id)?.executable === true,
+  );
+
   // 命令、回收站和清单共用后端的执行锁：任一操作进行时，其他执行按钮都禁用。
   // 判断以后端为准，这里只是不让用户白点。
   const anyCommandRunning = Object.values(commandStates).some(
@@ -490,6 +522,16 @@ export function CleanPage() {
                     onClick={() => startPlan(checkedIds)}
                   >
                     {planning ? "正在生成清单…" : "清理选中项"}
+                  </button>
+                )}
+                {group.tier === "leftover" && adminLeftoverRules.length > 0 && (
+                  <button
+                    type="button"
+                    className="button-primary"
+                    disabled={execBusy}
+                    onClick={() => runElevated(adminLeftoverRules)}
+                  >
+                    可执行的管理员残留项一起隔离（一次授权）
                   </button>
                 )}
                 <button type="button" className="link" onClick={() => toggleGroup(group.tier)}>
@@ -642,7 +684,7 @@ export function CleanPage() {
                                     className="button-primary"
                                     disabled={!selectable || execBusy}
                                     onClick={() =>
-                                      rule.admin ? runElevated(rule) : startPlan([rule.id])
+                                      rule.admin ? runElevated([rule]) : startPlan([rule.id])
                                     }
                                     title={selectable ? undefined : "当前不能清理这一项"}
                                   >
@@ -1045,9 +1087,14 @@ function elevatedResult(state: ElevatedState) {
   return (
     <>
       {state.result.ops.map((op) => (
-        <p key={op.op} className={op.status === "failed" ? "warn" : "muted"}>
-          {op.detail}
-        </p>
+        <Fragment key={op.op}>
+          <p className={op.status === "failed" ? "warn" : "muted"}>{op.detail}</p>
+          {op.conflicts.length > 0 && (
+            <p className="muted">
+              原位置已有同名文件、因此没有还原：{op.conflicts.join("、")}
+            </p>
+          )}
+        </Fragment>
       ))}
     </>
   );
