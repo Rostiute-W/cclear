@@ -24,6 +24,8 @@
 | T15 | 系统维护操作 | M5 | |
 | T16 | junction 迁移与迁回 | M6 | |
 | T17 | README、打包、手工验收清单 | 收尾 | **D** |
+| T17a | 检查点 D 修复（上）：隔离区、提权 helper、残留适配器 | 收尾 | |
+| T17b | 检查点 D 修复（下）：工具缓存迁移、junction 迁移 | 收尾 | **D 复审** |
 
 ## agy 的执行流程（每个任务都一样）
 1. 确认原仓库干净：`git -C G:\cclear status --short` 没有输出。用 `git -C G:\cclear rev-parse HEAD` 取得完整提交号，作为 `baseCommit`。
