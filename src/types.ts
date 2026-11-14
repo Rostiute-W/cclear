@@ -444,6 +444,8 @@ export interface MigrationToolState {
   installed: boolean;
   // 改配置或验证是否需要工具本身。Gradle 不需要。
   needsProgram: boolean;
+  // 是否支持“允许重建”。Gradle 无法查询自己的缓存位置，只支持迁移。
+  supportsRebuild: boolean;
   // 需要特别注意的提示，例如 Gradle 会整体搬走 .gradle。
   warning: string | null;
 }
@@ -459,6 +461,10 @@ export interface MigrationVolume {
 export interface MigrationsState {
   tools: MigrationToolState[];
   volumes: MigrationVolume[];
+  // 迁移记录主文件不可用、退回备份时的提示。
+  storeNote: string | null;
+  // 启动恢复的结果和错误。
+  recoveryNotes: string[];
 }
 
 // 一次迁移或撤销之后的结果。
@@ -488,6 +494,7 @@ export type DirMigrationStage =
   | "awaitingUserTest"
   | "backupDeleted"
   | "done"
+  | "returning"
   | "needsAttention"
   | "returned"
   | "failed";
@@ -516,6 +523,10 @@ export interface DirMigration {
 export interface DirMigrationsState {
   records: DirMigration[];
   volumes: MigrationVolume[];
+  // 迁移记录主文件不可用、退回备份时的提示。
+  storeNote: string | null;
+  // 启动恢复的结果和错误。
+  recoveryNotes: string[];
 }
 
 // 一个目录的资格检查结果。reasons 为空表示可以迁移。

@@ -31,8 +31,17 @@ import type {
 // 清理旧目录用的临时规则不在内置规则目录里，预览里给它一个中文名。
 const OLD_CACHE_RULE_NAME = "旧缓存目录";
 
-// 迁移过的工具才谈得上撤销。
-const REVERTIBLE_STAGES = ["verified", "cleanupPlanned", "cleaned"];
+// 迁移过的工具才谈得上撤销。中断在“已记录旧配置 / 已写入新配置 / 需要处理”时也能撤销：
+// 这几种状态下旧值都还在记录里，撤销就是按旧值恢复配置。
+const REVERTIBLE_STAGES = [
+  "planned",
+  "configured",
+  "failed",
+  "needsAttention",
+  "verified",
+  "cleanupPlanned",
+  "cleaned",
+];
 
 // 目录迁移的步骤时间线，顺序和 Rust 端状态机一致。
 const DIR_STEPS: readonly [DirMigrationStage, string][] = [
@@ -225,12 +234,33 @@ export function MigratePage({
     });
   };
 
+  // 记录文件提示和启动恢复说明可能来自两个接口，去重之后一起显示。
+  const alerts = Array.from(
+    new Set(
+      [
+        state?.storeNote,
+        dirs?.storeNote,
+        ...(state?.recoveryNotes ?? []),
+        ...(dirs?.recoveryNotes ?? []),
+      ].filter((note): note is string => typeof note === "string" && note.length > 0),
+    ),
+  );
+
   return (
     <section>
       <h2>迁移</h2>
 
       {error && <p className="warn">{error}</p>}
       {message && <p className="muted">{message}</p>}
+
+      {/* 启动恢复的结果和记录文件的读取提示都要让人看得见。 */}
+      {alerts.length > 0 && (
+        <ul className="warn">
+          {alerts.map((note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
+      )}
 
       <div className="card">
         <h3>目标盘与方式</h3>
@@ -313,6 +343,11 @@ export function MigratePage({
                       </div>
                     ))}
                     {tool.warning && <div className="warn">{tool.warning}</div>}
+                    {mode === "rebuild" && !tool.supportsRebuild && (
+                      <div className="warn">
+                        {tool.label} 无法查询自己的缓存位置，只支持“迁移旧缓存”。
+                      </div>
+                    )}
                     {tool.needsProgram && !tool.installed && (
                       <div className="warn">没有在 PATH 里找到 {tool.label}，无法验证新位置。</div>
                     )}
@@ -336,7 +371,9 @@ export function MigratePage({
                           busy ||
                           planRunning ||
                           !volume ||
-                          (tool.needsProgram && !tool.installed)
+                          (tool.needsProgram && !tool.installed) ||
+                          // 不支持重建的工具（Gradle）在这里禁用，避免选了做不到的方式。
+                          (mode === "rebuild" && !tool.supportsRebuild)
                         }
                         onClick={() => onStart(tool)}
                       >
@@ -523,8 +560,11 @@ export function MigratePage({
   );
 }
 
-/// 目录迁移的步骤时间线。中断和回滚不在上面的步骤里，单独说明。
+/// 目录迁移的步骤时间线。中断、迁回和回滚不在上面的步骤里，单独说明。
 function timeline(stage: DirMigrationStage) {
+  if (stage === "returning") {
+    return <span className="muted">正在迁回：把目标里的数据复制回本机</span>;
+  }
   if (stage === "needsAttention" || stage === "failed" || stage === "returned") {
     const text =
       stage === "returned" ? "已迁回，原位置恢复成普通目录" : stage === "failed" ? "已回滚" : "需要处理";

@@ -47,6 +47,9 @@ pub struct PlanRule {
     pub items: Range<u32>,
     pub total: SizeInfo,
     pub skipped_at_build: Vec<(PathBuf, String)>,
+    /// 执行前必须确认已经退出的进程。迁移这类临时规则不在规则目录里，
+    /// 进程名只能随清单一起带过来。
+    pub processes: Vec<&'static str>,
 }
 
 /// 一次预览定下的完整清单。
@@ -108,6 +111,7 @@ pub fn build_plan(
             items: first_item..items.len() as u32,
             total,
             skipped_at_build,
+            processes: rule.processes.to_vec(),
         });
     }
 
@@ -229,6 +233,8 @@ pub fn build_plan_selected(
             items: 0..count,
             total,
             skipped_at_build: skipped,
+            // 调用方可以填上自己的进程名（迁移清理清单就这么做）。
+            processes: Vec::new(),
         }],
         items,
     }

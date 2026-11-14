@@ -9,7 +9,9 @@ use std::sync::atomic::AtomicBool;
 use cclear_core::exec::executor;
 use cclear_core::guard::{self, Forbidden};
 use cclear_core::journal::{JournalSink, Record};
-use cclear_core::migrate::junction::{BACKUP_RULE_ID, DirStage, JunctionError, JunctionMigration};
+use cclear_core::migrate::junction::{
+    BACKUP_RULE_ID, DirMigration, DirStage, JunctionError, JunctionMigration,
+};
 use cclear_core::model::KnownRoot;
 use cclear_core::plan::FrozenPlan;
 use cclear_core::rules::resolve::RootMap;
@@ -104,6 +106,60 @@ fn create_junction(link: &Path, target: &Path) {
         "创建 junction 失败：{}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+/// 只删掉 junction 本身。`rmdir` 不会跟着链接删目标里的内容。
+fn remove_junction_link(link: &Path) {
+    let output = Command::new("cmd")
+        .args(["/c", "rmdir"])
+        .arg(link)
+        .output()
+        .expect("启动 cmd 失败");
+
+    assert!(
+        output.status.success(),
+        "删除 junction 失败：{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// 递归复制目录内容，模拟“迁回已经复制完、还没改名”的那一刻。
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// 把迁移记录改成指定阶段，模拟进程在那一刻被结束。
+fn write_stage(fixture: &Fixture, record: &DirMigration, stage: &str, note: &str) {
+    let store = serde_json::json!({
+        "directories": [{
+            "id": record.id,
+            "source": record.source,
+            "target": record.target,
+            "backup": record.backup,
+            "stage": stage,
+            "note": note,
+            "verified": record.verified,
+            "updatedAt": record.updated_at,
+        }],
+    });
+
+    let dir = fixture.temp.path().join("store");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("migrations.json"),
+        serde_json::to_string_pretty(&store).unwrap(),
+    )
+    .unwrap();
 }
 
 /// 原路径现在是 junction，并且指向 `expect`。
@@ -276,8 +332,9 @@ fn recovers_interrupted_rename() {
 
     // 恢复：把源改回原名，并删掉目标副本。
     let recovered = migration.recover_pending(&mut journal).unwrap();
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].stage, DirStage::Failed);
+    assert!(recovered.failures.is_empty(), "恢复不该失败");
+    assert_eq!(recovered.recovered.len(), 1);
+    assert_eq!(recovered.recovered[0].stage, DirStage::Failed);
 
     assert_eq!(fs::read_to_string(source.join("a.txt")).unwrap(), "a");
     assert!(
@@ -286,4 +343,211 @@ fn recovers_interrupted_rename() {
         record.target_path().display()
     );
     assert!(!record.backup_path().exists(), "备份目录应当已经改回原名");
+}
+
+#[test]
+fn returns_after_backup_deleted() {
+    let fixture = Fixture::new();
+    let source = fixture.data_dir();
+    let migration = fixture.migration();
+    let mut journal = MemoryJournal::default();
+
+    // 走完整条迁移，把备份也删掉，状态变成完成。
+    let record = migration.start(&source, TEST_VOLUME, &mut journal).unwrap();
+    let plan = migration.backup_plan(&record.id).unwrap();
+    run_plan(&plan);
+    let done = migration.finish_backup(&record.id, &mut journal).unwrap();
+    assert_eq!(done.stage, DirStage::Done);
+    assert!(!record.backup_path().exists());
+
+    // 备份删掉之后链接仍然是活的，迁回照样要能用。
+    let returned = migration.return_home(&record.id, &mut journal).unwrap();
+    assert_eq!(returned.stage, DirStage::Returned);
+
+    assert!(
+        dirinfo::is_plain_dir(&source),
+        "迁回之后原位置应当是普通目录"
+    );
+    assert_eq!(fs::read_to_string(source.join("a.txt")).unwrap(), "a");
+    assert_eq!(
+        fs::read_to_string(source.join("sub").join("b.txt")).unwrap(),
+        "b"
+    );
+}
+
+#[test]
+fn recovers_interrupted_verified_and_returning() {
+    let fixture = Fixture::new();
+    let mut journal = MemoryJournal::default();
+
+    // 一、停在“复制完成并校验”：目标副本已经写好，源目录还没动。
+    let source = fixture.data_dir();
+    let stopping = fixture.migration().with_stop_at(DirStage::Verified);
+    let error = stopping
+        .start(&source, TEST_VOLUME, &mut journal)
+        .unwrap_err();
+    assert!(
+        matches!(error, JunctionError::Interrupted),
+        "应当停在注入的断点上，实际：{error:?}"
+    );
+
+    let verified = stopping.get(&stopping.list().unwrap()[0].id).unwrap();
+    assert_eq!(verified.stage, DirStage::Verified);
+    assert!(verified.target_path().exists(), "这时目标副本已经写好");
+
+    // 重新打开之后按“复制阶段中断”处理：删掉目标副本，源目录完好，可以重新迁移。
+    let reopened = fixture.migration();
+    let recovered = reopened.recover_pending(&mut journal).unwrap();
+    assert!(recovered.failures.is_empty(), "恢复不该失败");
+    assert_eq!(recovered.recovered.len(), 1);
+    assert_eq!(recovered.recovered[0].stage, DirStage::Failed);
+    assert_eq!(fs::read_to_string(source.join("a.txt")).unwrap(), "a");
+    assert!(
+        !verified.target_path().exists(),
+        "目标副本应当已经删除：{}",
+        verified.target_path().display()
+    );
+
+    // 二、停在迁回开始：链接还在，只是“正在迁回”已经落盘。
+    let second = fixture.profile.join("data2");
+    fs::create_dir_all(&second).unwrap();
+    fs::write(second.join("c.txt"), "c").unwrap();
+
+    let started = reopened.start(&second, TEST_VOLUME, &mut journal).unwrap();
+    assert_eq!(started.stage, DirStage::AwaitingUserTest);
+
+    let returning = fixture.migration().with_stop_at(DirStage::Returning);
+    let error = returning
+        .return_home(&started.id, &mut journal)
+        .unwrap_err();
+    assert!(
+        matches!(error, JunctionError::Interrupted),
+        "应当停在注入的断点上，实际：{error:?}"
+    );
+    assert_eq!(
+        fixture.migration().get(&started.id).unwrap().stage,
+        DirStage::Returning
+    );
+
+    // 重新打开：原位置还是 junction，删掉临时目录就回到迁回之前的状态。
+    let recovered = fixture.migration().recover_pending(&mut journal).unwrap();
+    assert!(recovered.failures.is_empty(), "恢复不该失败");
+    assert_eq!(recovered.recovered.len(), 1);
+    assert_eq!(recovered.recovered[0].id, started.id);
+    assert_eq!(recovered.recovered[0].stage, DirStage::AwaitingUserTest);
+
+    assert_points_to(&second, &started.target_path());
+    assert_eq!(fs::read_to_string(second.join("c.txt")).unwrap(), "c");
+
+    // 三、停在“链接已删、临时目录完整”：恢复要把临时目录改名回原名，记为已迁回。
+    let third = fixture.profile.join("data3");
+    fs::create_dir_all(third.join("sub")).unwrap();
+    fs::write(third.join("d.txt"), "d").unwrap();
+    fs::write(third.join("sub").join("e.txt"), "e").unwrap();
+
+    let started = fixture
+        .migration()
+        .start(&third, TEST_VOLUME, &mut journal)
+        .unwrap();
+    let temp = started.return_temp_path();
+    copy_tree(&started.target_path(), &temp);
+
+    // 删掉链接本身（`rmdir` 只删 junction，不碰目标里的数据）。
+    remove_junction_link(&third);
+    assert!(!third.exists(), "原位置这时是空的");
+    assert!(dirinfo::is_plain_dir(&temp), "临时目录里还有子目录");
+
+    write_stage(
+        &fixture,
+        &started,
+        "returning",
+        "测试注入：复制完成、改名之前被中断",
+    );
+
+    let recovered = fixture.migration().recover_pending(&mut journal).unwrap();
+    assert!(recovered.failures.is_empty(), "恢复不该失败");
+    assert_eq!(recovered.recovered.len(), 1);
+    assert_eq!(recovered.recovered[0].stage, DirStage::Returned);
+    assert!(
+        dirinfo::is_plain_dir(&third),
+        "恢复应当把临时目录改名回原名"
+    );
+    assert_eq!(fs::read_to_string(third.join("d.txt")).unwrap(), "d");
+    assert_eq!(
+        fs::read_to_string(third.join("sub").join("e.txt")).unwrap(),
+        "e",
+        "含子目录的临时目录也应当被认作完整"
+    );
+    assert!(!temp.exists(), "改名之后临时目录应当不在了");
+}
+
+#[test]
+fn preserves_empty_directories() {
+    let fixture = Fixture::new();
+    let migration = fixture.migration();
+    let mut journal = MemoryJournal::default();
+
+    // 源里有多层空目录，还有一个普通文件。
+    let source = fixture.profile.join("data-empty");
+    fs::create_dir_all(source.join("empty").join("nested")).unwrap();
+    fs::create_dir_all(source.join("other")).unwrap();
+    fs::write(source.join("keep.txt"), "k").unwrap();
+
+    let record = migration.start(&source, TEST_VOLUME, &mut journal).unwrap();
+    let target = record.target_path();
+    assert!(
+        target.join("empty").join("nested").is_dir(),
+        "迁移之后目标里也要有空目录"
+    );
+
+    // 删备份，再迁回。
+    let plan = migration.backup_plan(&record.id).unwrap();
+    run_plan(&plan);
+    migration.finish_backup(&record.id, &mut journal).unwrap();
+
+    let returned = migration.return_home(&record.id, &mut journal).unwrap();
+    assert_eq!(returned.stage, DirStage::Returned);
+
+    assert!(
+        dirinfo::is_plain_dir(&source.join("empty").join("nested")),
+        "迁回之后多层空目录都应当还在"
+    );
+    assert!(dirinfo::is_plain_dir(&source.join("other")));
+    assert_eq!(fs::read_to_string(source.join("keep.txt")).unwrap(), "k");
+}
+
+#[test]
+fn return_copy_failure_cleans_temp_dir() {
+    let fixture = Fixture::new();
+    let source = fixture.data_dir();
+    let migration = fixture.migration();
+    let mut journal = MemoryJournal::default();
+
+    let record = migration.start(&source, TEST_VOLUME, &mut journal).unwrap();
+    let target = record.target_path();
+
+    // 迁回临时目录里先放一个同名文件：复制到它时必然失败。
+    let returning = source.with_file_name(format!("data.cclear-return-{}", record.id));
+    fs::create_dir_all(&returning).unwrap();
+    fs::write(returning.join("a.txt"), "占位").unwrap();
+
+    let error = migration.return_home(&record.id, &mut journal).unwrap_err();
+    assert!(
+        matches!(error, JunctionError::Copy(_)),
+        "应当是复制失败，实际：{error:?}"
+    );
+
+    // 临时目录被删掉，链接和目标数据都没动，状态回到迁回之前。
+    assert!(!returning.exists(), "临时目录应当被删除");
+    assert_points_to(&source, &target);
+    assert_eq!(fs::read_to_string(source.join("a.txt")).unwrap(), "a");
+    assert_eq!(fs::read_to_string(target.join("a.txt")).unwrap(), "a");
+
+    let after = migration.get(&record.id).unwrap();
+    assert_eq!(after.stage, DirStage::AwaitingUserTest);
+    assert!(
+        after.note.contains("迁回"),
+        "说明里要写清迁回没有完成：{}",
+        after.note
+    );
 }

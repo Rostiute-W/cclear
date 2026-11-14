@@ -269,6 +269,8 @@ pub fn replace_in_dir(
 ///
 /// 不带 `REPLACE_IF_EXISTS`：目标已经存在时由系统直接拒绝，绝不覆盖已有目录。
 /// 迁移把源目录改名成备份名时用它，所以改名之前先按预览时记下的身份复核一次。
+/// 杀毒软件和索引服务会短暂锁住刚被写过的目录，共享冲突和拒绝访问按 200/500/1000 毫秒
+/// 退避重试，最多重试 3 次（plan-final 第 7 节）。
 pub fn rename_child(
     parent: &DirHandle,
     from: &OsStr,
@@ -278,6 +280,28 @@ pub fn rename_child(
     validate_component(from)?;
     validate_component(to)?;
 
+    for wait in [200, 500, 1000] {
+        match rename_once(parent, from, to, expect) {
+            Ok(()) => return Ok(()),
+            Err(GuardError::Locked | GuardError::Denied) => {
+                std::thread::sleep(std::time::Duration::from_millis(wait));
+            }
+            // 其余错误重试也不会变好，直接报给调用方。
+            Err(error) => return Err(error),
+        }
+    }
+
+    // 重试用完还失败就报最后一次的结果，不再无限等下去。
+    rename_once(parent, from, to, expect)
+}
+
+/// 一次改名：先按身份复核打开的那个条目，再在它的句柄上执行改名。
+fn rename_once(
+    parent: &DirHandle,
+    from: &OsStr,
+    to: &OsStr,
+    expect: &Expect,
+) -> Result<(), GuardError> {
     let entry = open_component(&parent.handle, from, Role::Delete, &parent.path.join(from))?;
     if entry.identity != expect.identity {
         return Err(GuardError::Changed);
