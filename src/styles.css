@@ -361,3 +361,105 @@ button:disabled {
   background: transparent;
   text-decoration: underline;
 }
+
+.group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.group-header h3 {
+  margin: 0;
+}
+
+.status-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid #d0d5dc;
+  border-radius: 10px;
+  color: #4a525c;
+  background: #f2f4f7;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.status-ready {
+  border-color: #9fd3b0;
+  color: #1a6b3c;
+  background: #e8f6ee;
+}
+
+.status-processRunning {
+  border-color: #f0c36d;
+  color: #8a5a00;
+  background: #fdf5e3;
+}
+
+.status-forbidden {
+  border-color: #e0a19a;
+  color: #a4341c;
+  background: #fbeeec;
+}
+
+.sub-row td {
+  background: #fbfcfd;
+}
+
+.sample-list,
+.locker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sample-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.path-text {
+  max-width: 860px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.env-group {
+  margin: 12px 0 4px;
+  color: #67707b;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.env-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 2px 0;
+}
+
+.env-name {
+  min-width: 88px;
+  color: #4a525c;
+}
+
+.env-path {
+  max-width: 720px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.env-drive {
+  color: #67707b;
+  font-size: 12px;
+}
+
+.env-drive-c {
+  color: #a4341c;
+}

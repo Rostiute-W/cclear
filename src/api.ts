@@ -4,7 +4,9 @@ import type {
   AppInfo,
   CandidateInfo,
   DirNode,
+  EnvState,
   FileEntry,
+  LockReport,
   RuleInfo,
   ScanProgress,
   ScanRoot,
@@ -16,12 +18,28 @@ export function appInfo(): Promise<AppInfo> {
   return invoke<AppInfo>("app_info");
 }
 
+export function envState(): Promise<EnvState> {
+  return invoke<EnvState>("env_state");
+}
+
 export function rulesCatalog(): Promise<RuleInfo[]> {
   return invoke<RuleInfo[]>("rules_catalog");
 }
 
 export function rulesEvaluate(): Promise<CandidateInfo[]> {
   return invoke<CandidateInfo[]>("rules_evaluate");
+}
+
+// 只传规则 ID：路径由后端按规则重新解析。
+export function candidateLocks(ruleId: string): Promise<LockReport> {
+  return invoke<LockReport>("candidate_locks", { ruleId });
+}
+
+export function openCandidateInExplorer(
+  ruleId: string,
+  sampleIndex: number | null,
+): Promise<void> {
+  return invoke<void>("open_candidate_in_explorer", { ruleId, sampleIndex });
 }
 
 export function volumeInfo(): Promise<VolumeInfo[]> {

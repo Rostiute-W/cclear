@@ -2,6 +2,8 @@
 
 pub mod dirinfo;
 pub mod process;
+pub mod registry;
+pub mod restart_manager;
 pub mod volume;
 
 use std::path::{Path, PathBuf};
@@ -12,9 +14,10 @@ use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::{
-    FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_LocalAppData, FOLDERID_Profile,
-    FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_RoamingAppData,
-    FOLDERID_SkyDrive, FOLDERID_Windows, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
+    FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_LocalAppData,
+    FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
+    FOLDERID_ProgramFilesX86, FOLDERID_RoamingAppData, FOLDERID_SkyDrive, FOLDERID_Videos,
+    FOLDERID_Windows, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
 };
 use windows::core::GUID;
 
@@ -24,8 +27,11 @@ pub enum KnownFolder {
     LocalAppData,
     RoamingAppData,
     Profile,
+    Desktop,
     Documents,
     Downloads,
+    Pictures,
+    Videos,
     ProgramData,
     Windows,
     ProgramFiles,
@@ -39,8 +45,11 @@ impl KnownFolder {
             KnownFolder::LocalAppData => FOLDERID_LocalAppData,
             KnownFolder::RoamingAppData => FOLDERID_RoamingAppData,
             KnownFolder::Profile => FOLDERID_Profile,
+            KnownFolder::Desktop => FOLDERID_Desktop,
             KnownFolder::Documents => FOLDERID_Documents,
             KnownFolder::Downloads => FOLDERID_Downloads,
+            KnownFolder::Pictures => FOLDERID_Pictures,
+            KnownFolder::Videos => FOLDERID_Videos,
             KnownFolder::ProgramData => FOLDERID_ProgramData,
             KnownFolder::Windows => FOLDERID_Windows,
             KnownFolder::ProgramFiles => FOLDERID_ProgramFiles,

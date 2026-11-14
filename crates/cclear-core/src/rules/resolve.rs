@@ -13,10 +13,14 @@ use crate::rules::catalog::{ENABLED_PHASES, Rule, SelectKind, Selector, Target};
 use crate::rules::forbidden;
 use crate::scan::{EntryInfo, FileFilter, ScanOptions, ScanProgress, scan};
 use crate::win::process::ProcInfo;
+use crate::win::restart_manager::{LockReport, query_lockers};
 use crate::win::{KnownFolder, dirinfo, known_folder};
 
 /// 候选展示的样例路径条数上限。
 const SAMPLE_LIMIT: usize = 20;
+
+/// 每个候选最多检查占用的文件数。占用检查只为给出证据，不必查全部文件。
+const LOCK_CHECK_LIMIT: usize = 256;
 
 /// FILETIME 的计时单位是 100 纳秒。
 const TICKS_PER_SECOND: u64 = 10_000_000;
@@ -251,6 +255,73 @@ pub fn evaluate(rule: &Rule, roots: &RootMap, procs: &[ProcInfo], now: SystemTim
     candidate
 }
 
+/// 候选的样例路径：占盘最大的前 `SAMPLE_LIMIT` 个文件。
+///
+/// 界面上的样例序号就是这里的下标，打开样例时按同一套统计重算才能对上。
+pub fn sample_paths(rule: &Rule, roots: &RootMap, now: SystemTime) -> Vec<PathBuf> {
+    let (_, samples) = measure(&resolve_anchors(rule, roots), &selector_of(rule), now);
+
+    samples
+}
+
+/// 对候选做占用检查：查询占盘最大的前 `LOCK_CHECK_LIMIT` 个文件。
+///
+/// 检查的文件比候选的文件总数少时，结果同样不完整：没查过的文件不能当成没有占用。
+pub fn check_locks(rule: &Rule, roots: &RootMap, now: SystemTime) -> LockReport {
+    let files = lock_files(rule, roots, now);
+    let mut report = query_lockers(&files.largest);
+
+    report.total = files.total;
+    if report.checked < report.total {
+        report.complete = false;
+        if report.error.is_none() {
+            report.error = Some(format!(
+                "只检查了占盘最大的 {} 个文件（共 {} 个）",
+                report.checked, report.total
+            ));
+        }
+    }
+
+    report
+}
+
+/// 要检查占用的文件，以及候选的文件总数。
+struct LockFiles {
+    largest: Vec<PathBuf>,
+    total: usize,
+}
+
+/// 按选择器挑出候选的文件，再取占盘最大的若干个。
+fn lock_files(rule: &Rule, roots: &RootMap, now: SystemTime) -> LockFiles {
+    let selector = selector_of(rule);
+    let dirs = collect_all(&resolve_anchors(rule, roots), &selector);
+
+    let allowed = if needs_selection(&selector) {
+        Some(allowed_ids(&dirs, &selector, now))
+    } else {
+        None
+    };
+    let mut files: Vec<&ScannedFile> = dirs
+        .iter()
+        .flat_map(|dir| dir.files.iter())
+        .filter(|file| {
+            allowed
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(&file.id))
+        })
+        .collect();
+    files.sort_by_key(|file| std::cmp::Reverse(file.allocated));
+
+    LockFiles {
+        total: files.len(),
+        largest: files
+            .into_iter()
+            .take(LOCK_CHECK_LIMIT)
+            .map(|file| file.path.clone())
+            .collect(),
+    }
+}
+
 /// 从 `Local State` 的 `profile.info_cache` 读出 Profile 目录名。读不到就当没有 Profile。
 fn chromium_profiles(user_data: &Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(user_data.join("Local State")) else {
@@ -330,29 +401,38 @@ fn measure(anchors: &[PathBuf], selector: &Selector, now: SystemTime) -> (SizeIn
 /// 选择器需要逐文件判断时（限制层级或按时间筛选），先枚举锚点得到允许的文件 ID 集合，
 /// 再用 `file_filter` 只放行这些文件。
 fn build_filter(anchors: &[PathBuf], selector: &Selector, now: SystemTime) -> Option<FileFilter> {
-    let needs_selection = !matches!(selector.kind, SelectKind::AllContents)
-        || selector.min_age_hours.is_some()
-        || selector.exclude_newest_per_dir;
-    if !needs_selection {
+    if !needs_selection(selector) {
         return None;
     }
 
-    let allowed = allowed_files(anchors, selector, now);
+    let allowed = allowed_ids(&collect_all(anchors, selector), selector, now);
     Some(Arc::new(move |entry: &EntryInfo| {
         allowed.contains(&entry.file_id)
     }))
 }
 
-/// 计算本次允许统计的文件 ID 集合。
-fn allowed_files(anchors: &[PathBuf], selector: &Selector, now: SystemTime) -> HashSet<u128> {
-    let now = system_time_ticks(now);
+/// 选择器是否需要逐文件筛选：限制层级、按时间筛选或者保留最新一个。
+fn needs_selection(selector: &Selector) -> bool {
+    !matches!(selector.kind, SelectKind::AllContents)
+        || selector.min_age_hours.is_some()
+        || selector.exclude_newest_per_dir
+}
+
+/// 枚举锚点子树，保留每个目录里的文件列表。
+fn collect_all(anchors: &[PathBuf], selector: &Selector) -> Vec<DirFiles> {
     let mut dirs = Vec::new();
     for anchor in anchors {
         collect_dirs(anchor, true, selector, &mut dirs);
     }
 
+    dirs
+}
+
+/// 计算本次允许统计的文件 ID 集合。
+fn allowed_ids(dirs: &[DirFiles], selector: &Selector, now: SystemTime) -> HashSet<u128> {
+    let now = system_time_ticks(now);
     let mut allowed = HashSet::new();
-    for dir in &dirs {
+    for dir in dirs {
         for file in &dir.files {
             if let Some(hours) = selector.min_age_hours
                 && age_hours(file.creation_time, file.last_write_time, now) < u64::from(hours)
@@ -364,7 +444,7 @@ fn allowed_files(anchors: &[PathBuf], selector: &Selector, now: SystemTime) -> H
     }
 
     if selector.exclude_newest_per_dir {
-        for dir in &dirs {
+        for dir in dirs {
             let Some(newest) = dir.files.iter().map(|file| file.last_write_time).max() else {
                 continue;
             };
@@ -412,7 +492,9 @@ fn keep_anchor_file(selector: &Selector, name: &OsString) -> bool {
 
 /// 枚举目录树时看到的文件。
 struct ScannedFile {
+    path: PathBuf,
     id: u128,
+    allocated: u64,
     creation_time: u64,
     last_write_time: u64,
 }
@@ -449,7 +531,9 @@ fn collect_dirs(dir: &Path, is_anchor: bool, selector: &Selector, dirs: &mut Vec
         }
 
         current.files.push(ScannedFile {
+            path: dir.join(&entry.name),
             id: entry.file_id,
+            allocated: entry.allocated,
             creation_time: entry.creation_time,
             last_write_time: entry.last_write_time,
         });
