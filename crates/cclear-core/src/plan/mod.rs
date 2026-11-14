@@ -10,13 +10,14 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::error::{CoreError, Result};
-use crate::guard::{self, DirHandle, Forbidden};
+use crate::guard::{self, DirHandle, Forbidden, OpenIntent};
 use crate::model::{FileIdentity, Recovery, SizeInfo};
-use crate::rules::catalog::{Rule, SelectKind, Selector, Target};
+use crate::rules::adapters::{self, SystemVersionProbe};
+use crate::rules::catalog::{AdapterId, Rule, SelectKind, Selector, Target};
 use crate::rules::forbidden as rules_forbidden;
 use crate::rules::resolve::{
-    RootMap, age_hours, descend_into, is_excluded_child_dir, keep_anchor_file, resolve_anchors,
-    selector_of, system_time_ticks,
+    CandidateStatus, RootMap, age_hours, descend_into, is_excluded_child_dir, keep_anchor_file,
+    resolve_anchors, selector_of, system_time_ticks,
 };
 use crate::scan::{FileCount, classify_file};
 use crate::win::dirinfo::EntryInfo;
@@ -74,42 +75,31 @@ pub fn build_plan(
         }
 
         let first_item = items.len() as u32;
-        let anchors = resolve_anchors(rule, roots);
-        let selector = selector_of(rule);
         let mut skipped_at_build: Vec<(PathBuf, String)> = Vec::new();
         let mut total = SizeInfo::default();
         // 硬链接的多个名字只进清单一次，和 resolve 的去重口径一致。
         let mut seen: HashSet<FileIdentity> = HashSet::new();
 
-        for (index, anchor_path) in anchors.iter().enumerate() {
-            let anchor = match guard::open_anchor(anchor_path, forbidden) {
-                Ok(anchor) => anchor,
-                Err(error) => {
-                    skipped_at_build.push((anchor_path.clone(), error.to_string()));
-                    continue;
-                }
-            };
-
-            let mut walker = Walker {
-                anchor: &anchor,
-                anchor_path,
-                // 锚点数量远小于 u16 上限，真实规则最多几十个。
-                anchor_index: index as u16,
-                volume_serial: anchor.identity().volume_serial,
-                selector,
-                forbidden,
-                procs,
-                now_ticks,
-                seen: &mut seen,
+        let anchors = {
+            let mut state = PlanBuildState {
                 items: &mut items,
                 skipped: &mut skipped_at_build,
                 total: &mut total,
-                rule_id: rule.id,
+                seen: &mut seen,
             };
 
-            let mut rel = Vec::new();
-            walker.walk(&mut rel, None);
-        }
+            match &rule.target {
+                // 适配器规则的候选由适配器按证据给出，不走路径模板。
+                Target::Adapter(id) => {
+                    expand_adapter(rule, *id, roots, forbidden, procs, now, &mut state)
+                }
+                _ => {
+                    let anchors = resolve_anchors(rule, roots);
+                    walk_anchors(&anchors, rule, forbidden, procs, now_ticks, &mut state);
+                    anchors
+                }
+            }
+        };
 
         plan_rules.push(PlanRule {
             rule_id: rule.id,
@@ -129,6 +119,186 @@ pub fn build_plan(
     })
 }
 
+/// 生成一条规则的条目时共用的可变状态。
+struct PlanBuildState<'a> {
+    items: &'a mut Vec<FrozenItem>,
+    skipped: &'a mut Vec<(PathBuf, String)>,
+    total: &'a mut SizeInfo,
+    seen: &'a mut HashSet<FileIdentity>,
+}
+
+/// 按路径模板的锚点逐棵遍历，把条目收进清单。
+fn walk_anchors(
+    anchors: &[PathBuf],
+    rule: &Rule,
+    forbidden: &Forbidden,
+    procs: &[ProcInfo],
+    now_ticks: u64,
+    state: &mut PlanBuildState,
+) {
+    let PlanBuildState {
+        items,
+        skipped,
+        total,
+        seen,
+    } = state;
+    let selector = selector_of(rule);
+
+    for (index, anchor_path) in anchors.iter().enumerate() {
+        let anchor = match guard::open_anchor(anchor_path, forbidden) {
+            Ok(anchor) => anchor,
+            Err(error) => {
+                skipped.push((anchor_path.clone(), error.to_string()));
+                continue;
+            }
+        };
+
+        let mut walker = Walker {
+            anchor: &anchor,
+            anchor_path,
+            // 锚点数量远小于 u16 上限，真实规则最多几十个。
+            anchor_index: index as u16,
+            volume_serial: anchor.identity().volume_serial,
+            selector,
+            keep_dirs: true,
+            forbidden,
+            procs,
+            now_ticks,
+            seen,
+            items,
+            skipped,
+            total,
+            rule_id: rule.id,
+        };
+
+        let mut rel = Vec::new();
+        walker.walk(&mut rel, None);
+    }
+}
+
+/// 适配器规则：把适配器给出的条目展开成冻结清单。
+///
+/// 目录展开成整棵子树。隔离引擎只复制文件，所以子树里的目录不进清单，只收文件；
+/// 文件都隔离之后留下的空目录不在这里处理，也不退回去直接删除。
+fn expand_adapter(
+    rule: &Rule,
+    id: AdapterId,
+    roots: &RootMap,
+    forbidden: &Forbidden,
+    procs: &[ProcInfo],
+    now: SystemTime,
+    state: &mut PlanBuildState,
+) -> Vec<PathBuf> {
+    let PlanBuildState {
+        items,
+        skipped,
+        total,
+        seen,
+    } = state;
+    let now_ticks = system_time_ticks(now);
+
+    // 预览和执行之间状态可能已经变了，这时一个条目都不生成。
+    let result = adapters::evaluate_adapter(id, roots, procs, &SystemVersionProbe, now);
+    if result.status != CandidateStatus::Ready {
+        skipped.push((
+            PathBuf::new(),
+            format!(
+                "证据不足，没有生成条目：{}",
+                result.status.detail().unwrap_or_default()
+            ),
+        ));
+        return Vec::new();
+    }
+
+    let mut anchors: Vec<PathBuf> = Vec::new();
+
+    for item in &result.items {
+        let anchor_index = match anchors
+            .iter()
+            .position(|known| same_path(known, &item.anchor))
+        {
+            Some(index) => index,
+            None => {
+                anchors.push(item.anchor.clone());
+                anchors.len() - 1
+            }
+        };
+
+        let anchor = match guard::open_anchor(&item.anchor, forbidden) {
+            Ok(anchor) => anchor,
+            Err(error) => {
+                skipped.push((item.anchor.clone(), error.to_string()));
+                continue;
+            }
+        };
+
+        if item.is_dir {
+            let mut walker = Walker {
+                anchor: &anchor,
+                anchor_path: &item.anchor,
+                anchor_index: anchor_index as u16,
+                volume_serial: anchor.identity().volume_serial,
+                selector: selector_of(rule),
+                keep_dirs: false,
+                forbidden,
+                procs,
+                now_ticks,
+                seen,
+                items,
+                skipped,
+                total,
+                rule_id: rule.id,
+            };
+
+            let mut rel = item.rel.clone();
+            walker.walk(&mut rel, None);
+            continue;
+        }
+
+        // 单个文件：按条目打开一次，确认它确实是普通文件再进清单。
+        let entry = match guard::open_rel(&anchor, &item.rel, OpenIntent::Inspect, forbidden) {
+            Ok(entry) => entry,
+            Err(error) => {
+                skipped.push((join_all(&item.anchor, &item.rel), error.to_string()));
+                continue;
+            }
+        };
+        if entry.is_dir {
+            skipped.push((
+                join_all(&item.anchor, &item.rel),
+                "条目实际是目录，已跳过".to_string(),
+            ));
+            continue;
+        }
+        if !seen.insert(entry.identity) {
+            continue;
+        }
+
+        items.push(FrozenItem {
+            item_id: items.len() as u32,
+            rule_id: rule.id,
+            anchor_index: anchor_index as u16,
+            rel: item.rel.clone(),
+            is_dir: false,
+            identity: entry.identity,
+            size: entry.size,
+            allocated: entry.allocated,
+            mtime: entry.mtime,
+        });
+
+        total.logical += entry.size;
+        total.allocated += entry.allocated;
+        total.files += 1;
+    }
+
+    anchors
+}
+
+/// 两个路径是否相同。Windows 路径不区分大小写。
+fn same_path(left: &Path, right: &Path) -> bool {
+    crate::win::equals_ignore_case(&left.to_string_lossy(), &right.to_string_lossy())
+}
+
 /// 只有文件类规则能生成清单：命令、特殊和系统操作各有自己的任务。
 ///
 /// 隔离类规则也走冻结清单，只是执行时交给隔离引擎，而不是逐项删除。
@@ -139,7 +309,7 @@ fn plannable(rule: &Rule) -> bool {
     );
     let target_ok = matches!(
         rule.target,
-        Target::Paths { .. } | Target::ChromiumProfiles { .. }
+        Target::Paths { .. } | Target::ChromiumProfiles { .. } | Target::Adapter(_)
     );
 
     recovery_ok && target_ok
@@ -157,6 +327,8 @@ struct Walker<'a> {
     anchor_index: u16,
     volume_serial: u64,
     selector: Selector,
+    /// 子目录是否也进清单。适配器展开的子树只收文件，目录交给用户自己处理。
+    keep_dirs: bool,
     forbidden: &'a Forbidden,
     procs: &'a [ProcInfo],
     now_ticks: u64,
@@ -290,7 +462,8 @@ impl Walker<'_> {
 
         // 目录按后序进清单：子项先处理完，父目录才不会因为还有计划内条目而留下。
         // TopFiles 只收锚点直属的文件，一个目录都不进清单。
-        if let Some(own) = own
+        if self.keep_dirs
+            && let Some(own) = own
             && matches!(
                 self.selector.kind,
                 SelectKind::AllContents | SelectKind::ChildDirs(_)

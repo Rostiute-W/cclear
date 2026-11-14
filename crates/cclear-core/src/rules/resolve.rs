@@ -1,14 +1,16 @@
 //! 路径模板的候选解析：解析锚点、统计大小、判断状态。
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{CoreError, Result};
 use crate::model::{FileIdentity, KnownRoot, Phase, SizeInfo, Tier};
+use crate::rules::adapters::{self, LeftoverItem, SystemVersionProbe};
 use crate::rules::catalog::{
-    CommandId, ENABLED_PHASES, Rule, SelectKind, Selector, Target, catalog,
+    AdapterId, CommandId, ENABLED_PHASES, Rule, SelectKind, Selector, Target, catalog,
 };
 use crate::rules::commands::{self, CommandCheck};
 use crate::rules::forbidden;
@@ -141,14 +143,27 @@ pub struct Candidate {
     pub size: SizeInfo,
     /// 按大小降序，最多 `SAMPLE_LIMIT` 个。
     pub samples: Vec<PathBuf>,
+    /// 判定依据，一条一个条目。适配器规则用它向用户说明为什么选中这些目录。
+    pub evidence: Vec<String>,
+    /// 没有选中某些项的原因，例如“比当前运行时新的安装目录本次不选”。
+    pub notes: Vec<String>,
     pub executable: bool,
 }
 
 /// 解析规则锚点：只返回实际存在的目录。
 ///
-/// 命令、适配器、特殊和系统操作没有可删除的锚点，返回空；命令类规则的
+/// 命令、特殊和系统操作没有可删除的锚点，返回空；命令类规则的
 /// 缓存路径单独由 `rules::commands` 查询，不参与按清单执行。
 pub fn resolve_anchors(rule: &Rule, roots: &RootMap) -> Vec<PathBuf> {
+    // 适配器规则没有路径模板，锚点就是适配器给出的条目。
+    // 这里只用于展示和打开位置，时间取当前时刻即可。
+    if let Target::Adapter(id) = &rule.target {
+        return adapter_items(*id, roots, SystemTime::now())
+            .iter()
+            .map(leftover_path)
+            .collect();
+    }
+
     match &rule.target {
         Target::Paths { root, rels, .. } => {
             let Some(base) = roots.get(*root) else {
@@ -199,6 +214,7 @@ pub fn resolve_anchors(rule: &Rule, roots: &RootMap) -> Vec<PathBuf> {
 
             anchors
         }
+        // 适配器规则在上面已经提前返回。
         Target::Adapter(_) | Target::Command(_) | Target::Special(_) | Target::System(_) => {
             Vec::new()
         }
@@ -242,20 +258,24 @@ fn evaluate_with_checks(
         return evaluate_command(rule, *id, checks.and_then(|checks| checks.get(*id)));
     }
 
+    // 多版本残留的候选由适配器按证据给出，不走路径模板。
+    if let Target::Adapter(id) = &rule.target {
+        return evaluate_adapter_rule(rule, *id, roots, procs, now);
+    }
+
     let mut candidate = Candidate {
         rule_id: rule.id,
         status: CandidateStatus::NotPresent,
         anchors: Vec::new(),
         size: SizeInfo::default(),
         samples: Vec::new(),
+        evidence: Vec::new(),
+        notes: Vec::new(),
         executable: false,
     };
 
     // 这些目标的具体逻辑属于后续任务，现在只能报“阶段未开放”。
-    if matches!(
-        rule.target,
-        Target::Adapter(_) | Target::Special(_) | Target::System(_)
-    ) {
+    if matches!(rule.target, Target::Special(_) | Target::System(_)) {
         candidate.status = CandidateStatus::PhaseLocked(rule.phase);
         return candidate;
     }
@@ -301,6 +321,193 @@ fn evaluate_with_checks(
     candidate
 }
 
+/// 适配器规则的评估：判定交给适配器，这里只把结果整理成候选。
+///
+/// 进程和证据由适配器自己判断，所以这里不再跑通用的进程检查；条目路径由适配器
+/// 在 Known Folder 下拼出，生成清单和执行时还会各过一遍路径护栏。
+fn evaluate_adapter_rule(
+    rule: &Rule,
+    id: AdapterId,
+    roots: &RootMap,
+    procs: &[ProcInfo],
+    now: SystemTime,
+) -> Candidate {
+    let mut candidate = Candidate {
+        rule_id: rule.id,
+        status: CandidateStatus::NotPresent,
+        anchors: Vec::new(),
+        size: SizeInfo::default(),
+        samples: Vec::new(),
+        evidence: Vec::new(),
+        notes: Vec::new(),
+        executable: false,
+    };
+
+    // manual 的分析类适配器不受阶段限制，其余适配器按开放阶段判断。
+    if rule.tier != Tier::Manual && !ENABLED_PHASES.contains(&rule.phase) {
+        candidate.status = CandidateStatus::PhaseLocked(rule.phase);
+        return candidate;
+    }
+
+    let result = adapters::evaluate_adapter(id, roots, procs, &SystemVersionProbe, now);
+    candidate.status = result.status;
+    candidate.notes = result.notes;
+
+    for item in &result.items {
+        let path = leftover_path(item);
+        candidate
+            .evidence
+            .push(format!("{}：{}", path.display(), item.evidence.join("；")));
+    }
+
+    // 体积按条目里的文件统计：目录展开成整棵子树，单文件就是它自己。
+    let (mut files, dirs) = adapter_files(&result.items);
+    candidate.size = SizeInfo {
+        logical: files
+            .iter()
+            .filter(|file| file.counts_logical)
+            .map(|file| file.logical)
+            .sum(),
+        allocated: files.iter().map(|file| file.allocated).sum(),
+        files: files.len() as u64,
+        dirs,
+    };
+
+    // 样例取占盘最大的文件；“打开样例”按同一套统计重算才能对上序号。
+    sort_adapter_files(&mut files);
+    candidate.samples = files
+        .into_iter()
+        .take(SAMPLE_LIMIT)
+        .map(|file| file.path)
+        .collect();
+
+    candidate.anchors = result.items.iter().map(leftover_path).collect();
+
+    candidate.executable = matches!(rule.tier, Tier::Safe | Tier::Caution | Tier::Leftover)
+        && ENABLED_PHASES.contains(&rule.phase)
+        && candidate.status == CandidateStatus::Ready;
+
+    candidate
+}
+
+/// 适配器给出的条目。这里只用于展示、打开位置和占用检测：
+/// 进程列表传空，即便应用正在运行也要能看到会处理哪些条目。
+fn adapter_items(id: AdapterId, roots: &RootMap, now: SystemTime) -> Vec<LeftoverItem> {
+    adapters::evaluate_adapter(id, roots, &[], &SystemVersionProbe, now).items
+}
+
+/// 一个适配器条目里的文件。
+struct AdapterFile {
+    path: PathBuf,
+    logical: u64,
+    allocated: u64,
+    /// 云占位符本地没有数据，逻辑大小不计入。
+    counts_logical: bool,
+}
+
+/// 适配器条目里的文件。目录按整棵子树展开，单文件从父目录的枚举结果里取，
+/// 两种情况共用同一套硬链接去重：体积、样例和占用检测看到的文件集合必须一致。
+fn adapter_files(items: &[LeftoverItem]) -> (Vec<AdapterFile>, u64) {
+    let seen = HardLinkSet::new(HARD_LINK_SHARDS);
+    let selector = all_contents_selector();
+    let mut files: Vec<AdapterFile> = Vec::new();
+    let mut dirs = 0u64;
+
+    for item in items {
+        let path = leftover_path(item);
+
+        if item.is_dir {
+            let tree = collect_tree(&path, true, &selector, &seen);
+            dirs += tree.len() as u64;
+            for dir in &tree {
+                for file in &dir.files {
+                    files.push(AdapterFile {
+                        path: file.path.clone(),
+                        logical: file.logical,
+                        allocated: file.allocated,
+                        counts_logical: file.counts_logical,
+                    });
+                }
+            }
+            continue;
+        }
+
+        // 单文件：父目录的枚举结果里才有它的文件 ID 和大小。
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let Some((volume_serial, entry)) = directory_entry(parent, name) else {
+            continue;
+        };
+        if entry.is_dir {
+            continue;
+        }
+        // 和目录统计口径一致：符号链接这类 reparse 文件不算进任何统计。
+        let count = classify_file(&entry);
+        if count == FileCount::Skip {
+            continue;
+        }
+
+        let identity = FileIdentity {
+            volume_serial,
+            file_id: entry.file_id,
+        };
+        if !seen.insert(identity) {
+            continue;
+        }
+        files.push(AdapterFile {
+            path,
+            logical: entry.logical,
+            allocated: entry.allocated,
+            counts_logical: count != FileCount::AllocatedOnly,
+        });
+    }
+
+    (files, dirs)
+}
+
+/// 从父目录的枚举结果里找出指定名字的条目。
+///
+/// 名字比较不区分大小写：条目名来自适配器的目录枚举，个别名字（例如 `ext4.vhdx`）
+/// 是写死的，磁盘上的大小写可能和写法不同。
+fn directory_entry(parent: &Path, name: &OsStr) -> Option<(u64, dirinfo::EntryInfo)> {
+    let handle = dirinfo::open_dir(parent).ok()?;
+    let volume_serial = dirinfo::volume_serial(&handle).unwrap_or(0);
+    let expected = name.to_string_lossy();
+
+    let mut found = None;
+    let _ = dirinfo::for_each_entry(&handle, |entry| {
+        if crate::win::equals_ignore_case(&entry.name.to_string_lossy(), &expected) {
+            found = Some(entry);
+        }
+    });
+
+    found.map(|entry| (volume_serial, entry))
+}
+
+/// 占盘大的排前面，大小相同时按路径排，保证样例和占用检查的顺序稳定。
+fn sort_adapter_files(files: &mut [AdapterFile]) {
+    files.sort_by(|left, right| {
+        right
+            .allocated
+            .cmp(&left.allocated)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+}
+
+/// 适配器条目的完整路径，只用于展示和统计。
+fn leftover_path(item: &LeftoverItem) -> PathBuf {
+    let mut path = item.anchor.clone();
+    for part in &item.rel {
+        path.push(part);
+    }
+
+    path
+}
+
 /// 命令类规则的评估：工具装没装、缓存在不在 C 盘、缓存多大。
 ///
 /// 这里会启动工具查询缓存路径，正常几百毫秒；查询失败只让这条规则不可执行。
@@ -315,6 +522,8 @@ fn evaluate_command(
         anchors: Vec::new(),
         size: SizeInfo::default(),
         samples: Vec::new(),
+        evidence: Vec::new(),
+        notes: Vec::new(),
         executable: false,
     };
 
@@ -486,6 +695,18 @@ fn same_path(left: &Path, right: &Path) -> bool {
 ///
 /// 界面上的样例序号就是这里的下标，打开样例时按同一套统计重算才能对上。
 pub fn sample_paths(rule: &Rule, roots: &RootMap, now: SystemTime) -> Vec<PathBuf> {
+    // 适配器规则的样例是条目里的文件，和评估时用同一套统计。
+    if let Target::Adapter(id) = &rule.target {
+        let (mut files, _) = adapter_files(&adapter_items(*id, roots, now));
+        sort_adapter_files(&mut files);
+
+        return files
+            .into_iter()
+            .take(SAMPLE_LIMIT)
+            .map(|file| file.path)
+            .collect();
+    }
+
     let (_, samples) = measure(&resolve_anchors(rule, roots), &selector_of(rule), now);
 
     samples
@@ -527,6 +748,11 @@ struct LockFiles {
 
 /// 按选择器挑出候选的文件，再取占盘最大的若干个。
 fn lock_files(rule: &Rule, roots: &RootMap, now: SystemTime) -> LockFiles {
+    // 适配器规则的文件集合由适配器条目展开，口径和体积统计一致。
+    if let Target::Adapter(id) = &rule.target {
+        return adapter_lock_files(*id, roots, now);
+    }
+
     let selector = selector_of(rule);
     let dirs = collect_all(&resolve_anchors(rule, roots), &selector);
     let allowed = allowed_ids(&dirs, &selector, now);
@@ -540,6 +766,21 @@ fn lock_files(rule: &Rule, roots: &RootMap, now: SystemTime) -> LockFiles {
             .into_iter()
             .take(LOCK_CHECK_LIMIT)
             .map(|file| file.path.clone())
+            .collect(),
+    }
+}
+
+/// 适配器候选的占用检查文件：占盘最大的前 `LOCK_CHECK_LIMIT` 个。
+fn adapter_lock_files(id: AdapterId, roots: &RootMap, now: SystemTime) -> LockFiles {
+    let (mut files, _) = adapter_files(&adapter_items(id, roots, now));
+    sort_adapter_files(&mut files);
+
+    LockFiles {
+        total: files.len(),
+        largest: files
+            .into_iter()
+            .take(LOCK_CHECK_LIMIT)
+            .map(|file| file.path)
             .collect(),
     }
 }

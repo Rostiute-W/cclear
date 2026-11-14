@@ -50,6 +50,10 @@ pub struct CandidateDto {
     pub allocated: u64,
     pub files: u64,
     pub samples: Vec<String>,
+    /// 判定依据，一条一个条目。残留规则靠它向用户说明为什么选中这些目录。
+    pub evidence: Vec<String>,
+    /// 没有选中某些项的原因。
+    pub notes: Vec<String>,
     pub executable: bool,
 }
 
@@ -125,6 +129,8 @@ fn candidate_dto(candidate: Candidate) -> CandidateDto {
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
+        evidence: candidate.evidence,
+        notes: candidate.notes,
         executable: candidate.executable,
     }
 }
