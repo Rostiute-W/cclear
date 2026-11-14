@@ -463,3 +463,53 @@ button:disabled {
 .env-drive-c {
   color: #a4341c;
 }
+
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.checkbox-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.treemap {
+  width: 100%;
+}
+
+.treemap-svg {
+  display: block;
+  width: 100%;
+  background: #ffffff;
+  border: 1px solid #e3e6ea;
+  border-radius: 8px;
+}
+
+.treemap-cell {
+  cursor: pointer;
+}
+
+.treemap-cell-static {
+  cursor: default;
+}
+
+.treemap-cell:hover rect {
+  fill: #b9d0f7;
+}
+
+.treemap-label {
+  font-size: 11px;
+  fill: #1f2328;
+  pointer-events: none;
+}
+
+.treemap-size {
+  font-size: 10px;
+  fill: #4a525c;
+  pointer-events: none;
+}

@@ -9,6 +9,7 @@ import type {
   ExecReport,
   FileEntry,
   LockReport,
+  PlanDetail,
   PlanHistory,
   PlanItem,
   PlanSummary,
@@ -112,6 +113,11 @@ export function planExecute(
 
 export function historyList(days: number): Promise<PlanHistory> {
   return invoke<PlanHistory>("history_list", { days });
+}
+
+// 历史详情只传计划 ID：条目和跳过原因都从日志里读，界面不拼路径。
+export function historyDetail(planId: string, days: number): Promise<PlanDetail> {
+  return invoke<PlanDetail>("history_detail", { planId, days });
 }
 
 type ScanListener = (progress: ScanProgress) => void;

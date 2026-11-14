@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use cclear_core::exec::executor::{ExecProgress, ExecReport, execute};
 use cclear_core::guard::Forbidden;
-use cclear_core::journal::{FileJournal, read_summaries};
+use cclear_core::journal::{FileJournal, read_detail, read_summaries};
 use cclear_core::model::Recovery;
 use cclear_core::plan::{FrozenItem, FrozenPlan, PlanRule, build_plan};
 use cclear_core::rules::catalog::find;
@@ -34,6 +34,15 @@ pub struct PlanRuleDto {
     pub dirs: u64,
     /// 构建清单时被跳过的条目数（链接、禁区、正在运行的程序文件等）。
     pub skipped_at_build: u32,
+    /// 被跳过条目的明细，让用户能展开看原因。
+    pub skipped_details: Vec<PlanSkippedDto>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanSkippedDto {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Serialize)]
@@ -104,6 +113,8 @@ pub struct PlanHistoryEntryDto {
     pub plan_id: String,
     /// Unix 秒，0 表示日志里没有开始记录。
     pub started_at: i64,
+    /// 这次执行涉及的规则 ID，名称由界面查规则目录。
+    pub rules: Vec<String>,
     pub free_before: u64,
     pub free_after: u64,
     pub deleted_files: u64,
@@ -119,6 +130,30 @@ pub struct PlanHistoryDto {
     pub plans: Vec<PlanHistoryEntryDto>,
     /// 解析失败的日志行数。大于 0 说明历史不完整。
     pub skipped_lines: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanDetailDto {
+    pub plan_id: String,
+    pub started_at: i64,
+    pub free_before: u64,
+    pub free_after: u64,
+    pub finished: bool,
+    pub rules: Vec<PlanDetailRuleDto>,
+    /// 跳过明细，复用执行报告里的跳过结构。
+    pub skipped: Vec<ExecSkipDto>,
+    pub skipped_total: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanDetailRuleDto {
+    pub rule_id: String,
+    pub deleted_files: u64,
+    pub deleted_dirs: u64,
+    pub freed_allocated: u64,
+    pub skipped: u64,
 }
 
 #[tauri::command]
@@ -198,6 +233,21 @@ pub async fn history_list(days: u32) -> Result<PlanHistoryDto, String> {
             plans: plans.into_iter().map(history_dto).collect(),
             skipped_lines,
         })
+    })
+    .await
+    .map_err(|error| format!("读取操作日志失败：{error}"))?
+}
+
+/// 某一次执行的历史详情。只接受计划 ID，路径全部来自日志。
+#[tauri::command]
+pub async fn history_detail(plan_id: String, days: u32) -> Result<PlanDetailDto, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let id = Uuid::parse_str(&plan_id).map_err(|_| "这条历史记录不存在".to_string())?;
+
+        read_detail(days.max(1) as usize, id)
+            .map_err(|error| format!("读取操作日志失败：{error}"))?
+            .map(detail_dto)
+            .ok_or_else(|| "这条历史记录已经找不到了，可能日志已被清理".to_string())
     })
     .await
     .map_err(|error| format!("读取操作日志失败：{error}"))?
@@ -305,6 +355,14 @@ fn summary_dto(plan: &FrozenPlan) -> PlanSummaryDto {
                 files: rule.total.files,
                 dirs: rule.total.dirs,
                 skipped_at_build: rule.skipped_at_build.len() as u32,
+                skipped_details: rule
+                    .skipped_at_build
+                    .iter()
+                    .map(|(path, reason)| PlanSkippedDto {
+                        path: path.to_string_lossy().into_owned(),
+                        reason: reason.clone(),
+                    })
+                    .collect(),
             })
             .collect(),
     }
@@ -380,6 +438,7 @@ fn history_dto(summary: cclear_core::journal::PlanSummary) -> PlanHistoryEntryDt
     PlanHistoryEntryDto {
         plan_id: summary.plan_id.to_string(),
         started_at: summary.started_at.unix_timestamp(),
+        rules: summary.rules,
         free_before: summary.free_before,
         free_after: summary.free_after,
         deleted_files: summary.deleted_files,
@@ -387,6 +446,37 @@ fn history_dto(summary: cclear_core::journal::PlanSummary) -> PlanHistoryEntryDt
         freed_allocated: summary.freed_allocated,
         skipped: summary.skipped,
         finished: summary.finished,
+    }
+}
+
+fn detail_dto(detail: cclear_core::journal::PlanDetail) -> PlanDetailDto {
+    PlanDetailDto {
+        plan_id: detail.plan_id.to_string(),
+        started_at: detail.started_at.unix_timestamp(),
+        free_before: detail.free_before,
+        free_after: detail.free_after,
+        finished: detail.finished,
+        rules: detail
+            .rules
+            .into_iter()
+            .map(|rule| PlanDetailRuleDto {
+                rule_id: rule.rule_id,
+                deleted_files: rule.deleted_files,
+                deleted_dirs: rule.deleted_dirs,
+                freed_allocated: rule.freed_allocated,
+                skipped: rule.skipped,
+            })
+            .collect(),
+        skipped: detail
+            .skipped
+            .into_iter()
+            .map(|item| ExecSkipDto {
+                rule_id: item.rule_id,
+                path: item.path,
+                reason: item.reason,
+            })
+            .collect(),
+        skipped_total: detail.skipped_total,
     }
 }
 
