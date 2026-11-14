@@ -2,17 +2,10 @@
 
 use std::path::PathBuf;
 
-use thiserror::Error;
+use super::GuardError;
 
 /// 目录名里没有意义、只会出现在注入尝试中的字符。
 const FORBIDDEN_CHARS: [char; 6] = ['*', '?', '"', '<', '>', '|'];
-
-/// 路径护栏的错误。
-#[derive(Debug, Error)]
-pub enum GuardError {
-    #[error("路径不合法：{0}")]
-    InvalidExternalPath(String),
-}
 
 /// 校验并规范化前端传来的分析输入路径。
 ///
