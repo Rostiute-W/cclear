@@ -5,6 +5,7 @@ pub mod clean;
 pub mod devcache;
 pub mod elevated;
 pub mod env;
+pub mod maintenance;
 pub mod migrate;
 pub mod plan;
 pub mod quarantine;

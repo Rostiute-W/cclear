@@ -10,6 +10,8 @@
     "allow-command-execute",
     "allow-elevated-execute",
     "allow-env-state",
+    "allow-maintenance-analyze",
+    "allow-maintenance-execute",
     "allow-migrations-list",
     "allow-migration-inspect",
     "allow-migration-start",

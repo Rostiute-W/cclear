@@ -27,6 +27,9 @@ pub struct RuleDto {
     pub target_kind: String,
     /// 命令类规则调用的工具和二次确认要求，界面据此写确认文案。
     pub command: Option<CommandDto>,
+    /// 系统操作规则对应的内置操作名。没有内置操作时为 None，
+    /// 界面据此把还没实现的项排除在“系统维护”分组之外。
+    pub system_op: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -95,7 +98,17 @@ fn rule_dto(rule: &Rule) -> RuleDto {
         warning: rule.warning.map(|text| text.to_string()),
         target_kind: target_kind(&rule.target).to_string(),
         command: command_dto(&rule.target),
+        system_op: system_op(&rule.target),
     }
+}
+
+/// 系统操作规则对应的内置操作名。其他目标没有内置操作，返回 None。
+fn system_op(target: &Target) -> Option<String> {
+    let Target::System(id) = target else {
+        return None;
+    };
+
+    cclear_core::elevation::SystemOp::of_id(*id).map(|op| op.token())
 }
 
 /// 命令类规则的工具信息。其他目标没有命令，返回 None。

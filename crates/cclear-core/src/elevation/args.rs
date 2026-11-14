@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
+use crate::rules::catalog::SystemOpId;
+
 use super::ElevationError;
 
 /// 结果文件的固定目录前缀（相对用户名之后）。
@@ -80,6 +82,21 @@ impl SystemOp {
             Self::LeAppStoreCicada | Self::NvidiaOta | Self::RestoreBatch(_) | Self::PurgeBatch(_)
         )
     }
+
+    /// 规则目录里的系统操作对应的内置操作。
+    ///
+    /// `WerSystem` 属于后续任务，这里没有对应项，返回 None；界面据此把还没有
+    /// 内置操作的规则排除在“系统维护”分组之外。
+    pub fn of_id(id: SystemOpId) -> Option<Self> {
+        match id {
+            SystemOpId::WindowsTemp => Some(Self::WindowsTemp),
+            SystemOpId::WindowsLogs => Some(Self::WindowsLogs),
+            SystemOpId::SysReset => Some(Self::SysReset),
+            SystemOpId::DismComponentCleanup => Some(Self::DismComponentCleanup),
+            SystemOpId::DeliveryOptimization => Some(Self::DeliveryOptimization),
+            SystemOpId::WerSystem => None,
+        }
+    }
 }
 
 impl std::fmt::Display for SystemOp {
@@ -94,7 +111,7 @@ pub struct HelperArgs {
     pub ops: Vec<SystemOp>,
     /// helper 把执行结果写到这里，主程序在这个进程结束后读它。
     pub result: PathBuf,
-    /// 长耗时操作的进度文件。M5a 的两个操作很快，暂时不写进度。
+    /// 长耗时操作（DISM 组件存储清理）的进度文件。主进程每秒读一次并显示。
     pub progress: Option<PathBuf>,
     /// 隔离根目录。隔离和批次类操作必须给出。
     pub quarantine_root: Option<PathBuf>,

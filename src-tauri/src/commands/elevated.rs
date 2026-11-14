@@ -82,7 +82,8 @@ fn system_op(rule: &Rule) -> Result<SystemOp, String> {
     }
 }
 
-fn result_dto(result: HelperResult) -> ElevatedResultDto {
+/// 结果原样转成 IPC 结构。系统维护命令也复用它。
+pub(crate) fn result_dto(result: HelperResult) -> ElevatedResultDto {
     ElevatedResultDto {
         ops: result
             .ops

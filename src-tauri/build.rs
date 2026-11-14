@@ -7,6 +7,8 @@ fn main() {
             "command_execute",
             "elevated_execute",
             "env_state",
+            "maintenance_analyze",
+            "maintenance_execute",
             "migrations_list",
             "migration_inspect",
             "migration_start",

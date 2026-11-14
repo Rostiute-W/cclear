@@ -38,6 +38,8 @@ pub fn run() {
             commands::devcache::command_execute,
             commands::elevated::elevated_execute,
             commands::env::env_state,
+            commands::maintenance::maintenance_analyze,
+            commands::maintenance::maintenance_execute,
             commands::migrate::migrations_list,
             commands::migrate::migration_inspect,
             commands::migrate::migration_start,

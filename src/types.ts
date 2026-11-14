@@ -99,6 +99,8 @@ export interface RuleInfo {
   targetKind: TargetKind;
   // 命令类规则的工具信息，其他规则为 null。
   command: CommandInfo | null;
+  // 系统操作规则对应的内置操作名；还没有内置操作时为 null。
+  systemOp: string | null;
 }
 
 // 命令类规则调用的工具和二次确认要求，确认文案按它写。
@@ -365,6 +367,16 @@ export interface ElevatedOpResult {
 // 一次提权执行的完整结果。
 export interface ElevatedResult {
   ops: ElevatedOpResult[];
+}
+
+// 系统维护操作的进度。DISM 清理会在运行中不断给出百分比。
+export interface MaintenanceProgress {
+  // 操作名，例如 dism-component-cleanup。
+  op: string;
+  // 0–100 的百分比。还没给出数字时为 null。
+  percent: number | null;
+  // 中文说明，直接显示。
+  detail: string;
 }
 
 // 命令执行的进度。命令没有分项进度，只有开始和结束两个阶段。
