@@ -275,6 +275,74 @@ export interface RecycleBinInfo {
   bytes: number;
 }
 
+// 可以作为隔离区的卷。
+export interface QuarantineVolume {
+  root: string;
+  label: string;
+  total: number;
+  free: number;
+}
+
+// 隔离区设置卡：候选卷和当前选择。
+export interface QuarantineVolumes {
+  candidates: QuarantineVolume[];
+  // 已经设置好的隔离根目录，null 表示还没选过。
+  currentRoot: string | null;
+  currentFree: number;
+}
+
+// 批次状态，与 Rust 端 BatchStage 的 key 一致。
+export type QuarantineStage =
+  | "planned"
+  | "copying"
+  | "copiedVerified"
+  | "deletingSource"
+  | "committed"
+  | "restoring"
+  | "restored"
+  | "purging"
+  | "purged"
+  | "aborted"
+  | "needsAttention";
+
+// 隔离区页的一个批次。
+export interface QuarantineBatch {
+  batchId: string;
+  // Unix 秒，界面按本地时区格式化。
+  createdAt: number;
+  ruleId: string;
+  ruleName: string;
+  stage: QuarantineStage;
+  stageLabel: string;
+  note: string;
+  items: number;
+  size: number;
+  // 已经存放了多少天。
+  ageDays: number;
+}
+
+// 异常批次的人工处理方式。
+export type QuarantineResolveAction = "continue" | "abandon";
+
+export interface QuarantineRestoreResult {
+  batchId: string;
+  stage: QuarantineStage;
+  stageLabel: string;
+  restored: number;
+  // 原位已有同名文件、因此没有还原的路径。
+  conflicts: string[];
+}
+
+export interface QuarantineResolveResult {
+  batchId: string;
+  stage: QuarantineStage;
+  stageLabel: string;
+  // 源已删除、只留在隔离区的条目数。
+  moved: number;
+  // 源发生变化、源和副本都保留的条目数。
+  kept: number;
+}
+
 // 命令执行的进度。命令没有分项进度，只有开始和结束两个阶段。
 export interface CommandProgress {
   stage: "running" | "done";

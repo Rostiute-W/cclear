@@ -15,7 +15,10 @@ use thiserror::Error;
 
 pub use external::validate_external_path;
 pub use forbidden::Forbidden;
-pub use path::{DirHandle, Entry, Expect, OpenIntent, delete, list_dir, open_anchor, open_rel};
+pub use path::{
+    DirHandle, Entry, Expect, OpenIntent, delete, delete_tree, list_dir, open_anchor, open_rel,
+    replace_in_dir,
+};
 
 /// 路径护栏的错误。
 #[derive(Debug, Error)]

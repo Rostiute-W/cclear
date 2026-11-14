@@ -26,9 +26,10 @@ use windows::Win32::Storage::FileSystem::{
     FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
     FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_STANDARD_INFO, FileBasicInfo, FileDispositionInfoEx, FileIdInfo, FileStandardInfo,
-    GetFileInformationByHandleEx, OPEN_EXISTING, SYNCHRONIZE, SetFileInformationByHandle,
+    FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_DELETE, FILE_SHARE_MODE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo, FileDispositionInfoEx,
+    FileIdInfo, FileRenameInfoEx, FileStandardInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
+    SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::core::PCWSTR;
@@ -41,6 +42,11 @@ use crate::win::dirinfo::{self, EntryInfo};
 /// 共享模式全部放开：占用与否靠错误码判断，不靠这里的独占。
 const SHARE_ALL: FILE_SHARE_MODE =
     FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
+
+/// `FILE_RENAME_INFO` 的 Flags 取值。windows crate 没有导出这两个常量，照 Win32 头文件写。
+/// 前者表示目标存在时直接替换，后者要求按 POSIX 语义替换（允许目标正被打开）。
+const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
+const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
 
 /// 一个已打开的目录。后续的打开都相对它的句柄进行。
 pub struct DirHandle {
@@ -205,6 +211,122 @@ pub fn delete(entry: Entry, expect: &Expect) -> Result<(), GuardError> {
     };
 
     result.map_err(|error| map_os_error(io::Error::from(error)))
+}
+
+/// 在已打开的目录里把临时名字替换成最终名字。
+///
+/// 状态文件（例如隔离区的 manifest）靠它原子更新：先写同目录下的临时文件，再整体替换，
+/// 中途崩溃时读到的要么是旧的完整内容，要么是新的完整内容。
+pub fn replace_in_dir(
+    dir: &DirHandle,
+    tmp_name: &OsStr,
+    final_name: &OsStr,
+) -> Result<(), GuardError> {
+    validate_component(tmp_name)?;
+    validate_component(final_name)?;
+
+    // 重命名要求源文件带 DELETE 权限；目标是目录里的一个名字，不需要再打开它。
+    let entry = open_component(
+        &dir.handle,
+        tmp_name,
+        Role::Delete,
+        &dir.path.join(tmp_name),
+    )?;
+
+    // FileRenameInfoEx 不接受 RootDirectory：目标要用完整路径给出，所以这里拼上目录路径。
+    let target = crate::win::to_verbatim(&dir.path.join(final_name));
+
+    let name: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let name_bytes = u32::try_from(name.len() * 2).map_err(|_| GuardError::InvalidName)?;
+
+    // FILE_RENAME_INFO 的 FileName 是变长尾部：缓冲区长度必须是“结构体长度减去自带的 1 个字符
+    // 再加实际名字”，多传的字节会被当成参数错误。
+    let header = size_of::<FILE_RENAME_INFO>() - size_of::<u16>();
+    let total = header + name.len() * 2;
+
+    // 用 u64 数组分配，保证结构体要求的 8 字节对齐。
+    let mut storage = vec![0u64; total.div_ceil(size_of::<u64>())];
+    let info = storage.as_mut_ptr() as *mut FILE_RENAME_INFO;
+
+    // SAFETY: storage 按结构体加名字长度分配且按 8 字节对齐，下面写入的内容都在缓冲区范围内。
+    unsafe {
+        (*info).Anonymous = FILE_RENAME_INFO_0 {
+            Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
+        };
+        (*info).RootDirectory = HANDLE::default();
+        (*info).FileNameLength = name_bytes;
+        let destination = std::ptr::addr_of_mut!((*info).FileName) as *mut u16;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), destination, name.len());
+    }
+
+    // SAFETY: 缓冲区按 FILE_RENAME_INFO 的布局分配，长度随名字一起传入；
+    // 句柄来自 Entry（带 DELETE 权限）且在调用期间有效。
+    let result = unsafe {
+        SetFileInformationByHandle(
+            HANDLE(entry.handle.as_raw_handle()),
+            FileRenameInfoEx,
+            info as *const core::ffi::c_void,
+            total as u32,
+        )
+    };
+
+    result.map_err(|error| map_os_error(io::Error::from(error)))
+}
+
+/// 后序删除 `parent` 下的一个条目（文件或整棵目录树）。
+///
+/// 只能用在隔离区这类完全由 CClear 自己写入的目录上：不按用户规则排除禁区，
+/// 但依然逐级相对打开，并且遇到 reparse point 时直接失败。
+pub fn delete_tree(
+    parent: &DirHandle,
+    name: &OsStr,
+    forbidden: &Forbidden,
+) -> Result<(), GuardError> {
+    let mut rel = vec![name.to_os_string()];
+
+    let entry = open_rel(parent, &rel, OpenIntent::Inspect, forbidden)?;
+    if entry.is_dir {
+        delete_children(parent, &mut rel, forbidden)?;
+    }
+
+    // 目录这时已经空了；重新按删除意图打开，在同一次打开上复核后再删。
+    let entry = open_rel(parent, &rel, OpenIntent::Delete, forbidden)?;
+    let expect = entry.expect();
+    delete(entry, &expect)
+}
+
+/// 递归删除 `rel` 指向的目录里的全部内容，目录本身保留给调用方删。
+fn delete_children(
+    parent: &DirHandle,
+    rel: &mut Vec<OsString>,
+    forbidden: &Forbidden,
+) -> Result<(), GuardError> {
+    let entries = list_dir(parent, rel, forbidden)?;
+
+    for entry in entries {
+        // 链接不能跟着删：它指向的内容在别处，删掉就是误删。
+        if entry.is_reparse() {
+            let mut path = parent.path().to_path_buf();
+            for part in rel.iter() {
+                path.push(part);
+            }
+            path.push(&entry.name);
+            return Err(GuardError::ReparseInPath(path));
+        }
+
+        rel.push(entry.name);
+        if entry.is_dir {
+            delete_children(parent, rel, forbidden)?;
+        }
+
+        let opened = open_rel(parent, rel, OpenIntent::Delete, forbidden)?;
+        let expect = opened.expect();
+        delete(opened, &expect)?;
+
+        rel.pop();
+    }
+
+    Ok(())
 }
 
 /// 组件在相对打开时的角色。

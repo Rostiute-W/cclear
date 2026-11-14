@@ -81,6 +81,16 @@ pub enum Record {
         allocated_before: u64,
         allocated_after: u64,
     },
+    /// 隔离批次的状态变化。隔离区不按清理计划执行，单独记一条。
+    QuarantineStage {
+        batch_id: Uuid,
+        /// Unix 秒，方便按时间排序和显示。
+        at: i64,
+        /// 批次状态的中文名，界面直接显示。
+        stage: String,
+        /// 这一步做了什么，或者为什么停在这里。
+        detail: String,
+    },
 }
 
 /// 日志出口。执行器只认这个接口，日志写失败就立刻中止。
@@ -381,8 +391,10 @@ fn apply(
             summary.finished = true;
             summary.cancelled = cancelled;
         }
-        // 特殊操作和官方命令不属于任何计划，不会走到这里。
-        Record::SpecialAction { .. } | Record::CommandRun { .. } => {}
+        // 特殊操作、官方命令和隔离批次不属于任何计划，不会走到这里。
+        Record::SpecialAction { .. }
+        | Record::CommandRun { .. }
+        | Record::QuarantineStage { .. } => {}
     }
 }
 
@@ -394,7 +406,9 @@ fn record_plan_id(record: &Record) -> Option<Uuid> {
         | Record::ItemSkipped { plan_id, .. }
         | Record::RuleSkipped { plan_id, .. }
         | Record::PlanFinished { plan_id, .. } => Some(*plan_id),
-        Record::SpecialAction { .. } | Record::CommandRun { .. } => None,
+        Record::SpecialAction { .. }
+        | Record::CommandRun { .. }
+        | Record::QuarantineStage { .. } => None,
     }
 }
 
@@ -465,8 +479,10 @@ fn apply_detail(detail: &mut PlanDetail, record: Record) {
             detail.finished = true;
             detail.cancelled = cancelled;
         }
-        // 特殊操作和官方命令不属于任何计划，不会走到这里。
-        Record::SpecialAction { .. } | Record::CommandRun { .. } => {}
+        // 特殊操作、官方命令和隔离批次不属于任何计划，不会走到这里。
+        Record::SpecialAction { .. }
+        | Record::CommandRun { .. }
+        | Record::QuarantineStage { .. } => {}
     }
 }
 
