@@ -5,6 +5,9 @@
   "windows": ["main"],
   "permissions": [
     "allow-app-info",
+    "allow-candidate-locks",
+    "allow-open-candidate-in-explorer",
+    "allow-env-state",
     "allow-rules-catalog",
     "allow-rules-evaluate",
     "allow-volume-info",

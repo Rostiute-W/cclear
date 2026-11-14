@@ -144,6 +144,11 @@ pub fn catalog() -> &'static [Rule] {
     CATALOG
 }
 
+/// 按 id 找规则。命令只从前端拿 id，找不到就是前端传了无效值。
+pub fn find(id: &str) -> Option<&'static Rule> {
+    catalog().iter().find(|rule| rule.id == id)
+}
+
 static CATALOG: &[Rule] = &[
     Rule {
         id: "browser-edge-cache",

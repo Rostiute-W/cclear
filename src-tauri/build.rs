@@ -2,6 +2,9 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "app_info",
+            "candidate_locks",
+            "open_candidate_in_explorer",
+            "env_state",
             "rules_catalog",
             "rules_evaluate",
             "volume_info",

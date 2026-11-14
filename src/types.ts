@@ -110,3 +110,35 @@ export interface CandidateInfo {
   samples: string[];
   executable: boolean;
 }
+
+// 占用检测结果。complete 为 false 表示还有文件没查过，不能当成“没有占用”。
+export interface LockReport {
+  checked: number;
+  total: number;
+  complete: boolean;
+  lockers: LockerInfo[];
+  error: string | null;
+}
+
+export interface LockerInfo {
+  pid: number;
+  appName: string;
+  service: string | null;
+}
+
+// 环境状态卡里的一个位置项。path 为 null 表示读不到，界面显示“未知”。
+export interface EnvLocation {
+  // 显示名。页面文件和 OneDrive 这类靠分组标题说明的项为 null。
+  name: string | null;
+  path: string | null;
+  // true 表示在 C 盘，false 表示已在其他盘，null 表示判断不了。
+  onSystemDrive: boolean | null;
+}
+
+export interface EnvState {
+  hibernateEnabled: boolean | null;
+  pagefiles: EnvLocation[] | null;
+  wslDistros: EnvLocation[] | null;
+  knownFolders: EnvLocation[];
+  onedrive: EnvLocation | null;
+}

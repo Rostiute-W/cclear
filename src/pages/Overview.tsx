@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   currentScanProgress,
   defaultScanRoots,
+  envState,
   scanCancel,
   scanStart,
   scanSummary,
@@ -9,7 +10,14 @@ import {
   volumeInfo,
 } from "../api";
 import { formatDuration, formatSize } from "../format";
-import type { ScanProgress, ScanRoot, ScanSummary, VolumeInfo } from "../types";
+import type {
+  EnvLocation,
+  EnvState,
+  ScanProgress,
+  ScanRoot,
+  ScanSummary,
+  VolumeInfo,
+} from "../types";
 
 const RING_RADIUS = 54;
 const RING_STROKE = 14;
@@ -20,6 +28,7 @@ export function OverviewPage() {
   const [roots, setRoots] = useState<ScanRoot[]>([]);
   const [summary, setSummary] = useState<ScanSummary | null>(null);
   const [progress, setProgress] = useState<ScanProgress | null>(currentScanProgress());
+  const [env, setEnv] = useState<EnvState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -32,6 +41,10 @@ export function OverviewPage() {
     scanSummary()
       .then(setSummary)
       .catch(() => setSummary(null));
+    // 环境状态卡只是只读信息，读不到就整块不显示，不影响扫描。
+    envState()
+      .then(setEnv)
+      .catch(() => setEnv(null));
 
     // 页面可能是在扫描途中被重新打开的，先用模块里缓存的最新进度恢复界面。
     setProgress(currentScanProgress());
@@ -150,6 +163,31 @@ export function OverviewPage() {
         </div>
       )}
 
+      {env && (
+        <div className="card">
+          <h3>环境状态</h3>
+
+          <div className="env-line">
+            <span className="env-name">休眠</span>
+            <span className="env-path">
+              {env.hibernateEnabled === null ? "未知" : env.hibernateEnabled ? "已开启" : "已关闭"}
+            </span>
+          </div>
+
+          <p className="env-group">页面文件</p>
+          {locationLines(env.pagefiles, "没有配置页面文件")}
+
+          <p className="env-group">WSL 发行版</p>
+          {locationLines(env.wslDistros, "没有安装 WSL 发行版")}
+
+          <p className="env-group">用户目录</p>
+          {locationLines(env.knownFolders, "未知")}
+
+          <p className="env-group">OneDrive</p>
+          {locationLines(env.onedrive ? [env.onedrive] : null, "没有配置 OneDrive")}
+        </div>
+      )}
+
       <div className="card">
         <h3>扫描</h3>
         <div className="actions">
@@ -233,4 +271,44 @@ export function OverviewPage() {
       </div>
     </section>
   );
+}
+
+// 一组位置项：读不到时显示“未知”，没有配置时显示给定文案。
+function locationLines(locations: EnvLocation[] | null, emptyText: string) {
+  if (locations === null) {
+    return (
+      <div className="env-line">
+        <span className="muted">未知</span>
+      </div>
+    );
+  }
+
+  if (locations.length === 0) {
+    return (
+      <div className="env-line">
+        <span className="muted">{emptyText}</span>
+      </div>
+    );
+  }
+
+  return locations.map((location, index) => (
+    <div className="env-line" key={`${location.name ?? location.path ?? "未知"}-${index}`}>
+      {location.name && <span className="env-name">{location.name}</span>}
+      <span className="env-path" title={location.path ?? undefined}>
+        {location.path ?? "未知"}
+      </span>
+      <span className={location.onSystemDrive === true ? "env-drive env-drive-c" : "env-drive"}>
+        {driveLabel(location.onSystemDrive)}
+      </span>
+    </div>
+  ));
+}
+
+// 统一用“在 C 盘 / 已在其他盘”的说法。
+function driveLabel(onSystemDrive: boolean | null): string {
+  if (onSystemDrive === null) {
+    return "位置未知";
+  }
+
+  return onSystemDrive ? "在 C 盘" : "已在其他盘";
 }
