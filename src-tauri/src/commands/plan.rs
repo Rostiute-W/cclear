@@ -339,7 +339,8 @@ fn failed_report(message: String) -> ExecReport {
     }
 }
 
-fn summary_dto(plan: &FrozenPlan) -> PlanSummaryDto {
+/// 清单概要。迁移的“清理旧缓存目录”也复用它生成预览。
+pub fn summary_dto(plan: &FrozenPlan) -> PlanSummaryDto {
     PlanSummaryDto {
         plan_id: plan.plan_id.to_string(),
         created_at: plan.created_at.unix_timestamp(),

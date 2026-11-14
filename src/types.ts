@@ -368,3 +368,77 @@ export interface CommandReport {
   // 命令已执行但日志写入失败时的提示。
   logError: string | null;
 }
+
+// 迁移工具名，与 Rust 端 ToolId 一致。
+export type MigrationTool = "uv" | "pip" | "npm" | "nuget" | "gradle";
+
+// 迁移方式：迁移旧缓存，或者允许工具在新位置重建。
+export type MigrationMode = "migrate" | "rebuild";
+
+// 一项缓存配置的当前状态。
+export interface MigrationEntry {
+  // 环境变量名，或者 `npm cache` 这样的配置项名。
+  name: string;
+  path: string;
+  // 配置来源：环境变量 / 当前进程环境变量 / npmrc / 默认值。
+  source: string;
+  exists: boolean;
+  size: number;
+  onSystemDrive: boolean;
+}
+
+// 迁移页里一个工具的一行。
+export interface MigrationToolState {
+  tool: MigrationTool;
+  label: string;
+  entries: MigrationEntry[];
+  totalSize: number;
+  // 还有配置指向系统盘。
+  onSystemDrive: boolean;
+  // 迁移阶段，没迁移过时为 null。
+  stage: string | null;
+  stageLabel: string | null;
+  note: string;
+  // 新的缓存根目录。
+  target: string | null;
+  volumeRoot: string | null;
+  mode: string | null;
+  // 迁移前用过的目录里现在还存在、可以清理的那些。
+  oldDirs: string[];
+  // 相关进程里正在运行的那些，开始迁移前要提醒用户。
+  processes: string[];
+  installed: boolean;
+  // 改配置或验证是否需要工具本身。Gradle 不需要。
+  needsProgram: boolean;
+  // 需要特别注意的提示，例如 Gradle 会整体搬走 .gradle。
+  warning: string | null;
+}
+
+// 可以作为目标卷的卷。
+export interface MigrationVolume {
+  root: string;
+  label: string;
+  total: number;
+  free: number;
+}
+
+export interface MigrationsState {
+  tools: MigrationToolState[];
+  volumes: MigrationVolume[];
+}
+
+// 一次迁移或撤销之后的结果。
+export interface MigrationResult {
+  tool: string;
+  label: string;
+  stage: string;
+  stageLabel: string;
+  note: string;
+  target: string;
+}
+
+// 清理旧缓存目录的清单。planId 交给预览组件，条目路径仍然只在后端。
+export interface MigrationCleanupPlan {
+  planId: string;
+  summary: PlanSummary;
+}

@@ -89,6 +89,19 @@ pub fn resolve_tool(name: &str) -> Option<PathBuf> {
 ///
 /// 超时只报告，不结束进程：强杀别的工具的进程可能留下半个缓存，也可能打断它自己的清理。
 pub fn run(tool: &Path, args: &[&str], timeout: Duration) -> CmdOutcome {
+    run_with_env(tool, args, timeout, &[])
+}
+
+/// 同 [`run`]，但先覆盖几个环境变量再启动。
+///
+/// 子进程继承的是本进程的环境，这里只覆盖传入的变量：迁移验证要的正是
+/// “当前环境 + 新变量”，不能清空环境另建一套，否则 PATH 之类的会丢。
+pub fn run_with_env(
+    tool: &Path,
+    args: &[&str],
+    timeout: Duration,
+    env: &[(&str, String)],
+) -> CmdOutcome {
     let mut command = match command_for(tool) {
         Ok(command) => command,
         Err(error) => return failed(&error),
@@ -98,6 +111,7 @@ pub fn run(tool: &Path, args: &[&str], timeout: Duration) -> CmdOutcome {
     // 免得不小心读到界面进程的输入而卡住。
     command
         .args(args)
+        .envs(env.iter().map(|(name, value)| (*name, value.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -27,6 +27,8 @@ interface PlanPreviewProps {
   planId: string;
   // plan_build 的返回值，用来渲染规则行；执行和取条目只用 planId。
   summary: PlanSummary;
+  // 额外的规则显示名。迁移这类临时规则不在内置规则目录里，由调用方给出中文名。
+  ruleNames?: Record<string, string>;
   // 执行结束后通知调用方，清理页据此重新评估。
   onFinished?: () => void;
   // 执行状态变化时通知调用方，清理页据此禁用其他执行按钮。
@@ -38,12 +40,13 @@ interface PlanPreviewProps {
 export function PlanPreview({
   planId,
   summary,
+  ruleNames,
   onFinished,
   onRunningChange,
   blocked,
 }: PlanPreviewProps) {
   // 清单里只有规则 ID，名称取自内置规则目录；取不到就退回显示 ID。
-  const [ruleNames, setRuleNames] = useState<Map<string, string>>(new Map());
+  const [catalogNames, setCatalogNames] = useState<Map<string, string>>(new Map());
   const [openRule, setOpenRule] = useState<string | null>(null);
   const [page, setPage] = useState(0);
   const [items, setItems] = useState<PlanItem[]>([]);
@@ -58,8 +61,8 @@ export function PlanPreview({
 
   useEffect(() => {
     rulesCatalog()
-      .then((rules) => setRuleNames(new Map(rules.map((rule) => [rule.id, rule.name]))))
-      .catch(() => setRuleNames(new Map()));
+      .then((rules) => setCatalogNames(new Map(rules.map((rule) => [rule.id, rule.name]))))
+      .catch(() => setCatalogNames(new Map()));
   }, []);
 
   useEffect(() => {
@@ -75,7 +78,8 @@ export function PlanPreview({
       .finally(() => setItemsLoading(false));
   }, [planId, openRule, page]);
 
-  const nameOf = (ruleId: string) => ruleNames.get(ruleId) ?? ruleId;
+  // 调用方给的名称优先：迁移这类临时规则不在内置规则目录里。
+  const nameOf = (ruleId: string) => ruleNames?.[ruleId] ?? catalogNames.get(ruleId) ?? ruleId;
 
   const toggleItems = (ruleId: string) => {
     setPage(0);
