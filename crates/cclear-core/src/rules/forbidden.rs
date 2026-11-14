@@ -3,7 +3,7 @@
 //! 禁区只禁止执行和迁移，分析时仍然可以显示。§4 里的“云占位文件”“运行中进程加载的模块文件”
 //! 和“独立应用安装根”不是固定路径，由执行阶段的路径护栏负责判断，这里只覆盖按路径就能确定的项。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::model::KnownRoot;
 use crate::rules::resolve::RootMap;
@@ -41,6 +41,57 @@ pub fn forbidden_roots() -> Vec<(KnownRoot, &'static str)> {
 ///
 /// 不能只比末尾：`office6\backup` 下面还有多层子目录，只比末尾会漏判。
 const FORBIDDEN_SEGMENTS: &[(&[&str], &str)] = &[(&["Kingsoft", "office6", "backup"], "WPS 备份")];
+
+/// 执行阶段的路径护栏要按文件身份拦住的禁区目录。
+///
+/// 只按路径字符串比较会被 8.3 短名和大小写差异绕过，护栏需要先打开这些目录取身份。
+pub fn forbidden_dirs(roots: &RootMap) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    for (root, _) in forbidden_roots() {
+        if let Some(base) = roots.get(root) {
+            dirs.push(base.to_path_buf());
+        }
+    }
+
+    for folder in [
+        KnownFolder::ProgramFiles,
+        KnownFolder::ProgramFilesX86,
+        KnownFolder::SkyDrive,
+    ] {
+        if let Ok(base) = known_folder(folder) {
+            dirs.push(base);
+        }
+    }
+
+    if let Some(base) = roots.get(KnownRoot::LocalAppData) {
+        dirs.push(base.join("Packages"));
+        dirs.push(base.join("CClear"));
+        // Tauri/WebView2 按 tauri.conf.json 里的 identifier 建数据目录。
+        dirs.push(base.join("com.zhuanz.cclear"));
+    }
+
+    // 连续组件型禁区可能挂在多个根下，能定位到的都列出来。
+    for (segments, _) in FORBIDDEN_SEGMENTS {
+        for root in [
+            KnownRoot::RoamingAppData,
+            KnownRoot::LocalAppData,
+            KnownRoot::ProgramData,
+        ] {
+            let Some(base) = roots.get(root) else {
+                continue;
+            };
+
+            let mut path = base.to_path_buf();
+            for segment in *segments {
+                path.push(segment);
+            }
+            dirs.push(path);
+        }
+    }
+
+    dirs
+}
 
 /// 判断路径是否落在禁区，命中时返回中文原因。
 pub fn is_forbidden(path: &Path, roots: &RootMap) -> Option<String> {
