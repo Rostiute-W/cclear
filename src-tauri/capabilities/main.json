@@ -8,6 +8,7 @@
     "allow-candidate-locks",
     "allow-open-candidate-in-explorer",
     "allow-command-execute",
+    "allow-elevated-execute",
     "allow-env-state",
     "allow-migrations-list",
     "allow-migration-inspect",

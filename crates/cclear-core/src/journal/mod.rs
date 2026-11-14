@@ -175,7 +175,11 @@ pub struct FileJournal {
 impl FileJournal {
     /// 打开当天的日志文件。目录不存在时创建。
     pub fn new() -> io::Result<Self> {
-        let dir = journal_dir()?;
+        Self::at(journal_dir()?)
+    }
+
+    /// 在指定目录下打开当天的日志文件。提权 helper 的日志写在 ProgramData 下。
+    pub fn at(dir: PathBuf) -> io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
 
         let mut journal = Self {

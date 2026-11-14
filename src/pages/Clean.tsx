@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState } from "react";
 import {
   candidateLocks,
   commandExecute,
+  elevatedExecute,
   openCandidateInExplorer,
   planBuild,
   recycleBinEmpty,
@@ -15,6 +16,7 @@ import type {
   CandidateInfo,
   CandidateStatusKind,
   CommandReport,
+  ElevatedResult,
   LockReport,
   Phase,
   PlanSummary,
@@ -59,6 +61,12 @@ type CommandState =
   | { phase: "done"; report: CommandReport }
   | { phase: "failed"; message: string };
 
+// 单个需要管理员权限的清理项的执行状态。
+type ElevatedState =
+  | { phase: "running" }
+  | { phase: "done"; result: ElevatedResult }
+  | { phase: "failed"; message: string };
+
 export function CleanPage() {
   const [rules, setRules] = useState<RuleInfo[]>([]);
   const [candidates, setCandidates] = useState<Map<string, CandidateInfo>>(new Map());
@@ -84,6 +92,8 @@ export function CleanPage() {
   const [planRunning, setPlanRunning] = useState(false);
   // 每条命令的运行状态。命令之间互不影响，按规则 ID 分开记。
   const [commandStates, setCommandStates] = useState<Record<string, CommandState>>({});
+  // 需要管理员权限的清理项的执行状态，同样按规则 ID 分开记。
+  const [elevatedStates, setElevatedStates] = useState<Record<string, ElevatedState>>({});
 
   const refreshRecycle = () => {
     recycleBinQuery()
@@ -256,6 +266,31 @@ export function CleanPage() {
       });
   };
 
+  // 需要管理员权限的清理项：一次只执行一条规则，所以只会弹一次 UAC。
+  const runElevated = (rule: RuleInfo) => {
+    const text = `「${rule.name}」需要管理员权限，执行时会弹出一次授权提示；清理结果先进入隔离区。确认继续？`;
+    if (!window.confirm(text)) {
+      return;
+    }
+
+    setElevatedStates((previous) => ({ ...previous, [rule.id]: { phase: "running" } }));
+    elevatedExecute(rule.id)
+      .then((result) => {
+        setElevatedStates((previous) => ({
+          ...previous,
+          [rule.id]: { phase: "done", result },
+        }));
+        // 内容已经移入隔离区，重新评估一次，界面上的数字才是当前的。
+        evaluate();
+      })
+      .catch((reason) => {
+        setElevatedStates((previous) => ({
+          ...previous,
+          [rule.id]: { phase: "failed", message: String(reason) },
+        }));
+      });
+  };
+
   // 清空回收站：确认文案里写明执行时清空的是全部内容，并把当前数值一起回传。
   const emptyRecycle = () => {
     if (!recycle) {
@@ -289,7 +324,10 @@ export function CleanPage() {
   const anyCommandRunning = Object.values(commandStates).some(
     (state) => state.phase === "running",
   );
-  const execBusy = planning || recycleBusy || planRunning || anyCommandRunning;
+  const anyElevatedRunning = Object.values(elevatedStates).some(
+    (state) => state.phase === "running",
+  );
+  const execBusy = planning || recycleBusy || planRunning || anyCommandRunning || anyElevatedRunning;
 
   return (
     <section>
@@ -414,6 +452,7 @@ export function CleanPage() {
                         const note = statusNote(candidate);
                         const samplesOpen = openSamples.has(rule.id);
                         const evidenceOpen = openEvidence.has(rule.id);
+                        const elevated = elevatedStates[rule.id];
                         // 没有锚点时既没有文件可查占用，也没有目录可以打开。
                         const hasAnchors = candidate !== undefined && candidate.anchors.length > 0;
                         // 进程在运行、阶段未开放或证据不足的候选都不能勾选。
@@ -454,6 +493,9 @@ export function CleanPage() {
                               </td>
                               <td>
                                 <span>{rule.description}</span>
+                                {rule.admin && (
+                                  <span className="status-badge">需要管理员</span>
+                                )}
                                 {rule.warning && <p className="warn">注意：{rule.warning}</p>}
                                 {note && <p className="muted">{note}</p>}
                               </td>
@@ -499,10 +541,12 @@ export function CleanPage() {
                                     type="button"
                                     className="button-primary"
                                     disabled={!selectable || execBusy}
-                                    onClick={() => startPlan([rule.id])}
+                                    onClick={() =>
+                                      rule.admin ? runElevated(rule) : startPlan([rule.id])
+                                    }
                                     title={selectable ? undefined : "当前不能清理这一项"}
                                   >
-                                    移入隔离区
+                                    {rule.admin ? "移入隔离区（需管理员）" : "移入隔离区"}
                                   </button>
                                 )}
                               </td>
@@ -558,6 +602,12 @@ export function CleanPage() {
                             {lockState && (
                               <tr className="sub-row">
                                 <td colSpan={6}>{lockResult(lockState)}</td>
+                              </tr>
+                            )}
+
+                            {elevated && (
+                              <tr className="sub-row">
+                                <td colSpan={6}>{elevatedResult(elevated)}</td>
                               </tr>
                             )}
                           </Fragment>
@@ -790,6 +840,26 @@ function commandResult(report: CommandReport) {
       )}
       {report.output && <p className="path-text">{report.output}</p>}
       {report.logError && <p className="warn">{report.logError}</p>}
+    </>
+  );
+}
+
+// 提权执行的结果：等待授权、失败原因，或者每个内置操作的说明。
+function elevatedResult(state: ElevatedState) {
+  if (state.phase === "running") {
+    return <p className="muted">等待管理员授权并执行…</p>;
+  }
+  if (state.phase === "failed") {
+    return <p className="warn">提权执行失败：{state.message}</p>;
+  }
+
+  return (
+    <>
+      {state.result.ops.map((op) => (
+        <p key={op.op} className={op.status === "failed" ? "warn" : "muted"}>
+          {op.detail}
+        </p>
+      ))}
     </>
   );
 }

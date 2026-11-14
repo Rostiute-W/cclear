@@ -36,6 +36,7 @@ pub fn run() {
             commands::clean::candidate_locks,
             commands::clean::open_candidate_in_explorer,
             commands::devcache::command_execute,
+            commands::elevated::elevated_execute,
             commands::env::env_state,
             commands::migrate::migrations_list,
             commands::migrate::migration_inspect,

@@ -5,6 +5,7 @@ fn main() {
             "candidate_locks",
             "open_candidate_in_explorer",
             "command_execute",
+            "elevated_execute",
             "env_state",
             "migrations_list",
             "migration_inspect",

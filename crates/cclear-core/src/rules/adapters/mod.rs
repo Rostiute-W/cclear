@@ -37,6 +37,17 @@ const DOCKER_PROCESSES: &[&str] = &[
 /// Codex 运行时要求退出的进程。
 const CODEX_PROCESSES: &[&str] = &["codex.exe", "codex-code-mode-host.exe"];
 
+/// 联想应用商店的主进程。本机只读核实：`C:\Program Files (x86)\Common Files\LenovoAS\LeASLane.exe`
+/// 的 FileDescription 与 ProductName 都是“联想应用商店”；`ProgramData\Lenovo\LeAppStore` 里的
+/// 快捷方式指向 `Common Files\LenovoAppStoreNotify\LenovoAppStoreNotify.exe`（联想应用商店通知程序），
+/// 它随商店常驻，所以两个都算。
+pub const LE_APPSTORE_PROCESSES: &[&str] = &["LeASLane.exe", "LenovoAppStoreNotify.exe"];
+
+/// NVIDIA App 的主进程。本机只读核实：`C:\Program Files\NVIDIA Corporation\NVIDIA App\CEF`
+/// 下的可执行文件是 `NVIDIA App.exe` 和 `NVIDIA Overlay.exe`。`nvcontainer.exe` 是常驻容器服务，
+/// 不随 App 退出，不能拿它当“应用正在运行”的依据。
+pub const NVIDIA_APP_PROCESSES: &[&str] = &["NVIDIA App.exe", "NVIDIA Overlay.exe"];
+
 /// 一个候选残留条目。`rel` 相对 `anchor`，执行时按它逐级相对打开。
 pub struct LeftoverItem {
     pub anchor: PathBuf,
@@ -89,10 +100,8 @@ pub fn evaluate_adapter(
         AdapterId::QianfanInstaller => qianfan_installer(roots, procs),
         AdapterId::DockerDesktopUpdates => docker_desktop_updates(roots, procs),
         AdapterId::WslUnregisteredVhdx => wsl_unregistered_vhdx(roots),
-        // 这两个是 M5a 的提权操作，主程序里不做判定。
-        AdapterId::LeAppStoreCicada | AdapterId::NvidiaAppOtaArtifacts => {
-            insufficient("需要管理员权限，由提权 helper 处理")
-        }
+        AdapterId::LeAppStoreCicada => le_appstore_cicada(roots, procs),
+        AdapterId::NvidiaAppOtaArtifacts => nvidia_app_ota_artifacts(roots, procs),
     }
 }
 
@@ -600,6 +609,119 @@ fn docker_desktop_updates(roots: &RootMap, procs: &[ProcInfo]) -> AdapterResult 
 
     // Docker Desktop 的进程没退出时不碰更新包：可能正被安装程序使用。
     with_running(items, Vec::new(), running_names(DOCKER_PROCESSES, procs))
+}
+
+/// 联想应用商店的 cicada 下载缓存：`ProgramData\Lenovo\LeAppStore\cicada`。
+///
+/// 该目录在 ProgramData 下，普通权限只能读，清理要交给提权 helper。
+fn le_appstore_cicada(roots: &RootMap, procs: &[ProcInfo]) -> AdapterResult {
+    admin_data_dir(
+        roots,
+        procs,
+        r"Lenovo\LeAppStore\cicada",
+        LE_APPSTORE_PROCESSES,
+    )
+}
+
+/// NVIDIA App 的 OTA 下载残留：`ProgramData\NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts`。
+fn nvidia_app_ota_artifacts(roots: &RootMap, procs: &[ProcInfo]) -> AdapterResult {
+    admin_data_dir(
+        roots,
+        procs,
+        r"NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts",
+        NVIDIA_APP_PROCESSES,
+    )
+}
+
+/// ProgramData 下需要管理员权限的残留目录：整棵内容都算候选，实际隔离由提权 helper 执行。
+///
+/// 这里只做只读枚举和统计，主程序不写任何东西。
+fn admin_data_dir(
+    roots: &RootMap,
+    procs: &[ProcInfo],
+    rel: &str,
+    product: &[&str],
+) -> AdapterResult {
+    let Some(base) = roots.get(KnownRoot::ProgramData) else {
+        return not_present();
+    };
+    let target = base.join(rel);
+    if !dirinfo::is_plain_dir(&target) {
+        return not_present();
+    }
+
+    let mut items = Vec::new();
+
+    for (name, _) in child_dirs(&target) {
+        items.push(LeftoverItem {
+            anchor: target.clone(),
+            rel: vec![OsString::from(&name)],
+            is_dir: true,
+            evidence: vec![
+                "需要管理员权限，由提权 helper 隔离".to_string(),
+                "目录大小按整棵子树统计".to_string(),
+            ],
+        });
+    }
+
+    for (name, path) in child_files(&target) {
+        items.push(LeftoverItem {
+            anchor: target.clone(),
+            rel: vec![OsString::from(&name)],
+            is_dir: false,
+            evidence: vec![
+                "需要管理员权限，由提权 helper 隔离".to_string(),
+                format!("大小 {}", format_size(file_size(&path))),
+            ],
+        });
+    }
+
+    if items.is_empty() {
+        return not_present();
+    }
+
+    let running = running_for_target(&target, product, procs);
+
+    with_running(
+        items,
+        vec![format!(
+            "执行时只弹一次 UAC；相关进程：{}",
+            product.join("、")
+        )],
+        running,
+    )
+}
+
+/// 目标目录里有进程在运行，或者产品主进程在运行时，返回占用的进程名。
+///
+/// 映像路径落在目标目录下说明程序正从这个目录读文件；主进程名单独列出，
+/// 因为主程序装在别的安装目录里。
+pub fn running_for_target(target: &Path, product: &[&str], procs: &[ProcInfo]) -> Vec<String> {
+    let mut running: Vec<String> = Vec::new();
+
+    for process in procs {
+        let in_target = process
+            .image_path
+            .as_ref()
+            .is_some_and(|image| is_under(image, target));
+        let is_product = product
+            .iter()
+            .any(|name| crate::win::equals_ignore_case(&process.name, name));
+
+        if !in_target && !is_product {
+            continue;
+        }
+        if running
+            .iter()
+            .any(|known| crate::win::equals_ignore_case(known, &process.name))
+        {
+            continue;
+        }
+
+        running.push(process.name.clone());
+    }
+
+    running
 }
 
 /// 未关联的 WSL 虚拟磁盘（只做分析）：

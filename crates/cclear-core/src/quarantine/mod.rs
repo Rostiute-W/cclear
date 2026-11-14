@@ -162,6 +162,8 @@ pub struct QuarantineRoot {
     allow_same_volume: bool,
     /// 首次创建根目录时是否设置自保护 DACL。测试目录不需要。
     apply_acl: bool,
+    /// 新建批次的 manifest 是否标记 requiresAdmin。提权 helper 创建的批次要打开它。
+    requires_admin: bool,
     free_space: Box<dyn Fn(&Path) -> u64 + Send + Sync>,
     /// 测试注入：复制完第 N 个文件后中断，模拟进程被强行结束。
     crash_after_files: Option<usize>,
@@ -176,6 +178,7 @@ impl QuarantineRoot {
             root,
             allow_same_volume: false,
             apply_acl: true,
+            requires_admin: false,
             free_space: Box::new(volume::free_space),
             crash_after_files: None,
             after_copy: None,
@@ -188,10 +191,19 @@ impl QuarantineRoot {
             root,
             allow_same_volume: true,
             apply_acl: false,
+            requires_admin: false,
             free_space: Box::new(volume::free_space),
             crash_after_files: None,
             after_copy: None,
         }
+    }
+
+    /// 标记新建的批次需要管理员权限。提权 helper 用它写 manifest 里的 requiresAdmin。
+    ///
+    /// 还原和彻底删除这类批次会回到 helper 里执行：主程序没有权限碰 ProgramData 下的源。
+    pub fn with_requires_admin(mut self, required: bool) -> Self {
+        self.requires_admin = required;
+        self
     }
 
     /// 线上用法：读设置里保存的隔离根。还没设置过时返回 None。
@@ -353,6 +365,7 @@ impl QuarantineRoot {
             rule_id: rule_id.to_string(),
             stage: BatchStage::Planned,
             note: String::new(),
+            requires_admin: self.requires_admin,
             items: prepared,
         };
         manifest.save(&batch_dir)?;
@@ -901,6 +914,7 @@ impl QuarantineRoot {
                 items,
                 size,
                 age_days,
+                requires_admin: manifest.requires_admin,
             });
         }
 

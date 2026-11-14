@@ -6,6 +6,7 @@ import type {
   CommandProgress,
   CommandReport,
   DirNode,
+  ElevatedResult,
   EnvState,
   ExecProgress,
   ExecReport,
@@ -78,6 +79,11 @@ export function commandExecute(
     secondConfirm,
     onProgress: channel,
   });
+}
+
+// 需要管理员权限的清理项：只传规则 ID，内置操作和安全路径都由后端决定。
+export function elevatedExecute(ruleId: string): Promise<ElevatedResult> {
+  return invoke<ElevatedResult>("elevated_execute", { ruleId });
 }
 
 export function volumeInfo(): Promise<VolumeInfo[]> {
