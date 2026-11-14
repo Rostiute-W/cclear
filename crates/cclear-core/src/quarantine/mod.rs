@@ -1518,15 +1518,11 @@ fn restore_item(
         }
     }
 
-    // 上次还原在写完临时文件之后崩溃时，原位会留下半截的临时文件，重写之前先按前缀清掉。
+    // 上次还原在写完临时文件之后崩溃时，原位会留下半截的临时文件，重写之前先按名字清掉。
     remove_stale_restore_temp(&parent, name, batch_id);
 
     // 临时文件名带批次前缀：中途崩溃留下的半截文件一眼能认出属于哪个批次。
-    let temp_name = OsString::from(format!(
-        "{}.cclear-restore-{}",
-        name.to_string_lossy(),
-        batch_prefix(batch_id)
-    ));
+    let temp_name = restore_temp_name(name, batch_id);
     let temp_path = parent.path().join(&temp_name);
 
     if let Err(error) = write_copy(&parent, &temp_name, &copy) {
@@ -1584,28 +1580,29 @@ fn remove_pending_copies(
     }
 }
 
-/// 删掉原位残留的还原临时文件（`<名>.cclear-restore-<批次前 8 位>`）。
-///
-/// 通过护栏打开父目录、按名字前缀匹配，只删普通文件：目录、链接和同目录里别的文件一律不动。
-fn remove_stale_restore_temp(parent: &DirHandle, name: &OsStr, batch_id: Uuid) {
-    let prefix = format!(
+/// 还原临时文件名：`<名>.cclear-restore-<批次前 8 位>`。
+fn restore_temp_name(name: &OsStr, batch_id: Uuid) -> OsString {
+    OsString::from(format!(
         "{}.cclear-restore-{}",
         name.to_string_lossy(),
         batch_prefix(batch_id)
-    );
+    ))
+}
 
+/// 删掉原位残留的还原临时文件（`<名>.cclear-restore-<批次前 8 位>`）。
+///
+/// 按确定名字直接相对打开，存在且是普通文件（非目录、非链接）时通过护栏删除，不再枚举整个父目录。
+fn remove_stale_restore_temp(parent: &DirHandle, name: &OsStr, batch_id: Uuid) {
+    let temp_name = restore_temp_name(name, batch_id);
     let forbidden = Forbidden::empty();
-    let Ok(entries) = guard::list_dir(parent, &[], &forbidden) else {
-        return;
-    };
+    let rel = [temp_name];
 
-    for entry in entries {
-        // 链接和重解析点一概不碰：跟着它删会动到别的位置。
-        if entry.is_dir || entry.is_reparse() || !entry.name.to_string_lossy().starts_with(&prefix)
-        {
-            continue;
-        }
-        remove_child(parent, &entry.name);
+    if let Ok(entry) = guard::open_rel(parent, &rel, OpenIntent::Delete, &forbidden)
+        && !entry.is_dir
+        && entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0
+    {
+        let expect = entry.expect();
+        let _ = guard::delete(entry, &expect);
     }
 }
 

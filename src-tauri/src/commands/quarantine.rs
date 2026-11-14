@@ -2,7 +2,7 @@
 //!
 //! 执行类命令只接受批次 ID 和动作名，条目路径一律从批次清单里取，前端拿不到自由路径。
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use cclear_core::elevation::{SystemOp, run_elevated};
 use cclear_core::guard::Forbidden;
@@ -302,7 +302,7 @@ fn current_state() -> Result<QuarantineVolumesDto, String> {
 
     let current_free = current_root
         .as_ref()
-        .map(|path| volume::free_space(path))
+        .map(|path| volume::free_space(&volume_root(path)))
         .unwrap_or(0);
 
     Ok(QuarantineVolumesDto {
@@ -318,6 +318,18 @@ fn current_state() -> Result<QuarantineVolumesDto, String> {
         current_root: current_root.map(|path| path.to_string_lossy().into_owned()),
         current_free,
     })
+}
+
+/// 隔离根目录在首次隔离前可能还不存在，直接查它会返回 0；改为查它所在卷的根（例如 `D:\`）。
+fn volume_root(path: &Path) -> PathBuf {
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => {
+            let mut root = prefix.as_os_str().to_os_string();
+            root.push("\\");
+            PathBuf::from(root)
+        }
+        _ => path.to_path_buf(),
+    }
 }
 
 /// 已配置的隔离根。

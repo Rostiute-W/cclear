@@ -11,13 +11,15 @@ use std::sync::atomic::AtomicBool;
 use cclear_core::exec::executor;
 use cclear_core::guard::{Forbidden, validate_external_path};
 use cclear_core::journal::FileJournal;
-use cclear_core::migrate::junction::{self, DirMigration, DirStage, JunctionMigration};
+use cclear_core::migrate::junction::{
+    self, DirMigration, DirStage, JunctionError, JunctionMigration,
+};
 use cclear_core::migrate::tools::{self, ToolId};
-use cclear_core::migrate::{self, EntryState, Migration, Mode, ToolState};
+use cclear_core::migrate::{self, EntryState, MigrateError, Migration, Mode, ToolState};
 use cclear_core::rules::resolve::RootMap;
 use cclear_core::win::process::running_processes;
 use serde::Serialize;
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::commands::plan::{PlanSummaryDto, summary_dto};
 use crate::state::AppState;
@@ -252,12 +254,20 @@ pub async fn migration_cleanup_old(
 /// 确认使用备份里的迁移记录。迁移记录主文件读不出来时界面会退回 `.bak`，
 /// 在用户明确确认之前，后端拒绝把这份内容写回主文件。
 #[tauri::command]
-pub async fn migration_confirm_backup(state: State<'_, AppState>) -> Result<(), String> {
-    // 确认会写迁移记录，和迁移操作共用同一把执行锁。
+pub async fn migration_confirm_backup(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // 确认会写迁移记录并可能执行恢复，全程持有同一把执行锁。
     let _exec = state.start_exec()?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        migrate::adopt_backup_store().map_err(|error| format!("确认使用备份失败：{error}"))
+        migrate::adopt_backup_store().map_err(|error| format!("确认使用备份失败：{error}"))?;
+        let app_state = app.state::<AppState>();
+        app_state.clear_recovery_note(migrate::BACKUP_RECOVERY_DEFERRED);
+        // 备份还没确认时启动恢复会直接跳过；确认落盘后在这里按启动时的相同流程补跑一次。
+        run_startup_recovery(&app_state);
+        Ok(())
     })
     .await
     .map_err(|error| format!("确认使用备份失败：{error}"))?
@@ -491,6 +501,11 @@ pub fn recover_on_startup(state: &AppState) {
         return;
     };
 
+    run_startup_recovery(state);
+}
+
+/// 启动恢复的实际流程。调用方必须已经持有执行锁。
+fn run_startup_recovery(state: &AppState) {
     let Ok(mut journal) = FileJournal::new() else {
         state.push_recovery_note("启动恢复没有执行：操作日志无法写入".to_string());
         return;
@@ -523,6 +538,7 @@ fn recover_directories(state: &AppState, journal: &mut FileJournal) {
                 state.push_recovery_note(format!("目录迁移启动恢复失败：{failure}"));
             }
         }
+        Err(JunctionError::BackupUnconfirmed(note)) => state.push_recovery_note(note),
         Err(error) => state.push_recovery_note(format!("目录迁移启动恢复失败：{error}")),
     }
 }
@@ -535,6 +551,7 @@ fn recover_tools(state: &AppState, journal: &mut FileJournal) {
                 state.push_recovery_note(format!("{}：{}", record.tool, record.note));
             }
         }
+        Err(MigrateError::BackupUnconfirmed(note)) => state.push_recovery_note(note),
         Err(error) => state.push_recovery_note(format!("工具缓存迁移启动恢复失败：{error}")),
     }
 }

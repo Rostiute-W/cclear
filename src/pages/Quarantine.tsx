@@ -33,6 +33,7 @@ const STAGE_TONES: Record<QuarantineStage, SemanticTone> = {
 export function QuarantinePage({ onChanged }: { onChanged: () => void }) {
   const [volumes, setVolumes] = useState<QuarantineVolumes | null>(null);
   const [batches, setBatches] = useState<QuarantineBatch[]>([]);
+  const [batchesLoading, setBatchesLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -43,7 +44,8 @@ export function QuarantinePage({ onChanged }: { onChanged: () => void }) {
         setVolumes(volumeState);
         setBatches(list);
       })
-      .catch((reason) => setError(String(reason)));
+      .catch((reason) => setError(String(reason)))
+      .finally(() => setBatchesLoading(false));
   };
 
   useEffect(reload, []);
@@ -182,10 +184,14 @@ export function QuarantinePage({ onChanged }: { onChanged: () => void }) {
       <div className="card">
         <div className="card-header">
           <h3 className="card-title">批次</h3>
-          <span className="muted td-num">共 {batches.length} 个批次</span>
+          <span className="muted td-num">
+            {batchesLoading ? "加载中…" : `共 ${batches.length} 个批次`}
+          </span>
         </div>
 
-        {batches.length === 0 ? (
+        {batchesLoading ? (
+          <p className="muted">正在加载批次列表…</p>
+        ) : batches.length === 0 ? (
           <EmptyState
             icon={<IconQuarantine />}
             title="隔离区里还没有批次"

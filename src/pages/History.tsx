@@ -14,6 +14,7 @@ const RULE_NAMES_SHOWN = 5;
 
 export function HistoryPage() {
   const [plans, setPlans] = useState<PlanHistoryEntry[]>([]);
+  const [listLoading, setListLoading] = useState(true);
   const [skippedLines, setSkippedLines] = useState(0);
   // 日志里只有规则 ID，名称取自内置规则目录。
   const [ruleNames, setRuleNames] = useState<Map<string, string>>(new Map());
@@ -32,7 +33,8 @@ export function HistoryPage() {
         setPlans(history.plans);
         setSkippedLines(history.skippedLines);
       })
-      .catch((reason) => setError(String(reason)));
+      .catch((reason) => setError(String(reason)))
+      .finally(() => setListLoading(false));
   }, []);
 
   const nameOf = (ruleId: string) => ruleNames.get(ruleId) ?? ruleId;
@@ -70,7 +72,11 @@ export function HistoryPage() {
         </AlertBanner>
       )}
 
-      {plans.length === 0 ? (
+      {listLoading ? (
+        <div className="card">
+          <p className="muted">正在加载历史记录…</p>
+        </div>
+      ) : plans.length === 0 ? (
         <div className="card">
           <EmptyState
             icon={<IconHistory />}

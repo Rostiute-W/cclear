@@ -87,20 +87,19 @@ export default function App() {
           ))}
         </nav>
 
-        {app && (
-          <div className="sidebar-footer">
-            <div className="sidebar-meta-row">
-              <span>版本</span>
-              <span className="td-num">v{app.version}</span>
-            </div>
-            <div className="sidebar-meta-row">
-              <span>权限</span>
-              <StatusBadge tone={app.isAdmin ? "caution" : "neutral"}>
-                {app.isAdmin ? "管理员" : "普通权限"}
-              </StatusBadge>
-            </div>
+        <div className="sidebar-footer">
+          <div className="sidebar-meta-row">
+            <span>版本</span>
+            <span className="td-num">{app ? `v${app.version}` : "—"}</span>
           </div>
-        )}
+          {/* 权限徽标只用于展示，取不到时保持“普通权限”。 */}
+          <div className="sidebar-meta-row">
+            <span>权限</span>
+            <StatusBadge tone={app?.isAdmin ? "caution" : "neutral"}>
+              {app?.isAdmin ? "管理员" : "普通权限"}
+            </StatusBadge>
+          </div>
+        </div>
       </aside>
 
       <div className="main-stage">

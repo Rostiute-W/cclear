@@ -22,7 +22,9 @@ use windows::Win32::Storage::FileSystem::{
 
 use crate::guard::{self, DirHandle, Forbidden, GuardError, OpenIntent};
 use crate::journal::{JournalSink, Record, unix_now};
-use crate::migrate::{BACKUP_UNCONFIRMED, candidate_volumes, load_store, save_store};
+use crate::migrate::{
+    BACKUP_RECOVERY_DEFERRED, BACKUP_UNCONFIRMED, candidate_volumes, load_store, save_store,
+};
 use crate::model::{FileIdentity, KnownRoot, Recovery};
 use crate::plan::{FrozenPlan, build_plan_at};
 use crate::quarantine::{copy_tree_verified, hash_hex};
@@ -963,8 +965,8 @@ impl JunctionMigration {
         let target = record.target_path();
         let returning = return_path(&source, &record.id);
 
-        // 链接已经删掉，这一步再打不开父目录就没法重建 junction：同样交给 abort_return
-        // 收尾，状态落在 NeedsAttention，界面上的“继续”还能把链接补回来。
+        // 链接已经删掉，这一步再打不开父目录就没法重建 junction：不能调用会删掉临时目录的
+        // abort_return，保留临时目录并把完整路径写进说明，让用户能手工找回数据。
         let opened = parent_of(&source).and_then(|path| {
             let name = file_name_of(&source)?.to_os_string();
             let parent = guard::open_anchor(&path, &self.forbidden)?;
@@ -972,14 +974,17 @@ impl JunctionMigration {
         });
         let (parent, source_name) = match opened {
             Ok(parts) => parts,
-            Err(error) => {
-                return self.abort_return(
+            Err(open_error) => {
+                self.set_stage(
                     record,
                     DirStage::NeedsAttention,
-                    &returning,
-                    error,
+                    &format!(
+                        "迁回时目录改名失败，且无法打开父目录重建 junction，临时目录保留在 {}，请手工处理：{error}；{open_error}",
+                        returning.display()
+                    ),
                     journal,
-                );
+                )?;
+                return Err(JunctionError::Guard(error));
             }
         };
 
@@ -1056,9 +1061,18 @@ impl JunctionMigration {
         &self,
         journal: &mut dyn JournalSink,
     ) -> Result<RecoverReport, JunctionError> {
+        let dir = self.store_dir()?;
+        let store =
+            load_store(Some(&dir)).map_err(|error| JunctionError::Store(error.to_string()))?;
+        if store.from_backup {
+            return Err(JunctionError::BackupUnconfirmed(
+                BACKUP_RECOVERY_DEFERRED.to_string(),
+            ));
+        }
+
         let mut report = RecoverReport::default();
 
-        for record in self.load_all()? {
+        for record in store.directories {
             let id = record.id.clone();
             match self.recover_one(record, journal) {
                 Ok(Some(record)) => report.recovered.push(record),

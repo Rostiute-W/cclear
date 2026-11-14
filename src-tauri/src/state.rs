@@ -129,6 +129,14 @@ impl AppState {
         }
     }
 
+    /// 移除已经不再适用的恢复说明（例如用户确认使用备份之后撤掉先前的等待提示）。
+    pub fn clear_recovery_note(&self, note: &str) {
+        self.recovery_notes
+            .lock()
+            .unwrap()
+            .retain(|item| item != note);
+    }
+
     /// 启动恢复留下的说明，界面在迁移页显示。
     pub fn recovery_notes(&self) -> Vec<String> {
         self.recovery_notes.lock().unwrap().clone()

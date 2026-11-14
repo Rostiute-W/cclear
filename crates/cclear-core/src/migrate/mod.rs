@@ -50,6 +50,10 @@ const STORE_FILE: &str = "migrations.json";
 /// 记录是从 `.bak` 退回读出来的、用户还没确认时的统一拒绝文案。工具迁移和目录迁移共用。
 pub(crate) const BACKUP_UNCONFIRMED: &str = "迁移记录是从备份读出来的，请先在迁移页确认使用备份";
 
+/// 启动恢复遇上未确认备份时的提示。此时恢复不会动手，等用户确认之后再自动补跑一次。
+pub const BACKUP_RECOVERY_DEFERRED: &str =
+    "迁移记录是从备份读出来的，请先在迁移页确认使用备份，确认后会再做一次启动恢复";
+
 /// 配置来源的说明文字，界面直接显示。
 const SOURCE_ENV: &str = "环境变量";
 const SOURCE_PROCESS_ENV: &str = "当前进程环境变量";
@@ -694,9 +698,16 @@ impl Env {
         &self,
         journal: &mut dyn JournalSink,
     ) -> Result<Vec<Migration>, MigrateError> {
+        let store = self.load_store()?;
+        if store.from_backup {
+            return Err(MigrateError::BackupUnconfirmed(
+                BACKUP_RECOVERY_DEFERRED.to_string(),
+            ));
+        }
+
         let mut recovered = Vec::new();
 
-        for mut migration in self.load_all()? {
+        for mut migration in store.tools {
             if !matches!(migration.stage, Stage::Planned | Stage::Configured) {
                 continue;
             }
