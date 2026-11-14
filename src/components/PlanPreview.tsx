@@ -18,7 +18,7 @@ const PAGE_SIZE = 200;
 const RECOVERY_LABELS: Record<Recovery, string> = {
   regenerable: "可再生",
   irreversibleFile: "永久删除",
-  quarantine: "隔离",
+  quarantine: "隔离（可还原）",
   irreversibleCommand: "不可撤销命令",
   none: "仅展示",
 };
@@ -117,6 +117,8 @@ export function PlanPreview({
   const hasIrreversible = summary.rules.some(
     (rule) => rule.recovery === "irreversibleFile",
   );
+  // 隔离类规则执行完要引导用户去隔离区页还原或彻底删除。
+  const hasQuarantine = summary.rules.some((rule) => rule.recovery === "quarantine");
   const canExecute = !running && !blocked && !report && (!hasIrreversible || acknowledged);
   // 跳过明细可能被后端截断，起点要如实说明。
   const skippedShown = report ? report.skipped.length : 0;
@@ -314,6 +316,11 @@ export function PlanPreview({
             执行前剩余 {formatSize(report.freeBefore)}，执行后剩余{" "}
             {formatSize(report.freeAfter)}。
           </p>
+          {hasQuarantine && (
+            <p className="muted">
+              移入隔离区的条目可以在「隔离区」页查看、还原或彻底删除。
+            </p>
+          )}
 
           <table className="table">
             <thead>

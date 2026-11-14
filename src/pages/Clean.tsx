@@ -69,6 +69,8 @@ export function CleanPage() {
   const [collapsed, setCollapsed] = useState<Set<Tier>>(new Set<Tier>(["forbidden"]));
   // 展开了样例路径的规则。
   const [openSamples, setOpenSamples] = useState<Set<string>>(new Set());
+  // 展开了判定证据的规则。残留规则靠证据说明为什么选中这些目录。
+  const [openEvidence, setOpenEvidence] = useState<Set<string>>(new Set());
   const [lockStates, setLockStates] = useState<Record<string, LockState>>({});
   // 勾选的规则。每次重新评估后回到默认勾选状态。
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -139,6 +141,18 @@ export function CleanPage() {
 
   const toggleSamples = (ruleId: string) => {
     setOpenSamples((previous) => {
+      const next = new Set(previous);
+      if (next.has(ruleId)) {
+        next.delete(ruleId);
+      } else {
+        next.add(ruleId);
+      }
+      return next;
+    });
+  };
+
+  const toggleEvidence = (ruleId: string) => {
+    setOpenEvidence((previous) => {
       const next = new Set(previous);
       if (next.has(ruleId)) {
         next.delete(ruleId);
@@ -296,7 +310,7 @@ export function CleanPage() {
           )}
         </div>
         <p className="muted">
-          只有安全层和谨慎层的文件类规则可以按清单执行，命令类规则在下方「不可撤销命令」分组里单独运行。
+          安全层可一键清理，谨慎层逐项勾选后清理，残留层的条目一律先进隔离区。命令类规则在下方「不可撤销命令」分组里单独运行。
         </p>
         {error && <p className="warn">{error}</p>}
       </div>
@@ -399,23 +413,33 @@ export function CleanPage() {
                         const badge = statusBadge(candidate, rule);
                         const note = statusNote(candidate);
                         const samplesOpen = openSamples.has(rule.id);
+                        const evidenceOpen = openEvidence.has(rule.id);
                         // 没有锚点时既没有文件可查占用，也没有目录可以打开。
                         const hasAnchors = candidate !== undefined && candidate.anchors.length > 0;
                         // 进程在运行、阶段未开放或证据不足的候选都不能勾选。
                         const selectable = candidate?.executable === true;
+                        // 证据列表和没有被选中的原因，两者都没有时不给展开按钮。
+                        const hasEvidence =
+                          candidate !== undefined &&
+                          (candidate.evidence.length > 0 || candidate.notes.length > 0);
 
                         return (
                           <Fragment key={rule.id}>
                             <tr>
                               <td>
-                                <input
-                                  type="checkbox"
-                                  checked={selected.has(rule.id)}
-                                  disabled={!selectable}
-                                  onChange={() => toggleSelected(rule.id)}
-                                  aria-label={`选择 ${rule.name}`}
-                                  title={selectable ? undefined : "当前不能清理这一项"}
-                                />
+                                {group.tier === "leftover" ? (
+                                  // 残留项一条操作一次，勾选对它没有意义。
+                                  <span className="muted">隔离</span>
+                                ) : (
+                                  <input
+                                    type="checkbox"
+                                    checked={selected.has(rule.id)}
+                                    disabled={!selectable}
+                                    onChange={() => toggleSelected(rule.id)}
+                                    aria-label={`选择 ${rule.name}`}
+                                    title={selectable ? undefined : "当前不能清理这一项"}
+                                  />
+                                )}
                               </td>
                               <td>{rule.name}</td>
                               <td>{candidate ? formatSize(candidate.allocated) : "—"}</td>
@@ -460,9 +484,53 @@ export function CleanPage() {
                                       ? "收起样例"
                                       : `样例路径（${candidate.samples.length}）`}
                                   </button>
+                                )}{" "}
+                                {hasEvidence && (
+                                  <button
+                                    type="button"
+                                    className="link"
+                                    onClick={() => toggleEvidence(rule.id)}
+                                  >
+                                    {evidenceOpen ? "收起证据" : "查看证据"}
+                                  </button>
+                                )}{" "}
+                                {group.tier === "leftover" && (
+                                  <button
+                                    type="button"
+                                    className="button-primary"
+                                    disabled={!selectable || execBusy}
+                                    onClick={() => startPlan([rule.id])}
+                                    title={selectable ? undefined : "当前不能清理这一项"}
+                                  >
+                                    移入隔离区
+                                  </button>
                                 )}
                               </td>
                             </tr>
+
+                            {evidenceOpen && candidate && (
+                              <tr className="sub-row">
+                                <td colSpan={6}>
+                                  <p className="muted">
+                                    判定依据：没有列在这里的内容不会被处理。
+                                  </p>
+                                  <ul className="sample-list">
+                                    {candidate.evidence.map((line) => (
+                                      <li key={line}>
+                                        <span className="path-text" title={line}>
+                                          {line}
+                                        </span>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                  {candidate.notes.map((line) => (
+                                    <p key={line} className="muted">
+                                      {line}
+                                    </p>
+                                  ))}
+                                </td>
+                              </tr>
+                            )}
 
                             {samplesOpen && candidate && (
                               <tr className="sub-row">

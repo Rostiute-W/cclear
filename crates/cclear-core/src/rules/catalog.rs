@@ -87,7 +87,7 @@ pub enum SelectKind {
     ChildDirs(&'static [&'static str]),
 }
 
-/// 多版本残留适配器。具体识别逻辑在后续任务实现。
+/// 多版本残留适配器。识别逻辑在 `rules::adapters`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdapterId {
     CodexPreviousRuntime,
@@ -99,6 +99,8 @@ pub enum AdapterId {
     DroidOldBinary,
     QianfanInstaller,
     DockerDesktopUpdates,
+    /// 未关联的 WSL 虚拟磁盘，只做分析。
+    WslUnregisteredVhdx,
     LeAppStoreCicada,
     NvidiaAppOtaArtifacts,
 }
@@ -132,8 +134,8 @@ pub enum SystemOpId {
     DeliveryOptimization,
 }
 
-/// 允许执行清理的阶段。M3 开放 safe 和 caution 的文件类规则，命令类留给后续任务。
-pub const ENABLED_PHASES: &[Phase] = &[Phase::M3a, Phase::M3b];
+/// 允许执行清理的阶段。M3 开放 safe 和 caution 的文件类规则，M4 开放多版本残留。
+pub const ENABLED_PHASES: &[Phase] = &[Phase::M3a, Phase::M3b, Phase::M4];
 
 /// 递归清理锚点下的全部内容。
 const ALL_CONTENTS: Selector = Selector {
@@ -1120,16 +1122,7 @@ static CATALOG: &[Rule] = &[
         processes: &[],
         layout_markers: &[],
         warning: None,
-        target: Target::Paths {
-            root: KnownRoot::LocalAppData,
-            rels: &["wsl\\*"],
-            selector: Selector {
-                kind: SelectKind::TopFiles(&["*.vhdx"]),
-                min_age_hours: None,
-                exclude_newest_per_dir: false,
-                exclude_child_dirs: &[],
-            },
-        },
+        target: Target::Adapter(AdapterId::WslUnregisteredVhdx),
     },
     Rule {
         id: "manual-agent-data",

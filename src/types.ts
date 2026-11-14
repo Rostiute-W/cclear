@@ -116,6 +116,10 @@ export interface CandidateInfo {
   allocated: number;
   files: number;
   samples: string[];
+  // 判定依据，一条一个条目。残留规则靠它说明为什么选中这些目录。
+  evidence: string[];
+  // 没有选中某些项的原因。
+  notes: string[];
   executable: boolean;
 }
 
