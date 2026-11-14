@@ -19,6 +19,15 @@ pub struct Forbidden {
 }
 
 impl Forbidden {
+    /// 空禁区集合。隔离区这类完全由 CClear 自己写入的目录用它，
+    /// 用户目录的禁区规则不该挡住隔离区内部的相对打开。
+    pub fn empty() -> Self {
+        Self {
+            ids: HashSet::new(),
+            names: Vec::new(),
+        }
+    }
+
     /// 从规则里的禁区根目录建集合。不存在的目录直接跳过：没装的应用不该挡住启动。
     pub fn from_rules(roots: &RootMap) -> Self {
         let mut ids = HashSet::new();

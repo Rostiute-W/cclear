@@ -15,6 +15,11 @@ import type {
   PlanHistory,
   PlanItem,
   PlanSummary,
+  QuarantineBatch,
+  QuarantineResolveAction,
+  QuarantineResolveResult,
+  QuarantineRestoreResult,
+  QuarantineVolumes,
   RecycleBinInfo,
   RuleInfo,
   ScanProgress,
@@ -148,6 +153,38 @@ export function recycleBinEmpty(items: number, bytes: number): Promise<RecycleBi
 // 历史详情只传计划 ID：条目和跳过原因都从日志里读，界面不拼路径。
 export function historyDetail(planId: string, days: number): Promise<PlanDetail> {
   return invoke<PlanDetail>("history_detail", { planId, days });
+}
+
+// 隔离区：只传卷根和批次 ID，条目路径全部来自后端的批次清单。
+export function quarantineVolumes(): Promise<QuarantineVolumes> {
+  return invoke<QuarantineVolumes>("quarantine_volumes");
+}
+
+export function quarantineSetVolume(volumeRoot: string): Promise<QuarantineVolumes> {
+  return invoke<QuarantineVolumes>("quarantine_set_volume", { volumeRoot });
+}
+
+export function quarantineBatches(): Promise<QuarantineBatch[]> {
+  return invoke<QuarantineBatch[]>("quarantine_batches");
+}
+
+export function quarantineRestore(batchId: string): Promise<QuarantineRestoreResult> {
+  return invoke<QuarantineRestoreResult>("quarantine_restore", { batchId });
+}
+
+export function quarantinePurge(batchId: string): Promise<void> {
+  return invoke<void>("quarantine_purge", { batchId });
+}
+
+export function quarantineResolve(
+  batchId: string,
+  action: QuarantineResolveAction,
+): Promise<QuarantineResolveResult> {
+  return invoke<QuarantineResolveResult>("quarantine_resolve", { batchId, action });
+}
+
+export function quarantineOverdue(): Promise<QuarantineBatch[]> {
+  return invoke<QuarantineBatch[]>("quarantine_overdue");
 }
 
 type ScanListener = (progress: ScanProgress) => void;

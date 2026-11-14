@@ -4,7 +4,7 @@ mod commands;
 mod state;
 
 use cclear_core::win::{KnownFolder, known_folder};
-use tauri::{WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -23,6 +23,12 @@ pub fn run() {
                 .data_directory(data_directory)
                 .build()?;
 
+            // 上次没有做完的隔离批次要在用户操作之前收到确定状态，放到后台线程里做。
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                commands::quarantine::recover_on_startup(&handle.state::<state::AppState>());
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -37,6 +43,13 @@ pub fn run() {
             commands::plan::plan_cancel,
             commands::plan::history_list,
             commands::plan::history_detail,
+            commands::quarantine::quarantine_volumes,
+            commands::quarantine::quarantine_set_volume,
+            commands::quarantine::quarantine_batches,
+            commands::quarantine::quarantine_restore,
+            commands::quarantine::quarantine_purge,
+            commands::quarantine::quarantine_resolve,
+            commands::quarantine::quarantine_overdue,
             commands::recycle::recycle_bin_query,
             commands::recycle::recycle_bin_empty,
             commands::rules::rules_catalog,

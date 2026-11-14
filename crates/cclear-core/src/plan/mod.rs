@@ -129,11 +129,13 @@ pub fn build_plan(
     })
 }
 
-/// 只有直删类规则能生成清单：命令、隔离、特殊和系统操作各有自己的任务。
+/// 只有文件类规则能生成清单：命令、特殊和系统操作各有自己的任务。
+///
+/// 隔离类规则也走冻结清单，只是执行时交给隔离引擎，而不是逐项删除。
 fn plannable(rule: &Rule) -> bool {
     let recovery_ok = matches!(
         rule.recovery,
-        Recovery::Regenerable | Recovery::IrreversibleFile
+        Recovery::Regenerable | Recovery::IrreversibleFile | Recovery::Quarantine
     );
     let target_ok = matches!(
         rule.target,

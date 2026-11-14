@@ -1,12 +1,14 @@
 //! 按冻结清单执行清理：只动清单里的条目，每项都过一遍路径护栏。
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::guard::{self, DirHandle, Expect, Forbidden, GuardError, OpenIntent};
 use crate::journal::{JournalSink, Record, unix_now};
+use crate::model::Recovery;
 use crate::plan::{FrozenItem, FrozenPlan, PlanRule};
+use crate::quarantine::{BatchStage, QuarantineItem, QuarantineRoot};
 use crate::rules::catalog::find;
 use crate::win::process::ProcInfo;
 use crate::win::volume;
@@ -227,6 +229,11 @@ impl ExecContext<'_> {
             return (rule_report, Stop::Continue);
         }
 
+        // 隔离类规则不走逐项删除，整条交给隔离引擎处理。
+        if plan_rule.recovery == Recovery::Quarantine {
+            return self.quarantine_rule(plan_rule, rule_report, report);
+        }
+
         let items = &self.plan.items[plan_rule.items.start as usize..plan_rule.items.end as usize];
         let mut at = 0usize;
 
@@ -344,6 +351,98 @@ impl ExecContext<'_> {
         }
 
         None
+    }
+
+    /// 隔离类规则：整条交给隔离引擎，复制校验通过后才删源。
+    ///
+    /// 目录条目本身不复制，文件都隔离之后留下的空目录由用户自己处理。
+    fn quarantine_rule(
+        &mut self,
+        plan_rule: &PlanRule,
+        mut rule_report: RuleReport,
+        report: &mut ExecReport,
+    ) -> (RuleReport, Stop) {
+        let rule_id = plan_rule.rule_id;
+
+        let mut items: Vec<QuarantineItem> = Vec::new();
+        let frozen = &self.plan.items[plan_rule.items.start as usize..plan_rule.items.end as usize];
+        for item in frozen {
+            let anchor = plan_rule
+                .anchors
+                .get(item.anchor_index as usize)
+                .map(PathBuf::as_path)
+                .unwrap_or_else(|| Path::new(""));
+            let path = display_path(anchor, item);
+
+            if item.is_dir {
+                rule_report.skipped += 1;
+                report.add_skip(rule_id, path, "目录不隔离，已跳过".to_string());
+                continue;
+            }
+
+            items.push(QuarantineItem {
+                anchor_index: item.anchor_index,
+                rel: item.rel.clone(),
+            });
+        }
+
+        if items.is_empty() {
+            return (rule_report, Stop::Continue);
+        }
+
+        // 没有设置隔离区位置时不能退回直接删除，只能整条跳过。
+        let Some(root) = QuarantineRoot::from_settings() else {
+            let reason = "还没有设置隔离区位置，请在隔离区页选择保存卷".to_string();
+            if !self.skip_rule(rule_id, &reason) {
+                return (rule_report, Stop::Aborted);
+            }
+
+            rule_report.skipped += items.len() as u64;
+            report.add_skip(rule_id, String::new(), reason);
+            return (rule_report, Stop::Continue);
+        };
+
+        let outcome = root.quarantine(
+            rule_id,
+            self.forbidden,
+            &plan_rule.anchors,
+            &items,
+            self.journal,
+            self.cancel,
+        );
+
+        match outcome {
+            Ok(outcome) => {
+                rule_report.deleted_files += outcome.moved;
+                rule_report.freed_allocated += outcome.moved_size;
+                rule_report.skipped += outcome.kept;
+
+                for (path, reason) in outcome.skipped {
+                    rule_report.skipped += 1;
+                    report.add_skip(rule_id, path.to_string_lossy().into_owned(), reason);
+                }
+
+                // 批次没有走到“已隔离”时把原因带回执行报告。
+                if outcome.stage != BatchStage::Committed {
+                    report.add_skip(
+                        rule_id,
+                        String::new(),
+                        format!("隔离批次 {}：{}", outcome.batch_id, outcome.stage.label()),
+                    );
+                }
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                if !self.skip_rule(rule_id, &reason) {
+                    return (rule_report, Stop::Aborted);
+                }
+
+                rule_report.skipped += items.len() as u64;
+                report.add_skip(rule_id, String::new(), reason);
+            }
+        }
+
+        (rule_report, Stop::Continue)
     }
 
     /// 整条规则跳过时写日志，返回是否写成功。

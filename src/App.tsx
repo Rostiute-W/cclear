@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { appInfo } from "./api";
-import type { AppInfo } from "./types";
+import { appInfo, quarantineOverdue } from "./api";
+import { formatSize } from "./format";
+import type { AppInfo, QuarantineBatch } from "./types";
 import { CleanPage } from "./pages/Clean";
 import { HistoryPage } from "./pages/History";
 import { MigratePage } from "./pages/Migrate";
@@ -19,7 +20,7 @@ const NAV = [
 
 type PageId = (typeof NAV)[number]["id"];
 
-function renderPage(page: PageId) {
+function renderPage(page: PageId, onQuarantineChanged: () => void) {
   switch (page) {
     case "overview":
       return <OverviewPage />;
@@ -28,7 +29,8 @@ function renderPage(page: PageId) {
     case "space":
       return <SpacePage />;
     case "quarantine":
-      return <QuarantinePage />;
+      // 隔离区里处理过批次之后，顶部的超期横幅要跟着刷新。
+      return <QuarantinePage onChanged={onQuarantineChanged} />;
     case "migrate":
       return <MigratePage />;
     case "history":
@@ -39,12 +41,22 @@ function renderPage(page: PageId) {
 function App() {
   const [page, setPage] = useState<PageId>("overview");
   const [info, setInfo] = useState<AppInfo | null>(null);
+  const [overdue, setOverdue] = useState<QuarantineBatch[]>([]);
+
+  // 放太久的批次只提示，不自动删除：删不删由用户决定。
+  const refreshOverdue = () => {
+    quarantineOverdue()
+      .then(setOverdue)
+      .catch(() => setOverdue([]));
+  };
 
   useEffect(() => {
     // 权限徽标只用于展示，取不到时保持“普通权限”。
     appInfo()
       .then(setInfo)
       .catch(() => setInfo(null));
+
+    refreshOverdue();
   }, []);
 
   return (
@@ -56,6 +68,18 @@ function App() {
           {info?.isAdmin ? "管理员" : "普通权限"}
         </span>
       </header>
+
+      {overdue.length > 0 && (
+        <div className="banner">
+          <span>
+            隔离区有 {overdue.length} 个批次存放超过 7 天，共{" "}
+            {formatSize(overdue.reduce((total, batch) => total + batch.size, 0))}，需要你手动处理。
+          </span>
+          <button type="button" className="link" onClick={() => setPage("quarantine")}>
+            去处理
+          </button>
+        </div>
+      )}
 
       <div className="layout">
         <nav className="sidebar">
@@ -71,7 +95,7 @@ function App() {
           ))}
         </nav>
 
-        <main className="content">{renderPage(page)}</main>
+        <main className="content">{renderPage(page, refreshOverdue)}</main>
       </div>
     </div>
   );
