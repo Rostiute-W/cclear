@@ -1,0 +1,117 @@
+:root {
+  color-scheme: light;
+  font-family: "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  color: #1f2328;
+  background: #f6f7f9;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 48px;
+  padding: 0 16px;
+  background: #ffffff;
+  border-bottom: 1px solid #e3e6ea;
+}
+
+.brand {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.version {
+  color: #67707b;
+}
+
+.badge {
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 1px solid #d0d5dc;
+  border-radius: 10px;
+  color: #67707b;
+  background: #f2f4f7;
+}
+
+.badge-admin {
+  border-color: #f0c36d;
+  color: #8a5a00;
+  background: #fdf5e3;
+}
+
+.layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 180px;
+  padding: 12px 8px;
+  background: #ffffff;
+  border-right: 1px solid #e3e6ea;
+}
+
+.nav-item {
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #1f2328;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nav-item:hover {
+  background: #f2f4f7;
+}
+
+.nav-item-active {
+  background: #e8f0fe;
+  color: #1a56db;
+  font-weight: 600;
+}
+
+.content {
+  flex: 1;
+  padding: 20px 24px;
+  overflow: auto;
+}
+
+.content h2 {
+  margin: 0 0 12px;
+  font-size: 18px;
+}
+
+.placeholder {
+  margin: 0;
+  padding: 24px;
+  border: 1px dashed #d0d5dc;
+  border-radius: 8px;
+  color: #67707b;
+  background: #ffffff;
+}

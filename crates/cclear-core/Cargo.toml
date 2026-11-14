@@ -1,0 +1,13 @@
+[package]
+name = "cclear-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }

@@ -1,0 +1,21 @@
+[package]
+name = "cclear-app"
+version.workspace = true
+edition.workspace = true
+description = "CClear —— C 盘清理工具"
+
+[lib]
+name = "cclear_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "cclear"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+cclear-core = { path = "../crates/cclear-core" }
+serde.workspace = true
+tauri = { version = "2", features = [] }
