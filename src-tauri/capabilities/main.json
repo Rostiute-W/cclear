@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "主窗口只被授予本应用的命令权限",
+  "windows": ["main"],
+  "permissions": ["allow-app-info"]
+}
