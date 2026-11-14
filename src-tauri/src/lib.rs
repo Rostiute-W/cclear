@@ -27,6 +27,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app::app_info,
+            commands::rules::rules_catalog,
+            commands::rules::rules_evaluate,
             commands::scan::volume_info,
             commands::scan::default_scan_roots,
             commands::scan::scan_start,

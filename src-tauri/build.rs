@@ -2,6 +2,8 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "app_info",
+            "rules_catalog",
+            "rules_evaluate",
             "volume_info",
             "default_scan_roots",
             "scan_start",

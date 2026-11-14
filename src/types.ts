@@ -58,3 +58,55 @@ export interface FileEntry {
   allocated: number;
   lastWrite: number;
 }
+
+// 与 Rust 端 model.rs 的枚举一致，取值由 serde 转成 camelCase。
+export type Tier = "safe" | "caution" | "leftover" | "manual" | "forbidden";
+
+export type Recovery =
+  | "regenerable"
+  | "irreversibleFile"
+  | "quarantine"
+  | "irreversibleCommand"
+  | "none";
+
+export type Category = "system" | "browser" | "dev" | "app" | "leftover" | "userData" | "program";
+
+export type Phase = "analysis" | "m3a" | "m3b" | "m4" | "m5a" | "m5b";
+
+export type TargetKind = "paths" | "chromiumProfiles" | "adapter" | "command" | "special" | "system";
+
+export type CandidateStatusKind =
+  | "ready"
+  | "notPresent"
+  | "processRunning"
+  | "layoutMismatch"
+  | "phaseLocked"
+  | "forbidden"
+  | "insufficient";
+
+export interface RuleInfo {
+  id: string;
+  name: string;
+  description: string;
+  category: Category;
+  tier: Tier;
+  recovery: Recovery;
+  phase: Phase;
+  admin: boolean;
+  defaultSelected: boolean;
+  processes: string[];
+  warning: string | null;
+  targetKind: TargetKind;
+}
+
+export interface CandidateInfo {
+  ruleId: string;
+  status: CandidateStatusKind;
+  statusDetail: string | null;
+  anchors: string[];
+  logical: number;
+  allocated: number;
+  files: number;
+  samples: string[];
+  executable: boolean;
+}

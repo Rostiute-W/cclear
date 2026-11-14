@@ -5,6 +5,8 @@
   "windows": ["main"],
   "permissions": [
     "allow-app-info",
+    "allow-rules-catalog",
+    "allow-rules-evaluate",
     "allow-volume-info",
     "allow-default-scan-roots",
     "allow-scan-start",
