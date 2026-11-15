@@ -8,6 +8,7 @@ import {
   IconMigrate,
   IconOverview,
   IconQuarantine,
+  IconSettings,
   IconSpace,
 } from "./components/Icons";
 import { AlertBanner, StatusBadge } from "./components/Ui";
@@ -17,10 +18,11 @@ import { HistoryPage } from "./pages/History";
 import { MigratePage } from "./pages/Migrate";
 import { OverviewPage } from "./pages/Overview";
 import { QuarantinePage } from "./pages/Quarantine";
+import { SettingsPage } from "./pages/Settings";
 import { SpacePage } from "./pages/Space";
 import type { AppInfo, QuarantineBatch } from "./types";
 
-type PageId = "overview" | "clean" | "space" | "quarantine" | "migrate" | "history";
+type PageId = "overview" | "clean" | "space" | "quarantine" | "migrate" | "history" | "settings";
 
 const NAV: { id: PageId; label: string; icon: ReactNode }[] = [
   { id: "overview", label: "总览", icon: <IconOverview /> },
@@ -29,6 +31,7 @@ const NAV: { id: PageId; label: string; icon: ReactNode }[] = [
   { id: "quarantine", label: "隔离区", icon: <IconQuarantine /> },
   { id: "migrate", label: "迁移", icon: <IconMigrate /> },
   { id: "history", label: "历史", icon: <IconHistory /> },
+  { id: "settings", label: "设置", icon: <IconSettings /> },
 ];
 
 export default function App() {
@@ -125,7 +128,7 @@ export default function App() {
           )}
 
           {page === "overview" && <OverviewPage />}
-          {page === "clean" && <CleanPage />}
+          {page === "clean" && <CleanPage onOpenSettings={() => setPage("settings")} />}
           {page === "space" && <SpacePage onMigrate={openMigrateForNode} />}
           {page === "quarantine" && <QuarantinePage onChanged={refreshOverdue} />}
           {page === "migrate" && (
@@ -135,6 +138,7 @@ export default function App() {
             />
           )}
           {page === "history" && <HistoryPage />}
+          {page === "settings" && <SettingsPage />}
         </main>
       </div>
     </div>

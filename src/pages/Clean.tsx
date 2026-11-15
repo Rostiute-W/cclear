@@ -1,5 +1,6 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useState, type FormEvent } from "react";
 import {
+  aiAskRule,
   candidateLocks,
   commandExecute,
   elevatedExecute,
@@ -25,6 +26,7 @@ import { PlanPreview } from "../components/PlanPreview";
 import { AdminTag, AlertBanner, StatusBadge, type SemanticTone } from "../components/Ui";
 import { formatDuration, formatSize } from "../format";
 import type {
+  AiAnswer,
   CandidateInfo,
   CandidateStatusKind,
   CommandReport,
@@ -144,7 +146,7 @@ type ElevatedState =
   | { phase: "done"; result: ElevatedResult }
   | { phase: "failed"; message: string };
 
-export function CleanPage() {
+export function CleanPage({ onOpenSettings }: { onOpenSettings: () => void }) {
   const [rules, setRules] = useState<RuleInfo[]>([]);
   const [candidates, setCandidates] = useState<Map<string, CandidateInfo>>(new Map());
   const [evaluatedMs, setEvaluatedMs] = useState<number | null>(null);
@@ -157,6 +159,13 @@ export function CleanPage() {
   // 展开了判定证据的规则。残留规则靠证据说明为什么选中这些目录。
   const [openEvidence, setOpenEvidence] = useState<Set<string>>(new Set());
   const [lockStates, setLockStates] = useState<Record<string, LockState>>({});
+  // 清理页共享一个“问 AI”面板与请求锁，同一时间只允许发一条提问。
+  const [askRuleId, setAskRuleId] = useState<string | null>(null);
+  const [askQuestion, setAskQuestion] = useState("");
+  const [askBusy, setAskBusy] = useState(false);
+  const [askAnswer, setAskAnswer] = useState<AiAnswer | null>(null);
+  const [askError, setAskError] = useState<string | null>(null);
+  const [askSentOpen, setAskSentOpen] = useState(false);
   // 勾选的规则。每次重新评估后回到默认勾选状态。
   const [selected, setSelected] = useState<Set<string>>(new Set());
   // 生成中的清理预览。清单由后端持有，界面只拿计划 ID。
@@ -287,6 +296,110 @@ export function CleanPage() {
 
   const openLocation = (ruleId: string, sampleIndex: number | null) => {
     openCandidateInExplorer(ruleId, sampleIndex).catch((reason) => setError(String(reason)));
+  };
+
+  const toggleAsk = (ruleId: string) => {
+    if (askBusy) {
+      return;
+    }
+    if (askRuleId === ruleId) {
+      setAskRuleId(null);
+      return;
+    }
+    setAskRuleId(ruleId);
+    setAskQuestion("");
+    setAskAnswer(null);
+    setAskError(null);
+    setAskSentOpen(false);
+  };
+
+  const submitAsk = (event: FormEvent) => {
+    event.preventDefault();
+    if (!askRuleId || askBusy) {
+      return;
+    }
+    const trimmed = askQuestion.trim();
+    setAskBusy(true);
+    setAskAnswer(null);
+    setAskError(null);
+    setAskSentOpen(false);
+
+    aiAskRule(askRuleId, trimmed === "" ? null : trimmed)
+      .then(setAskAnswer)
+      .catch((reason) => setAskError(String(reason)))
+      .finally(() => setAskBusy(false));
+  };
+
+  const renderAskButton = (ruleId: string) => (
+    <button
+      type="button"
+      className="btn-link"
+      disabled={askBusy}
+      onClick={() => toggleAsk(ruleId)}
+    >
+      {askRuleId === ruleId ? "收起 AI" : "问 AI"}
+    </button>
+  );
+
+  const renderAskSubRow = (ruleId: string, colSpan: number) => {
+    if (askRuleId !== ruleId) {
+      return null;
+    }
+
+    return (
+      <tr className="sub-row">
+        <td colSpan={colSpan}>
+          <div className="ai-ask-box">
+            <form className="ai-ask-form" onSubmit={submitAsk}>
+              <input
+                type="text"
+                className="text-input"
+                value={askQuestion}
+                disabled={askBusy}
+                placeholder="可选：补充你想问的，例如‘我还在用 VS Code，能删吗？’"
+                onChange={(event) => setAskQuestion(event.target.value)}
+              />
+              <button type="submit" className="btn btn-primary" disabled={askBusy}>
+                {askBusy ? "发送中…" : "发送"}
+              </button>
+            </form>
+
+            {askBusy && (
+              <p className="muted" style={{ margin: 0 }}>
+                正在询问 AI…
+              </p>
+            )}
+
+            {askError && (
+              <div className="ai-ask-error">
+                <span className="danger-text">{askError}</span>
+                <button type="button" className="btn btn-subtle" onClick={onOpenSettings}>
+                  去设置
+                </button>
+              </div>
+            )}
+
+            {askAnswer && (
+              <div className="ai-answer-box">
+                <div className="ai-answer-meta">
+                  <StatusBadge tone="info">{askAnswer.model}</StatusBadge>
+                  <span className="muted">仅供参考</span>
+                  <button
+                    type="button"
+                    className="btn-link"
+                    onClick={() => setAskSentOpen((previous) => !previous)}
+                  >
+                    {askSentOpen ? "收起发送内容" : "查看发送内容"}
+                  </button>
+                </div>
+                <div className="ai-answer-text">{askAnswer.answer}</div>
+                {askSentOpen && <pre className="ai-sent-pre">{askAnswer.sent}</pre>}
+              </div>
+            )}
+          </div>
+        </td>
+      </tr>
+    );
   };
 
   // 生成冻结清单后由 PlanPreview 负责确认和执行。
@@ -616,21 +729,28 @@ export function CleanPage() {
                       <tr>
                         <th>名称</th>
                         <th>原因</th>
+                        <th>操作</th>
                       </tr>
                     </thead>
                     <tbody>
                       {groupRules.length === 0 && (
                         <tr>
-                          <td colSpan={2} className="muted">
+                          <td colSpan={3} className="muted">
                             这一类没有规则
                           </td>
                         </tr>
                       )}
                       {groupRules.map((rule) => (
-                        <tr key={rule.id}>
-                          <td className="td-nowrap">{rule.name}</td>
-                          <td>{rule.description}</td>
-                        </tr>
+                        <Fragment key={rule.id}>
+                          <tr>
+                            <td className="td-nowrap">{rule.name}</td>
+                            <td>{rule.description}</td>
+                            <td className="td-ops">
+                              <div className="actions">{renderAskButton(rule.id)}</div>
+                            </td>
+                          </tr>
+                          {renderAskSubRow(rule.id, 3)}
+                        </Fragment>
                       ))}
                     </tbody>
                   </table>
@@ -751,6 +871,7 @@ export function CleanPage() {
                                       {evidenceOpen ? "收起证据" : "查看证据"}
                                     </button>
                                   )}
+                                  {renderAskButton(rule.id)}
                                   {group.tier === "leftover" && (
                                     <button
                                       type="button"
@@ -826,50 +947,55 @@ export function CleanPage() {
                                 <td colSpan={6}>{elevatedResult(elevated)}</td>
                               </tr>
                             )}
+                            {renderAskSubRow(rule.id, 6)}
                           </Fragment>
                         );
                       })}
 
                       {specialRules.map((rule) => (
-                        <tr key={rule.id}>
-                          <td className="td-nowrap">
-                            <StatusBadge tone="danger">独立操作</StatusBadge>
-                          </td>
-                          <td className="td-rule-name">{rule.name}</td>
-                          <td className="td-num">{recycle ? formatSize(recycle.bytes) : "—"}</td>
-                          <td className="td-nowrap">
-                            {recycle ? (
-                              <StatusBadge tone="neutral">
-                                {recycle.items.toLocaleString()} 项
-                              </StatusBadge>
-                            ) : (
-                              <StatusBadge tone="neutral">读取失败</StatusBadge>
-                            )}
-                          </td>
-                          <td className="td-desc">
-                            <span>{rule.description}</span>
-                            {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
-                          </td>
-                          <td className="td-ops">
-                            <div className="actions">
-                              <button
-                                type="button"
-                                className="btn btn-danger-outline"
-                                disabled={!recycle || execBusy || recycle.items === 0}
-                                onClick={emptyRecycle}
-                              >
-                                {recycleBusy ? "正在清空…" : "清空回收站"}
-                              </button>
-                              <button
-                                type="button"
-                                className="btn btn-subtle"
-                                onClick={refreshRecycle}
-                              >
-                                重新查询
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
+                        <Fragment key={rule.id}>
+                          <tr>
+                            <td className="td-nowrap">
+                              <StatusBadge tone="danger">独立操作</StatusBadge>
+                            </td>
+                            <td className="td-rule-name">{rule.name}</td>
+                            <td className="td-num">{recycle ? formatSize(recycle.bytes) : "—"}</td>
+                            <td className="td-nowrap">
+                              {recycle ? (
+                                <StatusBadge tone="neutral">
+                                  {recycle.items.toLocaleString()} 项
+                                </StatusBadge>
+                              ) : (
+                                <StatusBadge tone="neutral">读取失败</StatusBadge>
+                              )}
+                            </td>
+                            <td className="td-desc">
+                              <span>{rule.description}</span>
+                              {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
+                            </td>
+                            <td className="td-ops">
+                              <div className="actions">
+                                <button
+                                  type="button"
+                                  className="btn btn-danger-outline"
+                                  disabled={!recycle || execBusy || recycle.items === 0}
+                                  onClick={emptyRecycle}
+                                >
+                                  {recycleBusy ? "正在清空…" : "清空回收站"}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn btn-subtle"
+                                  onClick={refreshRecycle}
+                                >
+                                  重新查询
+                                </button>
+                                {renderAskButton(rule.id)}
+                              </div>
+                            </td>
+                          </tr>
+                          {renderAskSubRow(rule.id, 6)}
+                        </Fragment>
                       ))}
                     </tbody>
                   </table>
@@ -921,27 +1047,34 @@ export function CleanPage() {
                   <th>选择</th>
                   <th>名称</th>
                   <th>说明</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
                 {maintenanceRules.map((rule) => (
-                  <tr key={rule.id}>
-                    <td className="td-nowrap">
-                      <input
-                        type="checkbox"
-                        className="checkbox-input"
-                        checked={maintenanceSelected.has(rule.id)}
-                        disabled={maintenanceRunning || anyAnalyzeRunning}
-                        onChange={() => toggleMaintenance(rule.id)}
-                        aria-label={`选择 ${rule.name}`}
-                      />
-                    </td>
-                    <td className="td-nowrap">{rule.name}</td>
-                    <td>
-                      <span>{rule.description}</span>
-                      {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
-                    </td>
-                  </tr>
+                  <Fragment key={rule.id}>
+                    <tr>
+                      <td className="td-nowrap">
+                        <input
+                          type="checkbox"
+                          className="checkbox-input"
+                          checked={maintenanceSelected.has(rule.id)}
+                          disabled={maintenanceRunning || anyAnalyzeRunning}
+                          onChange={() => toggleMaintenance(rule.id)}
+                          aria-label={`选择 ${rule.name}`}
+                        />
+                      </td>
+                      <td className="td-nowrap">{rule.name}</td>
+                      <td>
+                        <span>{rule.description}</span>
+                        {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
+                      </td>
+                      <td className="td-ops">
+                        <div className="actions">{renderAskButton(rule.id)}</div>
+                      </td>
+                    </tr>
+                    {renderAskSubRow(rule.id, 4)}
+                  </Fragment>
                 ))}
               </tbody>
             </table>
@@ -1058,15 +1191,18 @@ export function CleanPage() {
                             </p>
                           )}
                         </td>
-                        <td>
-                          <button
-                            type="button"
-                            className="btn btn-danger-outline"
-                            disabled={candidate?.executable !== true || execBusy || scope === ""}
-                            onClick={() => runCommand(rule, scope)}
-                          >
-                            {running ? "运行中…" : "运行"}
-                          </button>
+                        <td className="td-ops">
+                          <div className="actions">
+                            <button
+                              type="button"
+                              className="btn btn-danger-outline"
+                              disabled={candidate?.executable !== true || execBusy || scope === ""}
+                              onClick={() => runCommand(rule, scope)}
+                            >
+                              {running ? "运行中…" : "运行"}
+                            </button>
+                            {renderAskButton(rule.id)}
+                          </div>
                         </td>
                       </tr>
 
@@ -1095,6 +1231,7 @@ export function CleanPage() {
                           </td>
                         </tr>
                       )}
+                      {renderAskSubRow(rule.id, 5)}
                     </Fragment>
                   );
                 })}

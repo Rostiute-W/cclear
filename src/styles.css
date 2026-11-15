@@ -1407,6 +1407,136 @@ button {
   }
 }
 
+/* 设置页表单与文本输入 */
+.text-input {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-input);
+  color: var(--fg);
+}
+
+.text-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.text-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 680px;
+}
+
+.settings-row {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+}
+
+.settings-row .field-label {
+  padding-top: 8px;
+}
+
+.settings-key-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-key-wrap .text-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-actions {
+  padding-left: 100px;
+}
+
+.settings-providers {
+  max-width: 680px;
+}
+
+/* 清理页内嵌 AI 咨询面板 */
+.ai-ask-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 100%;
+}
+
+.ai-ask-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ai-ask-form .text-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.ai-ask-error {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ai-answer-box {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ai-answer-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ai-answer-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--fg);
+}
+
+.ai-sent-pre {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .plan-preview-highlight {
     animation: none;
