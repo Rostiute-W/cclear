@@ -97,8 +97,9 @@ export function SettingsPage() {
         </div>
 
         <p className="card-lead">
-          仅在你主动点击规则旁边的“问 AI”时，向你填写的服务地址发送一次只读请求。发送前会自动脱敏本机路径与用户名；
-          API Key 仅以 Windows DPAPI 加密后保存在本地，不返回界面、不写入日志。AI 回答仅供参考，不会改变任何清理、隔离或迁移行为。
+          {
+            "只在你点击‘问 AI’时才联网，请求只发往上面填写的地址。发送前会把用户目录替换为 %USERPROFILE%、把用户名替换为 <用户名>。API Key 用 Windows 加密保存，只有当前 Windows 账号能解开。AI 的回答仅供参考，不会自动执行任何清理。"
+          }
         </p>
 
         <form className="settings-form" onSubmit={onSubmit}>

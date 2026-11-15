@@ -494,13 +494,11 @@ fn match_needle(text: &str, start: usize, needle: &[char]) -> Option<usize> {
     Some(end)
 }
 
-/// 用户名替换时认可的边界：分隔符、空白和引号。
+/// 用户名替换时的边界：除 ASCII 字母、ASCII 数字、`_`、`-` 以外的任何字符都算边界
+///（包括 `.`、中英文标点、汉字、空白、引号与分隔符），避免误伤 `Alicex`、`Alice_1`、`Alice-PC`
+/// 这类标识符，同时让紧邻中文或标点的用户名也能正常脱敏。
 fn is_boundary(current: char) -> bool {
-    current == '\\'
-        || current == '/'
-        || current.is_whitespace()
-        || current == '"'
-        || current == '\''
+    !current.is_ascii_alphanumeric() && current != '_' && current != '-'
 }
 
 /// 占用大小的展示写法，统一用二进制单位。
