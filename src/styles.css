@@ -1386,7 +1386,32 @@ button {
   color: var(--fg-muted);
 }
 
+/* 预览生成后短暂高亮，先保持以便长页面平滑滚动到位后仍可见，再淡出移除类名 */
+.plan-preview-highlight {
+  animation: cclear-preview-highlight 1.5s ease-out;
+}
+
+@keyframes cclear-preview-highlight {
+  0%,
+  55% {
+    box-shadow:
+      0 0 0 2px var(--accent),
+      0 0 0 6px var(--accent-soft),
+      var(--shadow-md);
+  }
+  100% {
+    box-shadow:
+      0 0 0 0 transparent,
+      0 0 0 0 transparent,
+      var(--shadow-sm);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .plan-preview-highlight {
+    animation: none;
+  }
+
   *,
   *::before,
   *::after {

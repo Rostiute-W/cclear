@@ -1,5 +1,5 @@
 // 执行前的预览确认。清单由后端持有，这里只按计划 ID 取条目、发起执行和取消。
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { planCancel, planExecute, planItems, rulesCatalog } from "../api";
 import { formatSize, formatTime } from "../format";
 import type {
@@ -68,6 +68,25 @@ export function PlanPreview({
   const [progress, setProgress] = useState<Record<string, ExecProgress>>({});
   const [report, setReport] = useState<ExecReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [highlighted, setHighlighted] = useState(false);
+
+  // 新预览出现时自动滚入视野并短暂高亮，覆盖清理页与迁移页两个调用方。
+  useEffect(() => {
+    const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    rootRef.current?.scrollIntoView({
+      behavior: reduced ? "auto" : "smooth",
+      block: "start",
+    });
+    if (reduced) {
+      setHighlighted(false);
+      return;
+    }
+
+    setHighlighted(true);
+    const timer = window.setTimeout(() => setHighlighted(false), 1600);
+    return () => window.clearTimeout(timer);
+  }, [planId]);
 
   useEffect(() => {
     rulesCatalog()
@@ -138,10 +157,19 @@ export function PlanPreview({
   const skippedShown = report ? report.skipped.length : 0;
 
   return (
-    <div className={hasIrreversible ? "card card-tier-forbidden" : "card card-tier-safe"}>
+    <div
+      ref={rootRef}
+      className={[
+        hasIrreversible ? "card card-tier-forbidden" : "card card-tier-safe",
+        highlighted ? "plan-preview-highlight" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
       <div className="card-header">
         <div className="card-title-group">
           <h3 className="card-title">清理预览</h3>
+          <span className="muted">确认下面的清单后点击开始清理</span>
           {hasIrreversible && (
             <StatusBadge tone="danger" icon={<IconWarning width={12} height={12} />}>
               包含不可恢复删除项
