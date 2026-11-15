@@ -23,6 +23,7 @@ crates/cclear-core/src/
   elevation/    提权 helper
   special/      回收站等特殊操作
   envstate.rs   环境状态卡
+  ai/           AI 咨询：地址校验、脱敏、提问（T20a）
 crates/cclear-core/tests/   所有测试都放在这里（集成测试）
 src-tauri/src/  main.rs  lib.rs  state.rs  commands/*.rs   只做 IPC 薄层，不写业务逻辑
 src/            main.tsx  App.tsx  api.ts（所有 invoke 的类型化封装）  types.ts  pages/  components/  styles.css
@@ -32,7 +33,7 @@ src/            main.tsx  App.tsx  api.ts（所有 invoke 的类型化封装） 
 1. **破坏性文件操作只能出现在 `crates/cclear-core/src/guard/`**，包括删除、改名、移动、设置 delete disposition、创建或删除 reparse point。清空回收站只能在 `special/recycle_bin.rs`。启动外部进程只能在 `exec/command.rs` 和 `elevation/`。`scripts/check-forbidden-apis.ps1` 会自动检查。不得改动这个脚本，也不得用别名、宏或字符串拼接绕过检查。
 2. `unsafe` 只允许出现在 `win/`、`guard/`、`special/`、`elevation/` 中。每个 `unsafe` 块要有一行 `// SAFETY:` 说明。
 3. 测试和验收命令**绝不能触碰真实用户数据或系统路径**。测试只能在 `tempfile::tempdir()` 创建的目录里操作，规则解析类测试通过注入的“根目录映射”指向临时目录。
-4. 不联网、不做遥测、不自动更新。不以管理员身份运行主程序（manifest 保持 asInvoker）。
+4. 不联网、不做遥测、不自动更新。不以管理员身份运行主程序（manifest 保持 asInvoker）。唯一例外是 AI 咨询（T20a 起，见 `docs/plan-final.md` §10）：只在用户点击“问 AI”时，向用户自己填写的地址发一次请求；地址只允许 https 或本机 http，禁止重定向；发送前必须经过 `ai::redact` 脱敏；网络请求代码只能在 `win/http.rs`，调用方只能是 `ai/`；API Key 只能以 DPAPI 加密形式落盘，不返回前端、不进日志；AI 的回答只用于展示，不得触发或改变任何清理、隔离、迁移操作。
 5. 不强杀进程、不停第三方服务、不接管所有权、不修改 ACL（T12 创建隔离根目录时设置自身 DACL 除外）、不清除只读属性。遇到这些情况时跳过该项，并在结果中说明原因。
 6. 任何失败都只能导致“跳过并报告”。不允许扩大删除范围、退回直接删除目录或提升权限去兜底。
 7. 前端只向后端传 ID（计划 ID、规则 ID、条目 ID）和用户选择。**任何路径都不能从前端直接传入执行类命令**。T03 扫描路径和 T17 迁移源这类分析输入，必须先经过 `guard::validate_external_path`。
