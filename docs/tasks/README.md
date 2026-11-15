@@ -33,6 +33,7 @@
 | T19 | 预览生成后自动滚动到预览（agy 亲手实现） | 功能补充 | |
 | T20a | AI 咨询后端：设置、加密保存、脱敏、WinHTTP 请求（DSH） | 功能补充 | |
 | T20b | AI 咨询界面：设置页与“问 AI”（agy 亲手实现） | 功能补充 | **F** |
+| T20c | 检查点 F 修复：用户名脱敏边界、设置页说明（agy 亲手实现） | 功能补充 | **F 复审** |
 
 ## agy 的执行流程（每个任务都一样）
 1. 确认原仓库干净：`git -C G:\cclear status --short` 没有输出。用 `git -C G:\cclear rev-parse HEAD` 取得完整提交号，作为 `baseCommit`。
