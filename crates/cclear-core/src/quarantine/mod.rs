@@ -30,7 +30,8 @@ use crate::win::volume;
 
 pub use manifest::{BatchStage, BatchSummary, DATA_DIR, ItemState, Manifest, ManifestItem};
 pub use settings::{
-    load_quarantine_root, load_quarantine_roots, save_quarantine_root, settings_path,
+    AiSettings, KeyUpdate, load_ai_settings, load_quarantine_root, load_quarantine_roots,
+    save_ai_settings, save_quarantine_root, settings_path,
 };
 pub use volumes::{QUARANTINE_DIR_NAME, candidate_volumes, default_root};
 

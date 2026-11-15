@@ -1,5 +1,6 @@
 //! IPC 命令。
 
+pub mod ai;
 pub mod app;
 pub mod clean;
 pub mod devcache;

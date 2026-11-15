@@ -1,6 +1,8 @@
 // 所有 invoke 的类型化封装。扫描路径只能由这里按用户选择发起，界面不拼路径。
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
+  AiAnswer,
+  AiSettings,
   AppInfo,
   CandidateInfo,
   CommandProgress,
@@ -45,6 +47,24 @@ export function appInfo(): Promise<AppInfo> {
 
 export function envState(): Promise<EnvState> {
   return invoke<EnvState>("env_state");
+}
+
+// AI 咨询：设置里只回传有没有 Key；提问只传规则 ID 和可选问题，规则信息由后端重新评估。
+export function aiSettingsGet(): Promise<AiSettings> {
+  return invoke<AiSettings>("ai_settings_get");
+}
+
+// apiKey 为 null 保留已保存的 Key，空串清除，其他值由后端加密保存。
+export function aiSettingsSave(
+  baseUrl: string,
+  model: string,
+  apiKey: string | null,
+): Promise<AiSettings> {
+  return invoke<AiSettings>("ai_settings_save", { baseUrl, model, apiKey });
+}
+
+export function aiAskRule(ruleId: string, question: string | null): Promise<AiAnswer> {
+  return invoke<AiAnswer>("ai_ask_rule", { ruleId, question });
 }
 
 export function rulesCatalog(): Promise<RuleInfo[]> {

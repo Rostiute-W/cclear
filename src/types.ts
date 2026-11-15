@@ -4,6 +4,20 @@ export interface AppInfo {
   isAdmin: boolean;
 }
 
+// AI 咨询的设置。Key 只回传“有没有配置”，明文永远不返回前端。
+export interface AiSettings {
+  baseUrl: string | null;
+  model: string | null;
+  hasKey: boolean;
+}
+
+// 一次提问的结果。sent 是实际发出的内容（已脱敏），界面用它让用户看到发了什么。
+export interface AiAnswer {
+  answer: string;
+  model: string;
+  sent: string;
+}
+
 export interface VolumeInfo {
   root: string;
   label: string;

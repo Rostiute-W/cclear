@@ -1,5 +1,6 @@
 //! CClear 核心库：扫描、规则、计划、执行与路径护栏。
 
+pub mod ai;
 pub mod elevation;
 pub mod envstate;
 pub mod error;
