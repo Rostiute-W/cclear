@@ -40,6 +40,22 @@ fn redact_hides_profile_and_username() {
         redact(r"目录 C:\Users\Alice\Desktop 存在", profile),
         r"目录 %USERPROFILE%\Desktop 存在"
     );
+
+    // 紧邻中文标点、括号或汉字的用户名也要脱敏，带下划线或连字符的标识符则保持原样。
+    assert_eq!(
+        redact("用户名 Alice，能删吗", profile),
+        "用户名 <用户名>，能删吗"
+    );
+    assert_eq!(redact("（ALICE）", profile), "（<用户名>）");
+    assert_eq!(redact("用户名Alice能删吗", profile), "用户名<用户名>能删吗");
+    assert_eq!(
+        redact(r"D:\Backup\Alice_1\y", profile),
+        r"D:\Backup\Alice_1\y"
+    );
+    assert_eq!(
+        redact(r"D:\Backup\Alice-PC\y", profile),
+        r"D:\Backup\Alice-PC\y"
+    );
 }
 
 #[test]
