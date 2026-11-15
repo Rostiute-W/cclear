@@ -4,6 +4,9 @@
   "description": "主窗口只被授予本应用的命令权限",
   "windows": ["main"],
   "permissions": [
+    "allow-ai-settings-get",
+    "allow-ai-settings-save",
+    "allow-ai-ask-rule",
     "allow-app-info",
     "allow-candidate-locks",
     "allow-open-candidate-in-explorer",

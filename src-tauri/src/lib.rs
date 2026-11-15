@@ -34,6 +34,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::ai::ai_settings_get,
+            commands::ai::ai_settings_save,
+            commands::ai::ai_ask_rule,
             commands::app::app_info,
             commands::clean::candidate_locks,
             commands::clean::open_candidate_in_explorer,

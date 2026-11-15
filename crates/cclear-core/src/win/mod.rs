@@ -2,7 +2,9 @@
 
 pub mod acl;
 pub mod dirinfo;
+pub mod dpapi;
 pub mod fileversion;
+pub mod http;
 pub mod process;
 pub mod registry;
 pub mod restart_manager;

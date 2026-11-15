@@ -1,6 +1,9 @@
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "ai_settings_get",
+            "ai_settings_save",
+            "ai_ask_rule",
             "app_info",
             "candidate_locks",
             "open_candidate_in_explorer",
