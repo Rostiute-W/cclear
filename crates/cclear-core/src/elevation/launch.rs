@@ -1,18 +1,22 @@
 //! 用 `ShellExecuteExW` 以 runas 启动当前 exe 的 helper 模式，并等它结束。
 
+use std::ffi::OsStr;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
-use std::thread;
+use std::sync::atomic::Ordering;
 
-use windows::Win32::Foundation::{ERROR_CANCELLED, HANDLE};
-use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+use uuid::Uuid;
+use windows::Win32::Foundation::{ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
 use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows::core::PCWSTR;
 
 use super::ElevationError;
-use super::HelperResult;
+use super::{HelperResult, RunOptions};
+use crate::guard::{self, DirHandle, Forbidden};
 
 /// `runas` 动词。UAC 取消时 `ShellExecuteExW` 返回 `ERROR_CANCELLED`。
 const RUN_AS_VERB: &str = "runas";
@@ -23,12 +27,18 @@ const RUN_AS_VERB: &str = "runas";
 pub fn runas_and_wait(
     program: &Path,
     params: &[String],
-    result_file: &Path,
+    directory: &DirHandle,
+    id: Uuid,
+    options: &RunOptions<'_>,
 ) -> Result<HelperResult, ElevationError> {
     let program_wide = wide_path(program);
     let verb_wide = wide(RUN_AS_VERB);
     // 用户名可能带空格，--result 路径必须按 Windows 命令行规则加引号，否则会被拆成多个参数。
     let params_wide = wide(&command_line(params));
+    let system = crate::win::known_folder(crate::win::KnownFolder::Windows)
+        .map_err(|error| ElevationError::Launch(error.to_string()))?
+        .join("System32");
+    let system_wide = wide_path(&system);
 
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -36,6 +46,7 @@ pub fn runas_and_wait(
         lpVerb: PCWSTR(verb_wide.as_ptr()),
         lpFile: PCWSTR(program_wide.as_ptr()),
         lpParameters: PCWSTR(params_wide.as_ptr()),
+        lpDirectory: PCWSTR(system_wide.as_ptr()),
         nShow: SW_HIDE.0,
         ..Default::default()
     };
@@ -60,24 +71,74 @@ pub fn runas_and_wait(
     // SAFETY: 句柄由 ShellExecuteExW 成功返回，所有权转交给 OwnedHandle，由它负责关闭。
     let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess.0) };
 
-    let waiter = thread::spawn(move || {
-        // SAFETY: 句柄由 OwnedHandle 持有，等待期间一直有效；只等待，不结束进程。
-        unsafe {
-            WaitForSingleObject(HANDLE(process.as_raw_handle()), INFINITE);
-            let mut code = 0u32;
-            let _ = GetExitCodeProcess(HANDLE(process.as_raw_handle()), &mut code);
-            code
+    let handle = HANDLE(process.as_raw_handle());
+    let cancelled_name = format!("{id}.cancel");
+    let progress_name = format!("{id}.progress");
+    let forbidden = Forbidden::empty();
+    let mut sent_cancel = false;
+    loop {
+        if !sent_cancel
+            && options
+                .cancel
+                .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        {
+            sent_cancel = guard::create_file_in(directory, OsStr::new(&cancelled_name)).is_ok();
         }
-    });
+        if let Some((_, progress)) = options.mft
+            && let Ok(mut file) =
+                guard::path::read_file(directory.path(), &progress_name, &forbidden)
+            && let Ok(length) = file.metadata().map(|metadata| metadata.len())
+            && file
+                .seek(SeekFrom::Start(length.saturating_sub(256)))
+                .is_ok()
+        {
+            let mut buffer = String::new();
+            if file.take(256).read_to_string(&mut buffer).is_ok()
+                && let Some(line) = buffer
+                    .lines()
+                    .rev()
+                    .find(|line| line.starts_with('[') && line.ends_with(']'))
+                && let Ok([dirs, files, allocated]) = serde_json::from_str::<[u64; 3]>(line)
+            {
+                progress.dirs.store(dirs, Ordering::Relaxed);
+                progress.files.store(files, Ordering::Relaxed);
+                progress.allocated.store(allocated, Ordering::Relaxed);
+            }
+        }
+        // SAFETY: 进程句柄由 OwnedHandle 保持有效，短时等待后可更新进度及取消状态。
+        match unsafe { WaitForSingleObject(handle, 150) } {
+            WAIT_OBJECT_0 => break,
+            WAIT_TIMEOUT => {}
+            _ => {
+                return Err(ElevationError::Launch(
+                    std::io::Error::last_os_error().to_string(),
+                ));
+            }
+        }
+    }
+    let mut exit_code = 0;
+    // SAFETY: 进程句柄仍由 OwnedHandle 持有，退出码写入本地变量。
+    unsafe { GetExitCodeProcess(handle, &mut exit_code) }
+        .map_err(|error| ElevationError::Launch(error.to_string()))?;
+    if exit_code == 6 {
+        return Err(ElevationError::Launch(
+            "管理员操作无法验证当前用户的请求，请使用同一 Windows 账户授权".into(),
+        ));
+    }
 
-    let exit_code = waiter
-        .join()
-        .map_err(|_| ElevationError::Launch("等待 helper 结束的线程异常退出".to_string()))?;
-
-    let text = std::fs::read_to_string(result_file)
+    let file = guard::path::read_file(directory.path(), &format!("{id}.json"), &forbidden)
         .map_err(|_| ElevationError::MissingResult { exit_code })?;
-
-    serde_json::from_str(&text).map_err(|error| ElevationError::Result(error.to_string()))
+    const MAX_RESULT: u64 = 256 * 1024 * 1024;
+    if file
+        .metadata()
+        .map_err(|error| ElevationError::Result(error.to_string()))?
+        .len()
+        > MAX_RESULT
+    {
+        return Err(ElevationError::Result("管理员结果超过大小限制".into()));
+    }
+    serde_json::from_reader(std::io::BufReader::new(file.take(MAX_RESULT + 1)))
+        .map_err(|error| ElevationError::Result(error.to_string()))
 }
 
 /// 把 helper 参数拼成 `lpParameters` 字符串。

@@ -1,166 +1,57 @@
-//! 跨命令共享的运行时状态。
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use cclear_core::orchestrator::{JunkScan, deep_slim::WinSxSState, space::SpaceScan};
 
-use cclear_core::plan::FrozenPlan;
-use cclear_core::scan::ScanResult;
-use uuid::Uuid;
-
-/// 最近一次扫描结果、当前扫描的取消开关，以及冻结清单。
-///
-/// 执行类命令只接受节点 ID 或文件序号，路径一律从这里取，前端拿不到自由路径。
 #[derive(Default)]
 pub struct AppState {
-    scan_counter: AtomicU64,
-    /// 是否有扫描正在后台运行。
-    running: AtomicBool,
-    root: Mutex<Option<String>>,
-    result: Mutex<Option<Arc<ScanResult>>>,
-    cancel: Mutex<Option<Arc<AtomicBool>>>,
-    /// 冻结清单只保留最近一份：新预览会替换旧清单，避免执行一份已经过期的计划。
-    plans: Mutex<HashMap<Uuid, Arc<FrozenPlan>>>,
-    /// 是否有清理正在执行。同一时间只允许一次，否则两份清单会互相干扰。
-    exec_running: AtomicBool,
-    exec_cancel: Mutex<Option<Arc<AtomicBool>>>,
-    /// 启动恢复的结果和错误。迁移页读它显示，避免恢复失败只留在后台线程里。
-    recovery_notes: Mutex<Vec<String>>,
+    pub operation: Mutex<()>,
+    pub junk: Mutex<Option<JunkScan>>,
+    pub space: Mutex<Option<Arc<SpaceScan>>>,
+    pub conflicts: Mutex<Vec<String>>,
+    pub winsxs: Mutex<WinSxSState>,
+    pub junk_cancel: Cancellation,
+    pub clean_cancel: Cancellation,
+    pub space_cancel: Cancellation,
 }
 
-impl AppState {
-    /// 登记一次新扫描，返回扫描 ID 和取消开关。
-    ///
-    /// 同一时间只允许一次扫描：两次扫描会互相覆盖结果和取消标志。
-    pub fn start_scan(&self) -> Result<(String, Arc<AtomicBool>), String> {
-        if self.running.swap(true, Ordering::SeqCst) {
-            return Err("已经有扫描在进行，请等待结束或先取消".to_string());
+pub fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
+    mutex
+        .lock()
+        .map_err(|_| "应用状态不可用，请重启 CClear".into())
+}
+
+#[derive(Default)]
+pub struct Cancellation(Mutex<Option<Arc<AtomicBool>>>);
+
+pub struct Active<'a> {
+    owner: &'a Cancellation,
+    pub flag: Arc<AtomicBool>,
+}
+
+impl Cancellation {
+    pub fn start(&self) -> Result<Active<'_>, String> {
+        let mut current = lock(&self.0)?;
+        if current.is_some() {
+            return Err("已有同类操作正在运行".into());
         }
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        *self.cancel.lock().unwrap() = Some(cancel.clone());
-
-        let index = self.scan_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        Ok((format!("scan-{index}"), cancel))
+        let flag = Arc::new(AtomicBool::new(false));
+        *current = Some(Arc::clone(&flag));
+        Ok(Active { owner: self, flag })
     }
 
-    /// 保存扫描结果并清掉运行标记。
-    pub fn finish_scan(&self, result: ScanResult, root: String) {
-        *self.root.lock().unwrap() = Some(root);
-        *self.result.lock().unwrap() = Some(Arc::new(result));
-        self.clear_running();
-    }
-
-    /// 扫描失败或线程异常时只清掉运行标记，不动上一次的结果。
-    pub fn abort_scan(&self) {
-        self.clear_running();
-    }
-
-    /// 请求取消当前扫描。没有扫描时什么也不做。
-    pub fn cancel_scan(&self) {
-        if let Some(flag) = self.cancel.lock().unwrap().as_ref() {
-            flag.store(true, Ordering::SeqCst);
+    pub fn cancel(&self) -> Result<(), String> {
+        if let Some(flag) = lock(&self.0)?.as_ref() {
+            flag.store(true, Ordering::Relaxed);
         }
-    }
-
-    /// 取最近一次扫描结果。还没扫过时返回 None。
-    pub fn result(&self) -> Option<Arc<ScanResult>> {
-        self.result.lock().unwrap().clone()
-    }
-
-    /// 最近一次扫描的根路径。扫描刚起步就被取消时结果里没有根节点，界面靠它显示扫描范围。
-    pub fn scan_root(&self) -> String {
-        self.root.lock().unwrap().clone().unwrap_or_default()
-    }
-
-    fn clear_running(&self) {
-        *self.cancel.lock().unwrap() = None;
-        self.running.store(false, Ordering::SeqCst);
-    }
-
-    /// 存下一份新的冻结清单，并丢掉之前那份。
-    pub fn store_plan(&self, plan: FrozenPlan) {
-        let plan_id = plan.plan_id;
-        let mut plans = self.plans.lock().unwrap();
-        plans.clear();
-        plans.insert(plan_id, Arc::new(plan));
-    }
-
-    /// 按 ID 取冻结清单。过期或被替换时返回 None。
-    pub fn plan(&self, plan_id: Uuid) -> Option<Arc<FrozenPlan>> {
-        self.plans.lock().unwrap().get(&plan_id).cloned()
-    }
-
-    /// 登记一次清理执行。已经有清理在进行时返回错误。
-    ///
-    /// 返回的守卫代表这次执行，离开作用域时自动释放执行锁。
-    pub fn start_exec(&self) -> Result<ExecLock<'_>, String> {
-        if self.exec_running.swap(true, Ordering::SeqCst) {
-            return Err("已经有一次清理在进行，请等待结束或先取消".to_string());
-        }
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        *self.exec_cancel.lock().unwrap() = Some(cancel.clone());
-
-        Ok(ExecLock {
-            state: self,
-            cancel,
-        })
-    }
-
-    /// 执行结束（无论成功、中止还是取消）后清掉运行标记。
-    fn finish_exec(&self) {
-        *self.exec_cancel.lock().unwrap() = None;
-        self.exec_running.store(false, Ordering::SeqCst);
-    }
-
-    /// 请求取消当前清理。没有清理时什么也不做。
-    pub fn cancel_exec(&self) {
-        if let Some(flag) = self.exec_cancel.lock().unwrap().as_ref() {
-            flag.store(true, Ordering::SeqCst);
-        }
-    }
-
-    /// 记下一条启动恢复的结果。相同的说明只留一条，界面重复打开不会堆积。
-    pub fn push_recovery_note(&self, note: String) {
-        let mut notes = self.recovery_notes.lock().unwrap();
-        if !notes.contains(&note) {
-            notes.push(note);
-        }
-    }
-
-    /// 移除已经不再适用的恢复说明（例如用户确认使用备份之后撤掉先前的等待提示）。
-    pub fn clear_recovery_note(&self, note: &str) {
-        self.recovery_notes
-            .lock()
-            .unwrap()
-            .retain(|item| item != note);
-    }
-
-    /// 启动恢复留下的说明，界面在迁移页显示。
-    pub fn recovery_notes(&self) -> Vec<String> {
-        self.recovery_notes.lock().unwrap().clone()
+        Ok(())
     }
 }
 
-/// 一次清理执行的守卫。清单执行、命令执行和清空回收站共用同一把锁。
-///
-/// 用守卫而不是手动调用 `finish_exec`：失败或 panic 展开时锁也会还回去，
-/// 否则之后所有清理类操作都会被拒绝。
-pub struct ExecLock<'a> {
-    state: &'a AppState,
-    cancel: Arc<AtomicBool>,
-}
-
-impl ExecLock<'_> {
-    /// 取消开关。执行器按它判断是否要中止。
-    pub fn cancel(&self) -> Arc<AtomicBool> {
-        self.cancel.clone()
-    }
-}
-
-impl Drop for ExecLock<'_> {
+impl Drop for Active<'_> {
     fn drop(&mut self) {
-        self.state.finish_exec();
+        if let Ok(mut current) = self.owner.0.lock() {
+            *current = None;
+        }
     }
 }

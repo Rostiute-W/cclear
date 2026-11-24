@@ -7,6 +7,8 @@
 pub mod external;
 pub mod forbidden;
 pub mod path;
+pub mod reboot;
+pub mod recycle;
 
 use std::io;
 use std::path::PathBuf;
@@ -48,6 +50,9 @@ pub enum GuardError {
 
     #[error("文件带只读属性，未删除")]
     ReadOnly,
+
+    #[error("无法移入回收站，未删除")]
+    CannotRecycle,
 
     #[error("目录不为空")]
     DirNotEmpty,

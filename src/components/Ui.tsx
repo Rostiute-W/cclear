@@ -1,6 +1,6 @@
 // 纯展示型通用界面组件，不持有业务状态，也不发起后端调用。
 import type { ReactNode } from "react";
-import { IconInfo, IconLock, IconShield, IconWarning } from "./Icons";
+import { IconInfo, IconShield, IconWarning } from "./Icons";
 
 export type SemanticTone = "safe" | "caution" | "quarantine" | "danger" | "info" | "neutral";
 
@@ -45,14 +45,6 @@ export function AlertBanner({
       <div className="alert-content">{children}</div>
       {actions && <div className="alert-actions">{actions}</div>}
     </div>
-  );
-}
-
-export function AdminTag() {
-  return (
-    <StatusBadge tone="caution" icon={<IconLock width={12} height={12} />}>
-      需要管理员
-    </StatusBadge>
   );
 }
 

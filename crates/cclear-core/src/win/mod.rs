@@ -1,10 +1,7 @@
 //! 对 Win32 的薄封装。
 
-pub mod acl;
 pub mod dirinfo;
-pub mod dpapi;
-pub mod fileversion;
-pub mod http;
+pub mod mft;
 pub mod process;
 pub mod registry;
 pub mod restart_manager;
@@ -109,6 +106,36 @@ pub fn is_elevated() -> bool {
 
         let _ = CloseHandle(token);
         queried && elevation.TokenIsElevated != 0
+    }
+}
+
+pub(crate) fn compact_vhdx(path: &Path) -> io::Result<()> {
+    use windows::Win32::Storage::Vhd::*;
+    let wide: Vec<_> = to_verbatim(path)
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let storage = VIRTUAL_STORAGE_TYPE {
+        DeviceId: VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+        VendorId: VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
+    };
+    let mut handle = HANDLE::default();
+    // SAFETY: 虚拟磁盘类型、宽路径和输出句柄均在调用期间有效，操作完成后关闭磁盘句柄。
+    unsafe {
+        OpenVirtualDisk(
+            &storage,
+            PCWSTR(wide.as_ptr()),
+            VIRTUAL_DISK_ACCESS_METAOPS,
+            OPEN_VIRTUAL_DISK_FLAG_NONE,
+            None,
+            &mut handle,
+        )
+        .ok()
+        .map_err(io::Error::from)?;
+        let result = CompactVirtualDisk(handle, COMPACT_VIRTUAL_DISK_FLAG_NONE, None, None);
+        let _ = CloseHandle(handle);
+        result.ok().map_err(io::Error::from)
     }
 }
 

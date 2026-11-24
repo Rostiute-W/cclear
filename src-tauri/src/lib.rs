@@ -1,89 +1,50 @@
-//! Tauri 薄 IPC 层：只做窗口、状态与命令的接线，不放业务逻辑。
-
 mod commands;
 mod state;
 
 use cclear_core::win::{KnownFolder, known_folder};
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{WebviewUrl, WebviewWindowBuilder};
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(state::AppState::default())
         .setup(|app| {
-            // WebView2 的用户数据目录与系统盘默认位置分开，便于自我保护。
             let data_directory = known_folder(KnownFolder::LocalAppData)?
                 .join("CClear")
                 .join("webview");
-
             WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("CClear · C 盘清理")
                 .inner_size(1240.0, 800.0)
                 .min_inner_size(1040.0, 680.0)
                 .data_directory(data_directory)
                 .build()?;
-
-            // 上次没有做完的隔离批次和目录迁移要在用户操作之前收到确定状态，放到后台线程里做。
-            // 两者都要拿执行锁，所以放在同一个线程里依次执行。
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                commands::quarantine::recover_on_startup(&handle.state::<state::AppState>());
-                commands::migrate::recover_on_startup(&handle.state::<state::AppState>());
-            });
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::ai::ai_settings_get,
-            commands::ai::ai_settings_save,
-            commands::ai::ai_ask_rule,
-            commands::app::app_info,
-            commands::clean::candidate_locks,
-            commands::clean::open_candidate_in_explorer,
-            commands::devcache::command_execute,
-            commands::elevated::elevated_execute,
-            commands::env::env_state,
-            commands::maintenance::maintenance_analyze,
-            commands::maintenance::maintenance_execute,
-            commands::migrate::migrations_list,
-            commands::migrate::migration_inspect,
-            commands::migrate::migration_start,
-            commands::migrate::migration_cleanup_old,
-            commands::migrate::migration_revert,
-            commands::migrate::migration_confirm_backup,
-            commands::migrate::junction_state,
-            commands::migrate::junction_check,
-            commands::migrate::junction_start,
-            commands::migrate::junction_continue,
-            commands::migrate::junction_return,
-            commands::migrate::junction_delete_backup,
-            commands::migrate::junction_discard_target,
-            commands::plan::plan_build,
-            commands::plan::plan_items,
-            commands::plan::plan_execute,
-            commands::plan::plan_cancel,
-            commands::plan::history_list,
-            commands::plan::history_detail,
-            commands::quarantine::quarantine_volumes,
-            commands::quarantine::quarantine_set_volume,
-            commands::quarantine::quarantine_batches,
-            commands::quarantine::quarantine_restore,
-            commands::quarantine::quarantine_purge,
-            commands::quarantine::quarantine_resolve,
-            commands::quarantine::quarantine_overdue,
-            commands::recycle::recycle_bin_query,
-            commands::recycle::recycle_bin_empty,
-            commands::rules::rules_catalog,
-            commands::rules::rules_evaluate,
-            commands::scan::volume_info,
-            commands::scan::default_scan_roots,
-            commands::scan::scan_start,
-            commands::scan::scan_cancel,
-            commands::scan::scan_summary,
-            commands::scan::scan_children,
-            commands::scan::scan_top_files,
-            commands::scan::open_node_in_explorer,
-            commands::scan::open_top_file_in_explorer,
+            commands::app_info,
+            commands::volume_info,
+            commands::junk_scan_start,
+            commands::junk_scan_cancel,
+            commands::clean_check_processes,
+            commands::clean_close_processes,
+            commands::clean_execute,
+            commands::clean_cancel,
+            commands::open_clean_item_location,
+            commands::deep_slim_status,
+            commands::deep_slim_execute,
+            commands::default_scan_roots,
+            commands::space_scan_start,
+            commands::space_scan_cancel,
+            commands::space_scan_summary,
+            commands::space_scan_children,
+            commands::space_scan_top_files,
+            commands::space_open_in_explorer,
+            commands::space_recycle_item,
+            commands::history_list,
+            commands::history_detail,
+            commands::settings_get,
+            commands::settings_save,
+            commands::rule_pack_import,
+            commands::rule_pack_remove,
         ])
         .run(tauri::generate_context!())
         .expect("CClear 启动失败");

@@ -171,6 +171,142 @@ pub fn open_rel(
     Ok(entry)
 }
 
+pub fn inspect_path(path: &Path, forbidden: &Forbidden) -> Result<Entry, GuardError> {
+    let parent = path.parent().ok_or(GuardError::InvalidName)?;
+    let name = path.file_name().ok_or(GuardError::InvalidName)?;
+    let anchor = open_anchor(parent, forbidden)?;
+    open_rel(
+        &anchor,
+        &[name.to_os_string()],
+        OpenIntent::Inspect,
+        forbidden,
+    )
+}
+
+pub fn read_file(parent: &Path, name: &str, forbidden: &Forbidden) -> Result<File, GuardError> {
+    let anchor = open_anchor(parent, forbidden)?;
+    let name = OsStr::new(name);
+    let entry = open_component(&anchor.handle, name, Role::Read, &parent.join(name))?;
+    check_component(&entry, name, forbidden)?;
+    if entry.is_dir {
+        return Err(GuardError::InvalidName);
+    }
+    Ok(File::from(entry.handle))
+}
+
+pub fn append_file(
+    parent: &DirHandle,
+    name: &OsStr,
+    forbidden: &Forbidden,
+) -> Result<File, GuardError> {
+    use windows::Wdk::Storage::FileSystem::FILE_OPEN_IF;
+    use windows::Win32::Storage::FileSystem::FILE_APPEND_DATA;
+
+    validate_component(name)?;
+    let handle = nt_create(
+        &parent.handle,
+        name,
+        FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN_IF,
+        Role::Inspect.options(),
+    )?;
+    let info = read_info(&handle)?;
+    if info.is_dir
+        || info.attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        || forbidden.matches(name, &info.identity)
+    {
+        return Err(GuardError::Forbidden(parent.path.join(name)));
+    }
+    Ok(File::from(handle))
+}
+
+pub(super) fn pin_ancestors(
+    target: &Path,
+    forbidden: &Forbidden,
+) -> Result<Vec<OwnedHandle>, GuardError> {
+    let parent = target.parent().ok_or(GuardError::InvalidName)?;
+    let (root, parts) = split_anchor(parent)?;
+    let mut path = PathBuf::from(&root);
+    let mut chain = vec![open_volume_root(&root)?];
+    for name in parts {
+        path.push(&name);
+        let handle = nt_create_shared(
+            chain.last().ok_or(GuardError::InvalidName)?,
+            &name,
+            Role::Directory.access(),
+            FILE_OPEN,
+            Role::Directory.options(),
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )?;
+        let info = read_info(&handle)?;
+        if info.attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(GuardError::ReparseInPath(path));
+        }
+        if forbidden.matches(&name, &info.identity) {
+            return Err(GuardError::Forbidden(path));
+        }
+        chain.push(handle);
+    }
+    Ok(chain)
+}
+
+pub(crate) fn with_stable_file<T>(
+    target: &Path,
+    forbidden: &Forbidden,
+    call: impl FnOnce() -> T,
+) -> Result<T, GuardError> {
+    let ancestors = pin_ancestors(target, forbidden)?;
+    let name = target.file_name().ok_or(GuardError::InvalidName)?;
+    let handle = nt_create_shared(
+        ancestors.last().ok_or(GuardError::InvalidName)?,
+        name,
+        Role::Inspect.access(),
+        FILE_OPEN,
+        Role::Inspect.options(),
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )?;
+    let info = read_info(&handle)?;
+    if info.is_dir
+        || info.attributes & (FILE_ATTRIBUTE_REPARSE_POINT.0 | FILE_ATTRIBUTE_READONLY.0) != 0
+        || forbidden.matches(name, &info.identity)
+    {
+        return Err(GuardError::Forbidden(target.to_path_buf()));
+    }
+    let result = call();
+    drop(handle);
+    drop(ancestors);
+    Ok(result)
+}
+
+pub fn protected_tree(path: &Path, forbidden: &Forbidden) -> Result<(), GuardError> {
+    let target = inspect_path(path, forbidden)?;
+    if target.attributes & FILE_ATTRIBUTE_READONLY.0 != 0 {
+        return Err(GuardError::ReadOnly);
+    }
+    if !target.is_dir {
+        return Ok(());
+    }
+    let anchor = open_anchor(path, forbidden)?;
+    if target.identity != anchor.identity() {
+        return Err(GuardError::Changed);
+    }
+    let mut pending = vec![Vec::new()];
+    while let Some(relative) = pending.pop() {
+        for child in list_dir(&anchor, &relative, forbidden)? {
+            let mut next = relative.clone();
+            next.push(child.name);
+            let entry = open_rel(&anchor, &next, OpenIntent::Inspect, forbidden)?;
+            if entry.attributes & FILE_ATTRIBUTE_READONLY.0 != 0 {
+                return Err(GuardError::ReadOnly);
+            }
+            if entry.is_dir {
+                pending.push(next);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 枚举锚点下 `rel` 指向的目录。目录句柄同样通过相对打开获得，不走字符串路径。
 pub fn list_dir(
     anchor: &DirHandle,
@@ -187,6 +323,10 @@ pub fn list_dir(
 
 /// 删除一个已打开的条目。先用同一个句柄复核身份、大小和修改时间，再按句柄删除。
 pub fn delete(entry: Entry, expect: &Expect) -> Result<(), GuardError> {
+    delete_with_release(entry, expect).map(|_| ())
+}
+
+pub(crate) fn delete_with_release(entry: Entry, expect: &Expect) -> Result<u64, GuardError> {
     let info = read_info(&entry.handle)?;
 
     // 句柄会一直指向打开时的那个对象，所以同名替换不会改变 identity；
@@ -211,7 +351,12 @@ pub fn delete(entry: Entry, expect: &Expect) -> Result<(), GuardError> {
         return Err(GuardError::ReparseInPath(entry.path.clone()));
     }
 
-    dispose_handle(&entry.handle)
+    dispose_handle(&entry.handle)?;
+    Ok(if !info.is_dir && info.links == 1 {
+        info.allocated
+    } else {
+        0
+    })
 }
 
 /// 在句柄上设置立即删除。
@@ -638,6 +783,7 @@ fn delete_children(
 /// 组件在相对打开时的角色。
 #[derive(Clone, Copy)]
 enum Role {
+    Read,
     /// 中间组件：必须是目录，只要能列目录和读属性。
     Directory,
     /// 最后一级只读打开：文件或目录都可以。
@@ -655,6 +801,7 @@ impl Role {
             // 不要求父句柄带遍历权限，而安装程序留下的目录常常只给列目录和读属性。
             Role::Directory => FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             Role::Inspect => FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            Role::Read => FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             Role::Delete => DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             // 读 reparse 数据要读权限，删除链接本身要 DELETE。
             Role::Link => DELETE | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -669,7 +816,7 @@ impl Role {
 
         match self {
             Role::Directory => NTCREATEFILE_CREATE_OPTIONS(base.0 | FILE_DIRECTORY_FILE.0),
-            Role::Inspect | Role::Delete | Role::Link => base,
+            Role::Inspect | Role::Read | Role::Delete | Role::Link => base,
         }
     }
 }
@@ -768,6 +915,17 @@ fn nt_create(
     disposition: NTCREATEFILE_CREATE_DISPOSITION,
     options: NTCREATEFILE_CREATE_OPTIONS,
 ) -> Result<OwnedHandle, GuardError> {
+    nt_create_shared(parent, name, access, disposition, options, SHARE_ALL)
+}
+
+fn nt_create_shared(
+    parent: &OwnedHandle,
+    name: &OsStr,
+    access: FILE_ACCESS_RIGHTS,
+    disposition: NTCREATEFILE_CREATE_DISPOSITION,
+    options: NTCREATEFILE_CREATE_OPTIONS,
+    share: FILE_SHARE_MODE,
+) -> Result<OwnedHandle, GuardError> {
     let mut buffer: Vec<u16> = name.encode_wide().collect();
     let bytes = u16::try_from(buffer.len() * 2).map_err(|_| GuardError::InvalidName)?;
 
@@ -800,7 +958,7 @@ fn nt_create(
             &mut io_status,
             None,
             FILE_FLAGS_AND_ATTRIBUTES(0),
-            SHARE_ALL,
+            share,
             disposition,
             options,
             None,
@@ -850,6 +1008,7 @@ struct FileInfo {
     is_dir: bool,
     size: u64,
     allocated: u64,
+    links: u32,
     attributes: u32,
     creation_time: u64,
     last_write_time: u64,
@@ -871,6 +1030,7 @@ fn read_info(handle: &OwnedHandle) -> Result<FileInfo, GuardError> {
         is_dir: basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0,
         size: standard.EndOfFile as u64,
         allocated: standard.AllocationSize as u64,
+        links: standard.NumberOfLinks,
         attributes: basic.FileAttributes,
         creation_time: basic.CreationTime as u64,
         last_write_time: basic.LastWriteTime as u64,
@@ -879,7 +1039,7 @@ fn read_info(handle: &OwnedHandle) -> Result<FileInfo, GuardError> {
 }
 
 /// 取一个句柄的文件身份，供禁区集合记录。
-pub(crate) fn identity_of(handle: &OwnedHandle) -> io::Result<FileIdentity> {
+pub fn identity_of(handle: &OwnedHandle) -> io::Result<FileIdentity> {
     let mut id = FILE_ID_INFO::default();
 
     // SAFETY: 输出缓冲区指针与声明的大小一致，句柄由调用方持有且在调用期间有效。

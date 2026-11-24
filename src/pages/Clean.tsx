@@ -1,1421 +1,1287 @@
-import { Fragment, useEffect, useState, type FormEvent } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  aiAskRule,
-  candidateLocks,
-  commandExecute,
-  elevatedExecute,
-  maintenanceAnalyze,
-  maintenanceExecute,
-  openCandidateInExplorer,
-  planBuild,
-  recycleBinEmpty,
-  recycleBinQuery,
-  rulesCatalog,
-  rulesEvaluate,
+  cleanCancel,
+  cleanCheckProcesses,
+  cleanCloseProcesses,
+  cleanExecute,
+  deepSlimExecute,
+  deepSlimStatus,
+  junkScanCancel,
+  junkScanStart,
+  openCleanItemLocation,
+  settingsGet,
+  volumeInfo,
 } from "../api";
 import {
-  IconInfo,
+  IconCheck,
+  IconChevron,
+  IconClean,
+  IconCpu,
+  IconFolder,
+  IconGlobe,
+  IconGrid,
   IconLock,
-  IconQuarantine,
   IconRefresh,
   IconShield,
   IconTerminal,
+  IconTrash,
   IconWarning,
+  IconZap,
 } from "../components/Icons";
-import { PlanPreview } from "../components/PlanPreview";
-import { AdminTag, AlertBanner, StatusBadge, type SemanticTone } from "../components/Ui";
-import { formatDuration, formatSize } from "../format";
+import { AlertBanner, StatusBadge } from "../components/Ui";
+import { formatDuration, formatSize, formatTime } from "../format";
 import type {
-  AiAnswer,
-  CandidateInfo,
-  CandidateStatusKind,
-  CommandReport,
-  ElevatedResult,
-  LockReport,
-  MaintenanceProgress,
-  Phase,
-  PlanSummary,
-  RecycleBinInfo,
-  RuleInfo,
-  Tier,
+  CategoryGroup,
+  CleanCategory,
+  CleanItem,
+  CleanProgress,
+  CleanReport,
+  DeepSlimAction,
+  DeepSlimProgress,
+  DeepSlimResult,
+  DeepSlimState,
+  JunkScanProgress,
+  JunkScanResult,
+  RunningProcessConflict,
+  VolumeInfo,
 } from "../types";
 
-// 分组顺序固定，禁区默认折叠。
-const TIER_GROUPS: { tier: Tier; label: string; hint: string }[] = [
-  { tier: "safe", label: "安全", hint: "可安全清理或自动再生" },
-  { tier: "caution", label: "谨慎", hint: "逐项确认后再清理" },
-  { tier: "leftover", label: "残留", hint: "先移入隔离区 · 可还原" },
-  { tier: "manual", label: "手动", hint: "仅分析参考或阶段受限" },
-  { tier: "forbidden", label: "禁区", hint: "系统核心与不可触碰路径" },
-];
-
-// 徽标上显示阶段时用的写法，和后端 PhaseLocked 的文案保持一致。
-const PHASE_LABELS: Record<Phase, string> = {
-  analysis: "分析阶段",
-  m3a: "M3a",
-  m3b: "M3b",
-  m4: "M4",
-  m5a: "M5a",
-  m5b: "M5b",
+const CATEGORY_ICON: Record<CleanCategory, React.ReactNode> = {
+  system: <IconCpu width={16} height={16} />,
+  browser: <IconGlobe width={16} height={16} />,
+  app: <IconGrid width={16} height={16} />,
+  dev: <IconTerminal width={16} height={16} />,
+  leftover: <IconTrash width={16} height={16} />,
 };
 
-const CANDIDATE_TONES: Record<CandidateStatusKind, SemanticTone> = {
-  ready: "safe",
-  processRunning: "caution",
-  notPresent: "neutral",
-  layoutMismatch: "neutral",
-  phaseLocked: "info",
-  insufficient: "neutral",
-  forbidden: "danger",
-};
-
-// 单行的占用检查状态。
-type LockState =
-  | { phase: "loading" }
-  | { phase: "done"; report: LockReport }
-  | { phase: "failed"; message: string };
-
-// 能按冻结清单执行的规则。命令和特殊操作各有自己的执行方式，不进清单。
-function isPlanRule(rule: RuleInfo): boolean {
-  return rule.targetKind !== "command" && rule.targetKind !== "special";
-}
-
-// 有内置操作的系统项只在“系统维护”分组里出现，不再进分级表格。
-function isMaintenanceRule(rule: RuleInfo): boolean {
-  return rule.systemOp !== null;
-}
-
-// 内置操作名到界面文案。后端返回的是 kebab-case 的操作名。
-const SYSTEM_OP_LABELS: Record<string, string> = {
-  "windows-temp": "Windows\\Temp",
-  "windows-logs": "Windows\\Logs",
-  "sys-reset": "$SysReset",
-  "dism-analyze": "组件存储分析",
-  "dism-component-cleanup": "组件存储清理",
-  "delivery-optimization": "传递优化缓存",
-};
-
-function systemOpLabel(op: string): string {
-  return SYSTEM_OP_LABELS[op] ?? op;
-}
-
-function tierBadge(tier: Tier, hint: string) {
-  switch (tier) {
-    case "safe":
-      return (
-        <StatusBadge tone="safe" icon={<IconShield width={12} height={12} />}>
-          {hint}
-        </StatusBadge>
-      );
-    case "caution":
-      return (
-        <StatusBadge tone="caution" icon={<IconWarning width={12} height={12} />}>
-          {hint}
-        </StatusBadge>
-      );
-    case "leftover":
-      return (
-        <StatusBadge tone="quarantine" icon={<IconQuarantine width={12} height={12} />}>
-          {hint}
-        </StatusBadge>
-      );
-    case "forbidden":
-      return (
-        <StatusBadge tone="danger" icon={<IconLock width={12} height={12} />}>
-          {hint}
-        </StatusBadge>
-      );
-    case "manual":
-      return (
-        <StatusBadge tone="neutral" icon={<IconInfo width={12} height={12} />}>
-          {hint}
-        </StatusBadge>
-      );
+function sourceTag(item: CleanItem): { label: string; tone: "info" | "quarantine" | "neutral" } | null {
+  switch (item.source) {
+    case "heuristicElectron":
+      return { label: "自动发现 · Electron", tone: "info" };
+    case "heuristicUwp":
+      return { label: "自动发现 · 商店应用", tone: "info" };
+    case "heuristicOrphan":
+      return { label: "卸载残留 · 移入回收站", tone: "quarantine" };
+    case "externalRule":
+      return { label: "扩展规则", tone: "neutral" };
+    case "recycleBin":
+      return null;
+    default:
+      return item.deleteMode === "recycleBin"
+        ? { label: "移入回收站", tone: "quarantine" }
+        : null;
   }
 }
 
-// 单条命令的运行状态。
-type CommandState =
-  | { phase: "running" }
-  | { phase: "done"; report: CommandReport }
-  | { phase: "failed"; message: string };
+function hibernateModeLabel(mode: DeepSlimState["hibernate"]["mode"]): string {
+  switch (mode) {
+    case "full":
+      return "完整开启";
+    case "reduced":
+      return "精简模式（仅快速启动）";
+    case "off":
+      return "已关闭";
+    default:
+      return "未知";
+  }
+}
 
-// 单个需要管理员权限的清理项的执行状态。
-type ElevatedState =
-  | { phase: "running" }
-  | { phase: "done"; result: ElevatedResult }
-  | { phase: "failed"; message: string };
-
-export function CleanPage({ onOpenSettings }: { onOpenSettings: () => void }) {
-  const [rules, setRules] = useState<RuleInfo[]>([]);
-  const [candidates, setCandidates] = useState<Map<string, CandidateInfo>>(new Map());
-  const [evaluatedMs, setEvaluatedMs] = useState<number | null>(null);
-  const [evaluating, setEvaluating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // 折叠起来的分组。禁区默认折叠，只留名称和原因。
-  const [collapsed, setCollapsed] = useState<Set<Tier>>(new Set<Tier>(["forbidden"]));
-  // 展开了样例路径的规则。
-  const [openSamples, setOpenSamples] = useState<Set<string>>(new Set());
-  // 展开了判定证据的规则。残留规则靠证据说明为什么选中这些目录。
-  const [openEvidence, setOpenEvidence] = useState<Set<string>>(new Set());
-  const [lockStates, setLockStates] = useState<Record<string, LockState>>({});
-  // 清理页共享一个“问 AI”面板与请求锁，同一时间只允许发一条提问。
-  const [askRuleId, setAskRuleId] = useState<string | null>(null);
-  const [askQuestion, setAskQuestion] = useState("");
-  const [askBusy, setAskBusy] = useState(false);
-  const [askAnswer, setAskAnswer] = useState<AiAnswer | null>(null);
-  const [askError, setAskError] = useState<string | null>(null);
-  const [askSentOpen, setAskSentOpen] = useState(false);
-  // 勾选的规则。每次重新评估后回到默认勾选状态。
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  // 生成中的清理预览。清单由后端持有，界面只拿计划 ID。
-  const [plan, setPlan] = useState<PlanSummary | null>(null);
-  const [planning, setPlanning] = useState(false);
-  // C 盘回收站当前内容，清空前要把这份数值回传后端比对。
-  const [recycle, setRecycle] = useState<RecycleBinInfo | null>(null);
-  const [recycleBusy, setRecycleBusy] = useState(false);
-  // 清单是否正在执行。执行状态在 PlanPreview 内部，这里留一份用来禁用其他执行按钮。
-  const [planRunning, setPlanRunning] = useState(false);
-  // 每条命令的运行状态。命令之间互不影响，按规则 ID 分开记。
-  const [commandStates, setCommandStates] = useState<Record<string, CommandState>>({});
-  // 需要管理员权限的清理项的执行状态，同样按规则 ID 分开记。
-  const [elevatedStates, setElevatedStates] = useState<Record<string, ElevatedState>>({});
-  // 系统维护分组的勾选项。默认全不选，避免误删系统文件。
-  const [maintenanceSelected, setMaintenanceSelected] = useState<Set<string>>(new Set());
-  // 组件存储分析（只读）的状态。
-  const [analyzeState, setAnalyzeState] = useState<ElevatedState | null>(null);
-  // 系统维护执行中、最近一条进度和最终结果。
-  const [maintenanceRunning, setMaintenanceRunning] = useState(false);
-  const [maintenanceProgress, setMaintenanceProgress] = useState<MaintenanceProgress | null>(null);
-  const [maintenanceResult, setMaintenanceResult] = useState<ElevatedResult | null>(null);
-  const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
-
-  const refreshRecycle = () => {
-    recycleBinQuery()
-      .then(setRecycle)
-      .catch(() => setRecycle(null));
-  };
-
-  const evaluate = () => {
-    setEvaluating(true);
-    setError(null);
-    const started = performance.now();
-
-    rulesEvaluate()
-      .then((list) => {
-        setCandidates(new Map(list.map((candidate) => [candidate.ruleId, candidate])));
-        setEvaluatedMs(performance.now() - started);
-        // 文件已经重新统计过，旧的占用结果不再对应当前候选。
-        setLockStates({});
-      })
-      .catch((reason) => setError(String(reason)))
-      .finally(() => setEvaluating(false));
-  };
-
+function IndeterminateCheckbox({
+  checked,
+  indeterminate,
+  disabled,
+  ariaLabel,
+  onChange,
+}: {
+  checked: boolean;
+  indeterminate: boolean;
+  disabled?: boolean;
+  ariaLabel: string;
+  onChange: () => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
   useEffect(() => {
-    rulesCatalog()
-      .then(setRules)
-      .catch((reason) => setError(String(reason)));
-    evaluate();
-    refreshRecycle();
+    if (ref.current) {
+      ref.current.indeterminate = indeterminate;
+    }
+  }, [indeterminate]);
+
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      className="checkbox"
+      checked={checked}
+      disabled={disabled}
+      aria-label={ariaLabel}
+      onChange={onChange}
+      onClick={(event) => event.stopPropagation()}
+    />
+  );
+}
+
+export function CleanPage({
+  onCleaned,
+  onOpenSpace,
+}: {
+  onCleaned: () => void;
+  onOpenSpace: () => void;
+}) {
+  const [volumes, setVolumes] = useState<VolumeInfo[]>([]);
+  const [deepSlim, setDeepSlim] = useState<DeepSlimState | null>(null);
+  const [scheduleRebootDelete, setScheduleRebootDelete] = useState(false);
+
+  const [scanning, setScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState<JunkScanProgress | null>(null);
+  const [scanResult, setScanResult] = useState<JunkScanResult | null>(null);
+
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [openCategories, setOpenCategories] = useState<Set<CleanCategory>>(
+    new Set<CleanCategory>(["system", "browser", "app", "dev"]),
+  );
+  const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
+
+  const [cleaning, setCleaning] = useState(false);
+  const [cleanProgress, setCleanProgress] = useState<CleanProgress | null>(null);
+  const [cleanReport, setCleanReport] = useState<CleanReport | null>(null);
+  const [reportExpanded, setReportExpanded] = useState(false);
+
+  // 进程冲突弹窗状态
+  const [conflicts, setConflicts] = useState<RunningProcessConflict[] | null>(null);
+  const [closingProcs, setClosingProcs] = useState(false);
+  const [recheckingProcs, setRecheckingProcs] = useState(false);
+  const [closeNotice, setCloseNotice] = useState<string | null>(null);
+
+  // 深度瘦身执行状态
+  const [slimBusy, setSlimBusy] = useState<DeepSlimAction | null>(null);
+  const [slimProgress, setSlimProgress] = useState<DeepSlimProgress | null>(null);
+  const [slimResult, setSlimResult] = useState<DeepSlimResult | null>(null);
+
+  const [error, setError] = useState<string | null>(null);
+
+  const refreshBase = useCallback(() => {
+    volumeInfo()
+      .then(setVolumes)
+      .catch(() => {});
+    deepSlimStatus()
+      .then(setDeepSlim)
+      .catch(() => {});
   }, []);
 
-  // 默认勾选：可执行且默认选中的规则。重新评估后也回到这个状态。
   useEffect(() => {
-    if (rules.length === 0) {
-      return;
-    }
+    refreshBase();
+    settingsGet()
+      .then((settings) => setScheduleRebootDelete(settings.scheduleRebootDeleteDefault))
+      .catch(() => {});
+  }, [refreshBase]);
 
-    const defaults = rules
-      .filter((rule) => candidates.get(rule.id)?.executable === true && rule.defaultSelected)
-      .map((rule) => rule.id);
-    setSelected(new Set(defaults));
-  }, [rules, candidates]);
-
-  const toggleGroup = (tier: Tier) => {
-    setCollapsed((previous) => {
-      const next = new Set(previous);
-      if (next.has(tier)) {
-        next.delete(tier);
-      } else {
-        next.add(tier);
-      }
-      return next;
-    });
-  };
-
-  const toggleSamples = (ruleId: string) => {
-    setOpenSamples((previous) => {
-      const next = new Set(previous);
-      if (next.has(ruleId)) {
-        next.delete(ruleId);
-      } else {
-        next.add(ruleId);
-      }
-      return next;
-    });
-  };
-
-  const toggleEvidence = (ruleId: string) => {
-    setOpenEvidence((previous) => {
-      const next = new Set(previous);
-      if (next.has(ruleId)) {
-        next.delete(ruleId);
-      } else {
-        next.add(ruleId);
-      }
-      return next;
-    });
-  };
-
-  const toggleSelected = (ruleId: string) => {
-    setSelected((previous) => {
-      const next = new Set(previous);
-      if (next.has(ruleId)) {
-        next.delete(ruleId);
-      } else {
-        next.add(ruleId);
-      }
-      return next;
-    });
-  };
-
-  const checkLocks = (ruleId: string) => {
-    setLockStates((previous) => ({ ...previous, [ruleId]: { phase: "loading" } }));
-    candidateLocks(ruleId)
-      .then((report) =>
-        setLockStates((previous) => ({ ...previous, [ruleId]: { phase: "done", report } })),
-      )
-      .catch((reason) =>
-        setLockStates((previous) => ({
-          ...previous,
-          [ruleId]: { phase: "failed", message: String(reason) },
-        })),
-      );
-  };
-
-  const openLocation = (ruleId: string, sampleIndex: number | null) => {
-    openCandidateInExplorer(ruleId, sampleIndex).catch((reason) => setError(String(reason)));
-  };
-
-  const toggleAsk = (ruleId: string) => {
-    if (askBusy) {
-      return;
-    }
-    if (askRuleId === ruleId) {
-      setAskRuleId(null);
-      return;
-    }
-    setAskRuleId(ruleId);
-    setAskQuestion("");
-    setAskAnswer(null);
-    setAskError(null);
-    setAskSentOpen(false);
-  };
-
-  const submitAsk = (event: FormEvent) => {
-    event.preventDefault();
-    if (!askRuleId || askBusy) {
-      return;
-    }
-    const trimmed = askQuestion.trim();
-    setAskBusy(true);
-    setAskAnswer(null);
-    setAskError(null);
-    setAskSentOpen(false);
-
-    aiAskRule(askRuleId, trimmed === "" ? null : trimmed)
-      .then(setAskAnswer)
-      .catch((reason) => setAskError(String(reason)))
-      .finally(() => setAskBusy(false));
-  };
-
-  const renderAskButton = (ruleId: string) => (
-    <button
-      type="button"
-      className="btn-link"
-      disabled={askBusy}
-      onClick={() => toggleAsk(ruleId)}
-    >
-      {askRuleId === ruleId ? "收起 AI" : "问 AI"}
-    </button>
+  const systemVol = useMemo(
+    () => volumes.find((vol) => vol.isSystem) ?? volumes[0] ?? null,
+    [volumes],
   );
 
-  const renderAskSubRow = (ruleId: string, colSpan: number) => {
-    if (askRuleId !== ruleId) {
-      return null;
+  const usedBytes = systemVol ? Math.max(0, systemVol.total - systemVol.free) : 0;
+  const usedRatio = systemVol && systemVol.total > 0 ? usedBytes / systemVol.total : 0;
+  const gaugeTone =
+    usedRatio >= 0.85 ? "crit" : usedRatio >= 0.7 ? "warn" : "ok";
+
+  const allItems = useMemo(
+    () => (scanResult ? scanResult.categories.flatMap((group) => group.items) : []),
+    [scanResult],
+  );
+
+  const selectedSummary = useMemo(() => {
+    let bytes = 0;
+    let count = 0;
+    let adminCount = 0;
+    let recycleCount = 0;
+    for (const item of allItems) {
+      if (selected.has(item.id)) {
+        count += 1;
+        bytes += item.sizeBytes ?? 0;
+        if (item.requiresAdmin) adminCount += 1;
+        if (item.deleteMode === "recycleBin" && item.source !== "recycleBin") recycleCount += 1;
+      }
     }
+    return { bytes, count, adminCount, recycleCount };
+  }, [allItems, selected]);
 
-    return (
-      <tr className="sub-row">
-        <td colSpan={colSpan}>
-          <div className="ai-ask-box">
-            <form className="ai-ask-form" onSubmit={submitAsk}>
-              <input
-                type="text"
-                className="text-input"
-                value={askQuestion}
-                disabled={askBusy}
-                placeholder="可选：补充你想问的，例如‘我还在用 VS Code，能删吗？’"
-                onChange={(event) => setAskQuestion(event.target.value)}
-              />
-              <button type="submit" className="btn btn-primary" disabled={askBusy}>
-                {askBusy ? "发送中…" : "发送"}
-              </button>
-            </form>
+  const busy = scanning || cleaning || slimBusy !== null;
 
-            {askBusy && (
-              <p className="muted" style={{ margin: 0 }}>
-                正在询问 AI…
-              </p>
-            )}
-
-            {askError && (
-              <div className="ai-ask-error">
-                <span className="danger-text">{askError}</span>
-                <button type="button" className="btn btn-subtle" onClick={onOpenSettings}>
-                  去设置
-                </button>
-              </div>
-            )}
-
-            {askAnswer && (
-              <div className="ai-answer-box">
-                <div className="ai-answer-meta">
-                  <StatusBadge tone="info">{askAnswer.model}</StatusBadge>
-                  <span className="muted">仅供参考</span>
-                  <button
-                    type="button"
-                    className="btn-link"
-                    onClick={() => setAskSentOpen((previous) => !previous)}
-                  >
-                    {askSentOpen ? "收起发送内容" : "查看发送内容"}
-                  </button>
-                </div>
-                <div className="ai-answer-text">{askAnswer.answer}</div>
-                {askSentOpen && <pre className="ai-sent-pre">{askAnswer.sent}</pre>}
-              </div>
-            )}
-          </div>
-        </td>
-      </tr>
-    );
-  };
-
-  // 生成冻结清单后由 PlanPreview 负责确认和执行。
-  const startPlan = (ruleIds: string[]) => {
-    if (ruleIds.length === 0) {
-      return;
-    }
-
-    setPlanning(true);
+  const startScan = () => {
+    if (busy) return;
     setError(null);
-    planBuild(ruleIds)
-      .then(setPlan)
-      .catch((reason) => setError(String(reason)))
-      .finally(() => setPlanning(false));
-  };
-
-  // 某一层里可执行的规则（安全组一键清理用）。命令和特殊操作不走冻结清单，排除掉。
-  const executableIds = (tier: Tier) =>
-    rules
-      .filter(
-        (rule) =>
-          rule.tier === tier && isPlanRule(rule) && candidates.get(rule.id)?.executable === true,
-      )
-      .map((rule) => rule.id);
-
-  // 某一层里用户勾选的规则（谨慎组逐项清理用）。同样只保留按清单执行的规则。
-  const selectedIds = (tier: Tier) =>
-    rules
-      .filter((rule) => rule.tier === tier && isPlanRule(rule) && selected.has(rule.id))
-      .map((rule) => rule.id);
-
-  // 运行官方命令：确认文案写清工具和作用范围，需要二次确认的规则多问一步。
-  const runCommand = (rule: RuleInfo, scope: string) => {
-    const tool = rule.command?.tool ?? rule.name;
-    const text = `调用 ${tool} 官方命令，作用范围：${scope}；不可撤销；无法逐文件预览`;
-    if (!window.confirm(text)) {
-      return;
-    }
-
-    const needSecond = rule.command?.needsSecondConfirm === true;
-    const secondText = `「${rule.name}」会删除全部缓存，下次使用需要重新下载。确认继续？`;
-    if (needSecond && !window.confirm(secondText)) {
-      return;
-    }
-
-    setCommandStates((previous) => ({ ...previous, [rule.id]: { phase: "running" } }));
-    commandExecute(rule.id, needSecond, (progress) => {
-      // 命令一开始就保持“运行中”，结束后由返回值接管。
-      if (progress.stage === "running") {
-        setCommandStates((previous) => ({ ...previous, [rule.id]: { phase: "running" } }));
-      }
-    })
-      .then((report) => {
-        setCommandStates((previous) => ({ ...previous, [rule.id]: { phase: "done", report } }));
-        // 命令结束后缓存大小变了，重新评估一次，界面上的数字才是当前的。
-        evaluate();
-      })
-      .catch((reason) => {
-        setCommandStates((previous) => ({
-          ...previous,
-          [rule.id]: { phase: "failed", message: String(reason) },
-        }));
-      });
-  };
-
-  // 需要管理员权限的清理项：一次调用可以带多条规则，helper 只弹一次授权。
-  const runElevated = (targets: RuleInfo[]) => {
-    if (targets.length === 0) {
-      return;
-    }
-
-    const names = targets.map((rule) => `「${rule.name}」`).join("、");
-    const text = `${names} 需要管理员权限，执行时会弹出一次授权提示；清理结果先进入隔离区。确认继续？`;
-    if (!window.confirm(text)) {
-      return;
-    }
-
-    const ruleIds = targets.map((rule) => rule.id);
-    setElevatedStates((previous) => {
-      const next = { ...previous };
-      for (const ruleId of ruleIds) {
-        next[ruleId] = { phase: "running" };
-      }
-      return next;
+    setCleanReport(null);
+    setConflicts(null);
+    setCloseNotice(null);
+    setScanning(true);
+    setScanProgress({
+      phase: "准备扫描",
+      currentItem: "正在加载规则库与探测器…",
+      foundBytes: 0,
+      foundItems: 0,
+      done: false,
+      cancelled: false,
     });
 
-    elevatedExecute(ruleIds)
+    junkScanStart((progress) => setScanProgress(progress))
       .then((result) => {
-        setElevatedStates((previous) => {
-          const next = { ...previous };
-          // 结果与传入的规则按顺序一一对应，每条规则只显示属于自己的那一项。
-          ruleIds.forEach((ruleId, index) => {
-            const op = result.ops[index];
-            next[ruleId] = op
-              ? { phase: "done", result: { ops: [op] } }
-              : { phase: "failed", message: "提权 helper 没有返回这一项的结果" };
-          });
-          return next;
-        });
-        // 内容已经移入隔离区，重新评估一次，界面上的数字才是当前的。
-        evaluate();
-      })
-      .catch((reason) => {
-        setElevatedStates((previous) => {
-          const next = { ...previous };
-          for (const ruleId of ruleIds) {
-            next[ruleId] = { phase: "failed", message: String(reason) };
+        setScanResult(result);
+        setDeepSlim(result.deepSlim);
+        const defaults = new Set<string>();
+        const nonEmptyCats = new Set<CleanCategory>();
+        for (const group of result.categories) {
+          if (group.items.length > 0 && group.category !== "leftover") {
+            nonEmptyCats.add(group.category);
           }
-          return next;
-        });
+          for (const item of group.items) {
+            if (item.defaultSelected) {
+              defaults.add(item.id);
+            }
+          }
+        }
+        setSelected(defaults);
+        setOpenCategories(nonEmptyCats);
+        refreshBase();
+      })
+      .catch((reason) => setError(String(reason)))
+      .finally(() => {
+        setScanning(false);
+        setScanProgress(null);
       });
   };
 
-  // 系统维护分组：勾选、只读分析，以及一次授权执行全部选中项。
-  const toggleMaintenance = (ruleId: string) => {
-    setMaintenanceSelected((previous) => {
-      const next = new Set(previous);
-      if (next.has(ruleId)) {
-        next.delete(ruleId);
-      } else {
-        next.add(ruleId);
+  const toggleItem = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleCategorySelect = (group: CategoryGroup) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      const allChecked = group.items.every((item) => next.has(item.id));
+      for (const item of group.items) {
+        if (allChecked) next.delete(item.id);
+        else next.add(item.id);
       }
       return next;
     });
   };
 
-  // 分析组件存储：只读，不改动任何内容，但同样要管理员权限。
-  const analyzeComponentStore = () => {
-    setAnalyzeState({ phase: "running" });
-    maintenanceAnalyze()
-      .then((result) => setAnalyzeState({ phase: "done", result }))
-      .catch((reason) =>
-        setAnalyzeState({ phase: "failed", message: String(reason) }),
-      );
+  const toggleCategoryOpen = (category: CleanCategory) => {
+    setOpenCategories((prev) => {
+      const next = new Set(prev);
+      if (next.has(category)) next.delete(category);
+      else next.add(category);
+      return next;
+    });
   };
 
-  // 执行选中的系统维护项。全部选中项合成一次提权调用，只弹一次授权。
-  const runMaintenance = (ruleIds: string[]) => {
-    if (ruleIds.length === 0) {
+  const toggleItemExpand = (id: string) => {
+    setExpandedItems((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const applyPreset = (mode: "recommended" | "all" | "none") => {
+    if (!scanResult) return;
+    if (mode === "none") {
+      setSelected(new Set());
       return;
     }
-
-    const text = `将执行选中的 ${ruleIds.length} 项系统维护操作，只会弹出一次授权提示；其中组件存储清理（DISM）可能需要 10–30 分钟且无法取消，请勿关机；这些操作不可撤销。确认继续？`;
-    if (!window.confirm(text)) {
-      return;
+    const next = new Set<string>();
+    for (const item of allItems) {
+      if (mode === "all" || item.defaultSelected) {
+        next.add(item.id);
+      }
     }
+    setSelected(next);
+  };
 
-    setMaintenanceRunning(true);
-    setMaintenanceProgress(null);
-    setMaintenanceResult(null);
-    setMaintenanceError(null);
+  const runCleanNow = (itemIds: string[]) => {
+    if (!scanResult || itemIds.length === 0) return;
+    setConflicts(null);
+    setError(null);
+    setCleaning(true);
+    setCleanReport(null);
+    setReportExpanded(false);
+    setCleanProgress({
+      currentItemId: "",
+      currentItemName: "正在准备清理…",
+      completedItems: 0,
+      totalItems: itemIds.length,
+      freedBytes: 0,
+      skippedFiles: 0,
+      stage: "user",
+      done: false,
+    });
 
-    maintenanceExecute(ruleIds, setMaintenanceProgress)
-      .then((result) => {
-        setMaintenanceResult(result);
-        // 系统文件已经清过，重新评估一次，界面上的数字才是当前的。
-        evaluate();
+    cleanExecute(
+      {
+        scanId: scanResult.scanId,
+        itemIds,
+        scheduleRebootDelete,
+      },
+      (progress) => setCleanProgress(progress),
+    )
+      .then((report) => {
+        setCleanReport(report);
+        // 清理完成后后端已释放本次扫描快照，前端同步清空陈旧列表避免误点失效操作
+        setScanResult(null);
+        setSelected(new Set());
+        setExpandedItems(new Set());
+        refreshBase();
+        onCleaned();
       })
-      .catch((reason) => setMaintenanceError(String(reason)))
+      .catch((reason) => setError(String(reason)))
       .finally(() => {
-        setMaintenanceProgress(null);
-        setMaintenanceRunning(false);
+        setCleaning(false);
+        setCleanProgress(null);
       });
   };
 
-  // 清空回收站：确认文案里写明执行时清空的是全部内容，并把当前数值一起回传。
-  const emptyRecycle = () => {
-    if (!recycle) {
+  const handleCleanClick = async () => {
+    if (!scanResult || selectedSummary.count === 0 || busy) return;
+    setError(null);
+    setCloseNotice(null);
+    const ids = Array.from(selected);
+
+    try {
+      const running = await cleanCheckProcesses(scanResult.scanId, ids);
+      if (running.length > 0) {
+        setConflicts(running);
+        return;
+      }
+    } catch (reason) {
+      setError(String(reason));
       return;
     }
 
-    const text = `将清空执行时 C 盘回收站的全部内容（当前 ${recycle.items} 项，${formatSize(recycle.bytes)}），不可恢复`;
-    if (!window.confirm(text)) {
-      return;
-    }
-
-    setRecycleBusy(true);
-    recycleBinEmpty(recycle.items, recycle.bytes)
-      .then((info) => {
-        setRecycle(info);
-        // 清理完自动重新评估，界面上的统计才是清理后的。
-        evaluate();
-      })
-      .catch((reason) => {
-        setError(String(reason));
-        refreshRecycle();
-      })
-      .finally(() => setRecycleBusy(false));
+    runCleanNow(ids);
   };
 
-  // 命令类规则单独成组：它们不生成冻结清单，一条一行单独运行。
-  const commandRules = rules.filter((rule) => rule.targetKind === "command");
+  useEffect(() => {
+    if (!conflicts) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !closingProcs && !recheckingProcs) {
+        setConflicts(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [conflicts, closingProcs, recheckingProcs]);
 
-  // 有内置操作的系统项。还没有内置操作的项留在分级表格里显示“阶段未开放”。
-  const maintenanceRules = rules.filter(isMaintenanceRule);
-  const maintenanceIds = maintenanceRules
-    .filter((rule) => maintenanceSelected.has(rule.id))
-    .map((rule) => rule.id);
+  const handleRecheckProcesses = async () => {
+    if (!scanResult) return;
+    setRecheckingProcs(true);
+    setError(null);
+    const ids = Array.from(selected);
+    try {
+      const stillRunning = await cleanCheckProcesses(scanResult.scanId, ids);
+      if (stillRunning.length === 0) {
+        setConflicts(null);
+        runCleanNow(ids);
+      } else {
+        setConflicts(stillRunning);
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRecheckingProcs(false);
+    }
+  };
 
-  // 残留层里需要管理员权限、当前可以执行的规则。合成一次提权调用，只弹一次授权。
-  const adminLeftoverRules = rules.filter(
-    (rule) =>
-      rule.tier === "leftover" &&
-      rule.admin &&
-      isPlanRule(rule) &&
-      candidates.get(rule.id)?.executable === true,
-  );
+  const handleGracefulCloseAndClean = async () => {
+    if (!conflicts || !scanResult) return;
+    setClosingProcs(true);
+    setCloseNotice(null);
+    const names = Array.from(new Set(conflicts.flatMap((c) => c.processNames)));
+    try {
+      const result = await cleanCloseProcesses(names);
+      if (result.stillRunning.length > 0) {
+        setCloseNotice(
+          `以下程序未能自动退出（${result.stillRunning.join("、")}），将自动跳过其被占用的文件并清理其余部分。`,
+        );
+      }
+      runCleanNow(Array.from(selected));
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setClosingProcs(false);
+    }
+  };
 
-  // 命令、回收站和清单共用后端的执行锁：任一操作进行时，其他执行按钮都禁用。
-  // 判断以后端为准，这里只是不让用户白点。
-  const anyCommandRunning = Object.values(commandStates).some(
-    (state) => state.phase === "running",
-  );
-  const anyElevatedRunning = Object.values(elevatedStates).some(
-    (state) => state.phase === "running",
-  );
-  const anyAnalyzeRunning = analyzeState?.phase === "running";
-  const execBusy =
-    planning ||
-    recycleBusy ||
-    planRunning ||
-    anyCommandRunning ||
-    anyElevatedRunning ||
-    anyAnalyzeRunning ||
-    maintenanceRunning;
+  const runDeepSlim = (action: DeepSlimAction, confirmMessage?: string) => {
+    if (busy) return;
+    if (confirmMessage && !window.confirm(confirmMessage)) {
+      return;
+    }
+    setError(null);
+    setSlimResult(null);
+    setSlimBusy(action);
+    setSlimProgress({
+      action,
+      percent: null,
+      detail: "等待管理员授权并启动操作…",
+      done: false,
+    });
+
+    deepSlimExecute(action, (progress) => setSlimProgress(progress))
+      .then((result) => {
+        setSlimResult(result);
+        setDeepSlim(result.updatedState);
+        refreshBase();
+        onCleaned();
+      })
+      .catch((reason) => setError(String(reason)))
+      .finally(() => {
+        setSlimBusy(null);
+        setSlimProgress(null);
+      });
+  };
+
+  const actualFreed = cleanReport
+    ? Math.max(0, cleanReport.freeAfter - cleanReport.freeBefore)
+    : 0;
 
   return (
     <section className="page-section">
-      <div className="page-header">
-        <div>
-          <h2 className="page-title">清理</h2>
-          <p className="page-subtitle">先评估各规则候选规模，生成冻结清单预览后再确认执行</p>
-        </div>
-        <div className="actions">
-          {evaluatedMs !== null && (
-            <StatusBadge tone="neutral">上次评估耗时 {formatDuration(evaluatedMs)}</StatusBadge>
-          )}
-          <button
-            type="button"
-            className="btn btn-primary"
-            onClick={evaluate}
-            disabled={evaluating}
-          >
-            <IconRefresh width={14} height={14} />
-            <span>{evaluating ? "评估中…" : "重新评估"}</span>
-          </button>
-        </div>
-      </div>
+      {/* 顶部 C 盘空间英雄卡 */}
+      <div className={`hero-card hero-${gaugeTone}`}>
+        <div className="hero-top">
+          <div className="hero-drive">
+            <div className="hero-title-row">
+              <h2 className="hero-title">
+                {systemVol ? `系统盘 (${systemVol.root.replace(/\\$/, "")})` : "系统盘 (C:)"}
+              </h2>
+              {systemVol && (
+                <StatusBadge
+                  tone={
+                    gaugeTone === "crit" ? "danger" : gaugeTone === "warn" ? "caution" : "safe"
+                  }
+                >
+                  {gaugeTone === "crit"
+                    ? "空间紧张"
+                    : gaugeTone === "warn"
+                      ? "偏满"
+                      : "空间充足"}
+                </StatusBadge>
+              )}
+            </div>
+            {systemVol ? (
+              <p className="hero-metrics td-num">
+                剩余 <strong>{formatSize(systemVol.free)}</strong> / 共{" "}
+                {formatSize(systemVol.total)}（已用 {(usedRatio * 100).toFixed(1)}%）
+              </p>
+            ) : (
+              <p className="hero-metrics muted">正在读取 C 盘容量…</p>
+            )}
+            <div className="gauge-track" role="progressbar" aria-valuenow={Math.round(usedRatio * 100)} aria-valuemin={0} aria-valuemax={100}>
+              <div
+                className={`gauge-fill gauge-${gaugeTone}`}
+                style={{ width: `${Math.min(100, usedRatio * 100)}%` }}
+              />
+            </div>
+          </div>
 
-      <AlertBanner tone="info">
-        安全层可一键清理，谨慎层逐项勾选后清理，残留层的条目一律先进隔离区。命令类规则在下方「不可撤销命令」分组里单独运行。
-      </AlertBanner>
+          <div className="hero-cta">
+            {!scanning && !cleaning && !scanResult && (
+              <button
+                type="button"
+                className="btn btn-primary btn-hero"
+                disabled={busy}
+                onClick={startScan}
+              >
+                <IconClean width={18} height={18} />
+                <span>一键扫描垃圾</span>
+              </button>
+            )}
 
-      {error && <AlertBanner tone="danger">{error}</AlertBanner>}
+            {scanning && (
+              <button
+                type="button"
+                className="btn btn-subtle btn-hero"
+                onClick={() => junkScanCancel().catch(() => {})}
+              >
+                <span>取消扫描</span>
+              </button>
+            )}
 
-      {TIER_GROUPS.map((group) => {
-        const groupRules = rules.filter((rule) => rule.tier === group.tier);
-        const isCollapsed = collapsed.has(group.tier);
-        // 特殊操作（回收站）和命令都不走冻结清单，单独成行，不参与勾选。
-        // 系统维护项有内置操作，放到下面的“系统维护”分组里。
-        const tableRules = groupRules.filter(
-          (rule) => isPlanRule(rule) && !isMaintenanceRule(rule),
-        );
-        const specialRules = groupRules.filter((rule) => rule.targetKind === "special");
-        // 卡片标题按实际渲染的条目数统计：命令和特殊操作已经移出各自的表格。
-        const cardCount =
-          group.tier === "forbidden" ? groupRules.length : tableRules.length + specialRules.length;
-        const safeIds = group.tier === "safe" ? executableIds("safe") : [];
-        const checkedIds = group.tier === "caution" ? selectedIds("caution") : [];
-
-        return (
-          <div className={`card card-tier-${group.tier}`} key={group.tier}>
-            <div className="card-header" style={isCollapsed ? { marginBottom: 0 } : undefined}>
-              <div className="card-title-group">
-                <h3 className="card-title">
-                  {group.label}（{cardCount}）
-                </h3>
-                {tierBadge(group.tier, group.hint)}
-              </div>
-              <div className="actions">
-                {group.tier === "safe" && (
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    disabled={execBusy || safeIds.length === 0}
-                    onClick={() => startPlan(safeIds)}
-                  >
-                    {planning ? "正在生成清单…" : "一键清理安全项"}
-                  </button>
-                )}
-                {group.tier === "caution" && (
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    disabled={execBusy || checkedIds.length === 0}
-                    onClick={() => startPlan(checkedIds)}
-                  >
-                    {planning ? "正在生成清单…" : "清理选中项"}
-                  </button>
-                )}
-                {group.tier === "leftover" && adminLeftoverRules.length > 0 && (
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    disabled={execBusy}
-                    onClick={() => runElevated(adminLeftoverRules)}
-                  >
-                    可执行的管理员残留项一起隔离（一次授权）
-                  </button>
-                )}
+            {!scanning && !cleaning && scanResult && (
+              <div className="hero-cta-group">
+                <button
+                  type="button"
+                  className="btn btn-primary btn-hero"
+                  disabled={selectedSummary.count === 0 || busy}
+                  onClick={handleCleanClick}
+                >
+                  <IconZap width={18} height={18} />
+                  <span>
+                    {selectedSummary.count > 0
+                      ? `立即清理 · ${formatSize(selectedSummary.bytes)}`
+                      : "请先勾选清理项"}
+                  </span>
+                </button>
                 <button
                   type="button"
                   className="btn btn-subtle"
-                  onClick={() => toggleGroup(group.tier)}
+                  disabled={busy}
+                  onClick={startScan}
                 >
-                  {isCollapsed ? "展开" : "收起"}
+                  <IconRefresh width={14} height={14} />
+                  <span>重新扫描</span>
                 </button>
               </div>
-            </div>
+            )}
 
-            {!isCollapsed &&
-              (group.tier === "forbidden" ? (
-                // 禁区只列出名称和原因，不提供任何操作。
-                <div className="table-wrap">
-                  <table className="table">
-                    <thead>
-                      <tr>
-                        <th>名称</th>
-                        <th>原因</th>
-                        <th>操作</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {groupRules.length === 0 && (
-                        <tr>
-                          <td colSpan={3} className="muted">
-                            这一类没有规则
-                          </td>
-                        </tr>
-                      )}
-                      {groupRules.map((rule) => (
-                        <Fragment key={rule.id}>
-                          <tr>
-                            <td className="td-nowrap">{rule.name}</td>
-                            <td>{rule.description}</td>
-                            <td className="td-ops">
-                              <div className="actions">{renderAskButton(rule.id)}</div>
-                            </td>
-                          </tr>
-                          {renderAskSubRow(rule.id, 3)}
-                        </Fragment>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              ) : (
-                <div className="table-wrap">
-                  <table className="table rule-table">
-                    <thead>
-                      <tr>
-                        <th>选择</th>
-                        <th>名称</th>
-                        <th>占盘大小</th>
-                        <th>状态</th>
-                        <th>说明</th>
-                        <th>操作</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {tableRules.length === 0 && specialRules.length === 0 && (
-                        <tr>
-                          <td colSpan={6} className="muted">
-                            这一类没有规则
-                          </td>
-                        </tr>
-                      )}
-                      {tableRules.map((rule) => {
-                        const candidate = candidates.get(rule.id);
-                        const lockState = lockStates[rule.id];
-                        const badge = statusBadge(candidate, rule);
-                        const note = statusNote(candidate);
-                        const samplesOpen = openSamples.has(rule.id);
-                        const evidenceOpen = openEvidence.has(rule.id);
-                        const elevated = elevatedStates[rule.id];
-                        // 没有锚点时既没有文件可查占用，也没有目录可以打开。
-                        const hasAnchors = candidate !== undefined && candidate.anchors.length > 0;
-                        // 进程在运行、阶段未开放或证据不足的候选都不能勾选。
-                        const selectable = candidate?.executable === true;
-                        // 证据列表和没有被选中的原因，两者都没有时不给展开按钮。
-                        const hasEvidence =
-                          candidate !== undefined &&
-                          (candidate.evidence.length > 0 || candidate.notes.length > 0);
-
-                        return (
-                          <Fragment key={rule.id}>
-                            <tr>
-                              <td className="td-nowrap">
-                                {group.tier === "leftover" ? (
-                                  // 残留项一条操作一次，勾选对它没有意义。
-                                  <StatusBadge tone="quarantine">隔离</StatusBadge>
-                                ) : (
-                                  <input
-                                    type="checkbox"
-                                    className="checkbox-input"
-                                    checked={selected.has(rule.id)}
-                                    disabled={!selectable}
-                                    onChange={() => toggleSelected(rule.id)}
-                                    aria-label={`选择 ${rule.name}`}
-                                    title={selectable ? undefined : "当前不能清理这一项"}
-                                  />
-                                )}
-                              </td>
-                              <td className="td-rule-name">{rule.name}</td>
-                              <td className="td-num">
-                                {candidate ? formatSize(candidate.allocated) : "—"}
-                              </td>
-                              <td className="td-status">
-                                {badge ? (
-                                  <StatusBadge tone={CANDIDATE_TONES[badge.kind]}>
-                                    {badge.label}
-                                  </StatusBadge>
-                                ) : (
-                                  "—"
-                                )}
-                              </td>
-                              <td className="td-desc">
-                                <div className="actions" style={{ marginBottom: rule.admin ? 4 : 0 }}>
-                                  <span>{rule.description}</span>
-                                  {rule.admin && <AdminTag />}
-                                </div>
-                                {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
-                                {note && <p className="muted" style={{ margin: "3px 0 0" }}>{note}</p>}
-                              </td>
-                              <td className="td-ops">
-                                <div className="actions">
-                                  <button
-                                    type="button"
-                                    className="btn-link"
-                                    disabled={!hasAnchors || lockState?.phase === "loading"}
-                                    onClick={() => checkLocks(rule.id)}
-                                  >
-                                    检查占用
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="btn-link"
-                                    disabled={!hasAnchors}
-                                    onClick={() => openLocation(rule.id, null)}
-                                  >
-                                    打开位置
-                                  </button>
-                                  {candidate && candidate.samples.length > 0 && (
-                                    <button
-                                      type="button"
-                                      className="btn-link"
-                                      onClick={() => toggleSamples(rule.id)}
-                                    >
-                                      {samplesOpen
-                                        ? "收起样例"
-                                        : `样例路径（${candidate.samples.length}）`}
-                                    </button>
-                                  )}
-                                  {hasEvidence && (
-                                    <button
-                                      type="button"
-                                      className="btn-link"
-                                      onClick={() => toggleEvidence(rule.id)}
-                                    >
-                                      {evidenceOpen ? "收起证据" : "查看证据"}
-                                    </button>
-                                  )}
-                                  {renderAskButton(rule.id)}
-                                  {group.tier === "leftover" && (
-                                    <button
-                                      type="button"
-                                      className="btn btn-primary"
-                                      disabled={!selectable || execBusy}
-                                      onClick={() =>
-                                        rule.admin ? runElevated([rule]) : startPlan([rule.id])
-                                      }
-                                      title={selectable ? undefined : "当前不能清理这一项"}
-                                    >
-                                      {rule.admin ? "移入隔离区（需管理员）" : "移入隔离区"}
-                                    </button>
-                                  )}
-                                </div>
-                              </td>
-                            </tr>
-
-                            {evidenceOpen && candidate && (
-                              <tr className="sub-row">
-                                <td colSpan={6}>
-                                  <p className="muted" style={{ margin: 0 }}>
-                                    判定依据：没有列在这里的内容不会被处理。
-                                  </p>
-                                  <ul className="sample-list">
-                                    {candidate.evidence.map((line) => (
-                                      <li key={line}>
-                                        <span className="path-text" title={line}>
-                                          {line}
-                                        </span>
-                                      </li>
-                                    ))}
-                                  </ul>
-                                  {candidate.notes.map((line) => (
-                                    <p key={line} className="muted" style={{ margin: "4px 0 0" }}>
-                                      {line}
-                                    </p>
-                                  ))}
-                                </td>
-                              </tr>
-                            )}
-
-                            {samplesOpen && candidate && (
-                              <tr className="sub-row">
-                                <td colSpan={6}>
-                                  <ul className="sample-list">
-                                    {candidate.samples.map((path, index) => (
-                                      <li key={path}>
-                                        <span className="path-text" title={path}>
-                                          {path}
-                                        </span>
-                                        <button
-                                          type="button"
-                                          className="btn-link"
-                                          onClick={() => openLocation(rule.id, index)}
-                                        >
-                                          打开
-                                        </button>
-                                      </li>
-                                    ))}
-                                  </ul>
-                                </td>
-                              </tr>
-                            )}
-
-                            {lockState && (
-                              <tr className="sub-row">
-                                <td colSpan={6}>{lockResult(lockState)}</td>
-                              </tr>
-                            )}
-
-                            {elevated && (
-                              <tr className="sub-row">
-                                <td colSpan={6}>{elevatedResult(elevated)}</td>
-                              </tr>
-                            )}
-                            {renderAskSubRow(rule.id, 6)}
-                          </Fragment>
-                        );
-                      })}
-
-                      {specialRules.map((rule) => (
-                        <Fragment key={rule.id}>
-                          <tr>
-                            <td className="td-nowrap">
-                              <StatusBadge tone="danger">独立操作</StatusBadge>
-                            </td>
-                            <td className="td-rule-name">{rule.name}</td>
-                            <td className="td-num">{recycle ? formatSize(recycle.bytes) : "—"}</td>
-                            <td className="td-nowrap">
-                              {recycle ? (
-                                <StatusBadge tone="neutral">
-                                  {recycle.items.toLocaleString()} 项
-                                </StatusBadge>
-                              ) : (
-                                <StatusBadge tone="neutral">读取失败</StatusBadge>
-                              )}
-                            </td>
-                            <td className="td-desc">
-                              <span>{rule.description}</span>
-                              {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
-                            </td>
-                            <td className="td-ops">
-                              <div className="actions">
-                                <button
-                                  type="button"
-                                  className="btn btn-danger-outline"
-                                  disabled={!recycle || execBusy || recycle.items === 0}
-                                  onClick={emptyRecycle}
-                                >
-                                  {recycleBusy ? "正在清空…" : "清空回收站"}
-                                </button>
-                                <button
-                                  type="button"
-                                  className="btn btn-subtle"
-                                  onClick={refreshRecycle}
-                                >
-                                  重新查询
-                                </button>
-                                {renderAskButton(rule.id)}
-                              </div>
-                            </td>
-                          </tr>
-                          {renderAskSubRow(rule.id, 6)}
-                        </Fragment>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              ))}
+            {cleaning && (
+              <button
+                type="button"
+                className="btn btn-danger btn-hero"
+                onClick={() => cleanCancel().catch(() => {})}
+              >
+                <span>停止清理</span>
+              </button>
+            )}
           </div>
-        );
-      })}
+        </div>
 
-      {maintenanceRules.length > 0 && (
-        <div className="card card-tier-caution">
+        {/* 扫描中实时进度 */}
+        {scanning && scanProgress && (
+          <div className="live-progress">
+            <div className="live-progress-row">
+              <span className="live-phase">{scanProgress.phase}</span>
+              <span className="muted truncate">{scanProgress.currentItem}</span>
+              <span className="td-num live-bytes">
+                已发现 {formatSize(scanProgress.foundBytes)}（{scanProgress.foundItems} 项）
+              </span>
+            </div>
+            <div className="bar-indeterminate">
+              <div className="bar-indeterminate-inner" />
+            </div>
+          </div>
+        )}
+
+        {/* 清理中实时进度 */}
+        {cleaning && cleanProgress && (
+          <div className="live-progress">
+            <div className="live-progress-row">
+              <span className="live-phase">
+                正在清理 ({cleanProgress.completedItems}/{cleanProgress.totalItems})
+              </span>
+              <span className="muted truncate">{cleanProgress.currentItemName}</span>
+              <span className="td-num live-bytes">
+                已释放 {formatSize(cleanProgress.freedBytes)}
+              </span>
+            </div>
+            <div className="bar">
+              <div
+                className="bar-fill"
+                style={{
+                  width: `${
+                    cleanProgress.totalItems > 0
+                      ? Math.min(100, (cleanProgress.completedItems / cleanProgress.totalItems) * 100)
+                      : 0
+                  }%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* 扫描完成摘要工具栏 */}
+        {!scanning && !cleaning && scanResult && (
+          <div className="hero-toolbar">
+            <div className="hero-toolbar-left td-num">
+              <span>
+                扫描耗时 {formatDuration(scanResult.elapsedMs)} · 共发现{" "}
+                <strong>{formatSize(scanResult.totalBytes)}</strong> · 已选{" "}
+                <strong>{selectedSummary.count}</strong> 项（
+                <strong>{formatSize(selectedSummary.bytes)}</strong>）
+              </span>
+              {selectedSummary.adminCount > 0 && (
+                <StatusBadge tone="caution" icon={<IconLock width={12} height={12} />}>
+                  含 {selectedSummary.adminCount} 项系统项（合并一次 UAC 授权）
+                </StatusBadge>
+              )}
+            </div>
+            <div className="hero-toolbar-right">
+              <label className="inline-check" title="对被系统占用的系统垃圾文件安排下次开机自动删除">
+                <input
+                  type="checkbox"
+                  checked={scheduleRebootDelete}
+                  onChange={(event) => setScheduleRebootDelete(event.target.checked)}
+                />
+                <span>占用系统文件重启后删除</span>
+              </label>
+              <button type="button" className="btn-link" onClick={() => applyPreset("recommended")}>
+                默认推荐
+              </button>
+              <button type="button" className="btn-link" onClick={() => applyPreset("all")}>
+                全选
+              </button>
+              <button type="button" className="btn-link" onClick={() => applyPreset("none")}>
+                清空
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {error && <AlertBanner tone="danger">{error}</AlertBanner>}
+      {closeNotice && <AlertBanner tone="info">{closeNotice}</AlertBanner>}
+
+      {/* 清理完成总结卡 */}
+      {cleanReport && (
+        <div className="card report-card">
           <div className="card-header">
             <div className="card-title-group">
-              <h3 className="card-title">系统维护（需要管理员）（{maintenanceRules.length}）</h3>
-              <AdminTag />
+              <StatusBadge tone={cleanReport.cancelled ? "caution" : "safe"} icon={<IconCheck width={12} height={12} />}>
+                {cleanReport.cancelled ? "已停止" : "清理完成"}
+              </StatusBadge>
+              <h3 className="card-title">
+                本次清理估算释放 {formatSize(cleanReport.freedBytes)}
+                {actualFreed > 0 && `（C 盘实际可用增加 ${formatSize(actualFreed)}）`}
+              </h3>
             </div>
             <div className="actions">
               <button
                 type="button"
                 className="btn btn-subtle"
-                disabled={execBusy}
-                onClick={analyzeComponentStore}
+                onClick={() => setReportExpanded((prev) => !prev)}
               >
-                {anyAnalyzeRunning ? "正在分析…" : "分析组件存储（只读）"}
+                {reportExpanded ? "收起明细" : `查看 ${cleanReport.items.length} 项明细`}
+              </button>
+              <button type="button" className="btn btn-primary" onClick={startScan}>
+                再次扫描
+              </button>
+            </div>
+          </div>
+
+          <div className="stat-grid">
+            <div className="stat-box">
+              <span className="stat-label">已删除文件</span>
+              <strong className="stat-value td-num">{cleanReport.deletedFiles.toLocaleString()}</strong>
+            </div>
+            <div className="stat-box">
+              <span className="stat-label">移入回收站（可还原）</span>
+              <strong className="stat-value td-num">{cleanReport.recycledItems.toLocaleString()}</strong>
+            </div>
+            <div className="stat-box">
+              <span className="stat-label">占用跳过</span>
+              <strong className="stat-value td-num">{cleanReport.skippedFiles.toLocaleString()}</strong>
+            </div>
+            <div className="stat-box">
+              <span className="stat-label">已排入重启删除</span>
+              <strong className="stat-value td-num">{cleanReport.rebootScheduled.toLocaleString()}</strong>
+            </div>
+          </div>
+
+          {cleanReport.recycledItems > 0 && (
+            <p className="muted" style={{ marginTop: 10, marginBottom: 0 }}>
+              提示：卸载残留项已安全移入 Windows 回收站，确认软件运行正常后清空回收站即可彻底释放空间。
+            </p>
+          )}
+
+          {cleanReport.error && (
+            <AlertBanner tone="danger">{cleanReport.error}</AlertBanner>
+          )}
+
+          {reportExpanded && (
+            <div className="table-wrap" style={{ marginTop: 12 }}>
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>项目</th>
+                    <th>状态</th>
+                    <th>释放大小</th>
+                    <th>说明</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {cleanReport.items.map((item) => (
+                    <tr key={item.itemId}>
+                      <td className="td-nowrap">{item.name}</td>
+                      <td>
+                        <StatusBadge
+                          tone={
+                            item.status === "done"
+                              ? "safe"
+                              : item.status === "partial"
+                                ? "caution"
+                                : item.status === "failed"
+                                  ? "danger"
+                                  : "neutral"
+                          }
+                        >
+                          {item.status === "done"
+                            ? "已完成"
+                            : item.status === "partial"
+                              ? "部分跳过"
+                              : item.status === "failed"
+                                ? "失败"
+                                : "已跳过"}
+                        </StatusBadge>
+                      </td>
+                      <td className="td-num">{formatSize(item.freedBytes)}</td>
+                      <td>{item.detail}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 场景分类勾选树 */}
+      {scanResult && (
+        <div className="category-stack">
+          {scanResult.categories.map((group) => {
+            const isOpen = openCategories.has(group.category);
+            const selectedInGroup = group.items.filter((item) => selected.has(item.id));
+            const allChecked =
+              group.items.length > 0 && selectedInGroup.length === group.items.length;
+            const someChecked =
+              selectedInGroup.length > 0 && selectedInGroup.length < group.items.length;
+            const selectedBytesInGroup = selectedInGroup.reduce(
+              (sum, item) => sum + (item.sizeBytes ?? 0),
+              0,
+            );
+
+            return (
+              <div className="card category-card" key={group.category}>
+                <div
+                  className="category-header"
+                  onClick={() => toggleCategoryOpen(group.category)}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      toggleCategoryOpen(group.category);
+                    }
+                  }}
+                >
+                  <div className="category-header-left">
+                    <IndeterminateCheckbox
+                      checked={allChecked}
+                      indeterminate={someChecked}
+                      disabled={group.items.length === 0 || busy}
+                      ariaLabel={`全选 ${group.label}`}
+                      onChange={() => toggleCategorySelect(group)}
+                    />
+                    <span className="category-icon">{CATEGORY_ICON[group.category]}</span>
+                    <div>
+                      <div className="category-title-row">
+                        <span className="category-title">{group.label}</span>
+                        <span className="muted td-num">（{group.items.length} 项）</span>
+                      </div>
+                      <span className="category-desc">{group.description}</span>
+                    </div>
+                  </div>
+                  <div className="category-header-right">
+                    <span className="td-num category-size">
+                      {selectedInGroup.length > 0 && (
+                        <strong className="accent-text">{formatSize(selectedBytesInGroup)} / </strong>
+                      )}
+                      {formatSize(group.totalBytes)}
+                    </span>
+                    <IconChevron open={isOpen} width={16} height={16} />
+                  </div>
+                </div>
+
+                {isOpen && (
+                  <div className="category-body">
+                    {group.items.length === 0 ? (
+                      <p className="muted empty-inline">这一分类下未检测到可清理垃圾，很干净。</p>
+                    ) : (
+                      <div className="item-list">
+                        {group.items.map((item) => {
+                          const isChecked = selected.has(item.id);
+                          const isExpanded = expandedItems.has(item.id);
+                          const badge = sourceTag(item);
+                          return (
+                            <Fragment key={item.id}>
+                              <div className={isChecked ? "clean-row clean-row-checked" : "clean-row"}>
+                                <input
+                                  type="checkbox"
+                                  className="checkbox"
+                                  checked={isChecked}
+                                  disabled={busy}
+                                  aria-label={`选择 ${item.name}`}
+                                  onChange={() => toggleItem(item.id)}
+                                />
+                                <div className="clean-row-main">
+                                  <div className="clean-row-title-line">
+                                    <span className="clean-row-name">{item.name}</span>
+                                    {badge && (
+                                      <StatusBadge tone={badge.tone}>{badge.label}</StatusBadge>
+                                    )}
+                                    {item.requiresAdmin && (
+                                      <StatusBadge tone="caution" icon={<IconLock width={11} height={11} />}>
+                                        管理员
+                                      </StatusBadge>
+                                    )}
+                                    {item.runningProcesses.length > 0 && (
+                                      <StatusBadge tone="caution">
+                                        运行中：{item.runningProcesses.join("、")}
+                                      </StatusBadge>
+                                    )}
+                                  </div>
+                                  <div className="clean-row-sub">
+                                    <span>{item.description}</span>
+                                    {item.warning && (
+                                      <span className="warn-inline">
+                                        <IconWarning width={12} height={12} /> {item.warning}
+                                      </span>
+                                    )}
+                                    {item.lastModifiedAt !== null && (
+                                      <span className="muted">
+                                        最后修改：{formatTime(item.lastModifiedAt)}
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+
+                                <div className="clean-row-right">
+                                  <div className="clean-row-size td-num">
+                                    {item.sizeBytes !== null ? (
+                                      <strong>{formatSize(item.sizeBytes)}</strong>
+                                    ) : (
+                                      <span className="muted">需提权查看</span>
+                                    )}
+                                    {item.fileCount > 0 && (
+                                      <span className="muted file-count">
+                                        {item.fileCount.toLocaleString()} 个文件
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="clean-row-ops">
+                                    {item.samplePaths.length > 0 && (
+                                      <button
+                                        type="button"
+                                        className="btn-link"
+                                        disabled={busy}
+                                        onClick={() => toggleItemExpand(item.id)}
+                                      >
+                                        {isExpanded ? "收起" : "详情"}
+                                      </button>
+                                    )}
+                                    {item.anchors.length > 0 && (
+                                      <button
+                                        type="button"
+                                        className="btn-link"
+                                        disabled={busy}
+                                        title="在资源管理器中打开目录"
+                                        onClick={() =>
+                                          openCleanItemLocation(scanResult.scanId, item.id, null).catch(
+                                            (reason) => setError(String(reason)),
+                                          )
+                                        }
+                                      >
+                                        <IconFolder width={14} height={14} />
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+
+                              {isExpanded && item.samplePaths.length > 0 && (
+                                <div className="sample-box">
+                                  <div className="sample-title">
+                                    代表性路径（最多显示 {item.samplePaths.length} 条）
+                                  </div>
+                                  <ul className="sample-list">
+                                    {item.samplePaths.map((sample, idx) => (
+                                      <li key={`${item.id}-sample-${idx}`}>
+                                        <button
+                                          type="button"
+                                          className="sample-path-btn"
+                                          disabled={busy}
+                                          onClick={() =>
+                                            openCleanItemLocation(
+                                              scanResult.scanId,
+                                              item.id,
+                                              idx,
+                                            ).catch((reason) => setError(String(reason)))
+                                          }
+                                        >
+                                          {sample}
+                                        </button>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                            </Fragment>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 系统深度瘦身大户卡片区 */}
+      <div className="section-block">
+        <div className="section-header">
+          <div>
+            <h3 className="section-title">系统深度瘦身（GB 级空间大户）</h3>
+            <p className="muted">
+              针对 C 盘最常见的超大系统占用项，单次 UAC 提权安全执行；若清理后 C 盘仍紧张，可前往{" "}
+              <button type="button" className="btn-link" onClick={onOpenSpace}>
+                空间分析定位大文件
+              </button>
+              。
+            </p>
+          </div>
+          <button
+            type="button"
+            className="btn btn-subtle"
+            disabled={busy}
+            onClick={refreshBase}
+          >
+            <IconRefresh width={14} height={14} />
+            <span>刷新状态</span>
+          </button>
+        </div>
+
+        {slimProgress && (
+          <AlertBanner tone="info">
+            <div className="slim-progress-banner">
+              <span>{slimProgress.detail}</span>
+              {slimProgress.percent !== null && (
+                <strong className="td-num">{slimProgress.percent.toFixed(1)}%</strong>
+              )}
+            </div>
+          </AlertBanner>
+        )}
+
+        {slimResult && (
+          <AlertBanner
+            tone={
+              slimResult.status === "done"
+                ? "success"
+                : slimResult.status === "failed"
+                  ? "danger"
+                  : "warn"
+            }
+          >
+            {slimResult.detail}
+            {slimResult.freeAfter > slimResult.freeBefore && (
+              <>
+                {" "}
+                · C 盘可用空间增加{" "}
+                <strong>{formatSize(slimResult.freeAfter - slimResult.freeBefore)}</strong>
+              </>
+            )}
+          </AlertBanner>
+        )}
+
+        <div className="slim-grid">
+          {/* 1. 休眠文件 */}
+          <div className="card slim-card">
+            <div className="slim-card-head">
+              <div>
+                <h4 className="slim-card-title">休眠文件 (hiberfil.sys)</h4>
+                <span className="muted">
+                  当前状态：{deepSlim ? hibernateModeLabel(deepSlim.hibernate.mode) : "读取中…"}
+                </span>
+              </div>
+              <strong className="slim-size td-num">
+                {deepSlim?.hibernate.fileBytes !== null && deepSlim?.hibernate.fileBytes !== undefined
+                  ? formatSize(deepSlim.hibernate.fileBytes)
+                  : deepSlim?.hibernate.mode === "off"
+                    ? "0 B"
+                    : "—"}
+              </strong>
+            </div>
+            <p className="slim-desc">
+              台式机或很少使用“休眠”时可精简或关闭，通常一次可释放 6–32 GB 空间。
+            </p>
+            <div className="slim-actions">
+              {deepSlim?.hibernate.mode !== "off" && (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    disabled={busy}
+                    onClick={() =>
+                      runDeepSlim(
+                        "hibernateOff",
+                        "关闭休眠会删除 C:\\hiberfil.sys 释放全部空间，同时停用快速启动和系统休眠（不影响睡眠）。可随时在此重新开启。确认继续？",
+                      )
+                    }
+                  >
+                    关闭休眠
+                  </button>
+                  {deepSlim?.hibernate.mode !== "reduced" && (
+                    <button
+                      type="button"
+                      className="btn btn-subtle btn-sm"
+                      disabled={busy}
+                      onClick={() =>
+                        runDeepSlim(
+                          "hibernateReduced",
+                          "精简模式会保留快速启动并释放约一半的休眠文件空间（同时会隐藏电源菜单中的“休眠”选项，不影响睡眠）。确认继续？",
+                        )
+                      }
+                    >
+                      精简约一半
+                    </button>
+                  )}
+                </>
+              )}
+              {deepSlim?.hibernate.mode !== "full" && (
+                <button
+                  type="button"
+                  className="btn btn-subtle btn-sm"
+                  disabled={busy}
+                  onClick={() => runDeepSlim("hibernateOn")}
+                >
+                  恢复完整开启
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* 2. WinSxS 组件存储 */}
+          <div className="card slim-card">
+            <div className="slim-card-head">
+              <div>
+                <h4 className="slim-card-title">WinSxS 系统组件清理</h4>
+                <span className="muted">
+                  {deepSlim?.winsxs.reclaimableText
+                    ? `可回收：${deepSlim.winsxs.reclaimableText}`
+                    : "使用官方 DISM 清理已取代的旧系统组件"}
+                </span>
+              </div>
+              <StatusBadge tone="safe" icon={<IconShield width={11} height={11} />}>
+                保留回滚
+              </StatusBadge>
+            </div>
+            <p className="slim-desc">
+              {deepSlim?.winsxs.detail ??
+                "安全清理过期的 Windows 更新备份组件（不加 /ResetBase，已装补丁仍可卸载）。"}
+            </p>
+            <div className="slim-actions">
+              <button
+                type="button"
+                className="btn btn-subtle btn-sm"
+                disabled={busy}
+                onClick={() => runDeepSlim("dismAnalyze")}
+              >
+                分析可回收空间
               </button>
               <button
                 type="button"
-                className="btn btn-danger-solid"
-                disabled={execBusy || maintenanceIds.length === 0}
-                onClick={() => runMaintenance(maintenanceIds)}
+                className="btn btn-primary btn-sm"
+                disabled={busy}
+                onClick={() =>
+                  runDeepSlim(
+                    "dismCleanup",
+                    "将调用官方 DISM /StartComponentCleanup 清理过期系统组件，耗时约 3–15 分钟，期间请勿关机。确认开始？",
+                  )
+                }
               >
-                {maintenanceRunning ? "正在执行…" : "执行选中项"}
+                开始安全清理
               </button>
             </div>
           </div>
 
-          <div style={{ marginBottom: 12 }}>
-            <AlertBanner tone="warn">
-              这些项走 Windows 自己的维护流程，需要管理员权限。勾选多项后点“执行选中项”，整个过程中只会弹出一次授权提示。
-              文件类操作按冻结清单逐项删除，被占用的文件跳过；DISM 组件存储清理不做 ResetBase，可能需要 10–30
-              分钟且无法取消，请勿关机；传递优化缓存调用官方 cmdlet。
-            </AlertBanner>
+          {/* 3. VSS 系统还原点/卷影 */}
+          <div className="card slim-card">
+            <div className="slim-card-head">
+              <div>
+                <h4 className="slim-card-title">系统还原点与卷影副本</h4>
+                <span className="muted">
+                  {deepSlim?.vss.shadowCount !== null && deepSlim?.vss.shadowCount !== undefined
+                    ? `已检测 ${deepSlim.vss.shadowCount} 个卷影`
+                    : "需管理员查询精确数量"}
+                </span>
+              </div>
+              <strong className="slim-size td-num">
+                {deepSlim?.vss.usedBytes !== null && deepSlim?.vss.usedBytes !== undefined
+                  ? formatSize(deepSlim.vss.usedBytes)
+                  : "—"}
+              </strong>
+            </div>
+            <p className="slim-desc">
+              系统更新与安装驱动会自动创建历史还原点，逐个清理最旧卷影可温和回收数 GB。
+            </p>
+            <div className="slim-actions">
+              <button
+                type="button"
+                className="btn btn-subtle btn-sm"
+                disabled={busy}
+                onClick={() =>
+                  runDeepSlim(
+                    "vssCleanOldest",
+                    "将删除 C 盘最旧的一个系统卷影/还原点以释放空间，不影响最新还原点。确认继续？",
+                  )
+                }
+              >
+                清理最旧卷影副本
+              </button>
+            </div>
           </div>
 
-          <div className="table-wrap">
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>选择</th>
-                  <th>名称</th>
-                  <th>说明</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {maintenanceRules.map((rule) => (
-                  <Fragment key={rule.id}>
-                    <tr>
-                      <td className="td-nowrap">
-                        <input
-                          type="checkbox"
-                          className="checkbox-input"
-                          checked={maintenanceSelected.has(rule.id)}
-                          disabled={maintenanceRunning || anyAnalyzeRunning}
-                          onChange={() => toggleMaintenance(rule.id)}
-                          aria-label={`选择 ${rule.name}`}
-                        />
-                      </td>
-                      <td className="td-nowrap">{rule.name}</td>
-                      <td>
-                        <span>{rule.description}</span>
-                        {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
-                      </td>
-                      <td className="td-ops">
-                        <div className="actions">{renderAskButton(rule.id)}</div>
-                      </td>
-                    </tr>
-                    {renderAskSubRow(rule.id, 4)}
-                  </Fragment>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          {anyAnalyzeRunning && (
-            <p className="muted" style={{ marginTop: 10 }}>
-              正在分析组件存储，可能需要几分钟…
+          {/* 4. WSL2 / Docker 虚拟盘压缩 */}
+          <div className="card slim-card">
+            <div className="slim-card-head">
+              <div>
+                <h4 className="slim-card-title">WSL2 / Docker 虚拟盘压缩</h4>
+                <span className="muted">
+                  {deepSlim
+                    ? deepSlim.wslVhdx.length > 0
+                      ? `检测到 ${deepSlim.wslVhdx.length} 个虚拟盘`
+                      : "未检测到 WSL / Docker 虚拟盘"
+                    : "读取中…"}
+                </span>
+              </div>
+              <strong className="slim-size td-num">
+                {deepSlim && deepSlim.wslVhdx.length > 0
+                  ? formatSize(
+                      deepSlim.wslVhdx.reduce((sum, item) => sum + item.sizeBytes, 0),
+                    )
+                  : "0 B"}
+              </strong>
+            </div>
+            <p className="slim-desc">
+              WSL2 和 Docker 删除容器/文件后 .vhdx 不会自动缩容，压缩可把内部空洞还给 C 盘。
             </p>
-          )}
-          {analyzeState?.phase === "failed" && (
-            <div style={{ marginTop: 10 }}>
-              <AlertBanner tone="danger">分析失败：{analyzeState.message}</AlertBanner>
-            </div>
-          )}
-          {analyzeState?.phase === "done" && (
-            <div className="summary-box">
-              {analyzeState.result.ops.map((op) => (
-                <p
-                  key={op.op}
-                  className={op.status === "failed" ? "danger-text" : "muted"}
-                  style={{ margin: "3px 0 0" }}
-                >
-                  {systemOpLabel(op.op)}：{op.detail}
-                </p>
-              ))}
-            </div>
-          )}
-
-          {maintenanceRunning && (
-            <p className="muted" style={{ marginTop: 10 }}>
-              {maintenanceProgress
-                ? `${systemOpLabel(maintenanceProgress.op)}：${maintenanceProgress.detail}`
-                : "等待管理员授权并执行…"}
-            </p>
-          )}
-          {maintenanceError && (
-            <div style={{ marginTop: 10 }}>
-              <AlertBanner tone="danger">系统维护失败：{maintenanceError}</AlertBanner>
-            </div>
-          )}
-          {maintenanceResult && (
-            <div className="summary-box">
-              <ul className="sample-list" style={{ marginTop: 0 }}>
-                {maintenanceResult.ops.map((op) => (
-                  <li key={op.op} className={op.status === "failed" ? "danger-text" : "muted"}>
-                    {systemOpLabel(op.op)}：{op.detail}
+            {deepSlim && deepSlim.wslVhdx.length > 0 && (
+              <ul className="mini-list">
+                {deepSlim.wslVhdx.slice(0, 3).map((disk) => (
+                  <li key={disk.path} className="td-num">
+                    <span className="truncate">{disk.name}</span>
+                    <span>{formatSize(disk.sizeBytes)}</span>
                   </li>
                 ))}
               </ul>
-            </div>
-          )}
-        </div>
-      )}
-
-      {commandRules.length > 0 && (
-        <div className="card card-tier-forbidden">
-          <div className="card-header">
-            <div className="card-title-group">
-              <h3 className="card-title">不可撤销命令（{commandRules.length}）</h3>
-              <StatusBadge tone="danger" icon={<IconTerminal width={12} height={12} />}>
-                不可撤销 · 无逐文件预览
-              </StatusBadge>
+            )}
+            <div className="slim-actions">
+              <button
+                type="button"
+                className="btn btn-subtle btn-sm"
+                disabled={busy || !deepSlim || deepSlim.wslVhdx.length === 0}
+                onClick={() =>
+                  runDeepSlim(
+                    "wslCompact",
+                    "压缩前会先执行 wsl --shutdown 暂停 WSL 实例，再调用 Windows 虚拟磁盘 API 回收空洞。若正在运行 Docker Desktop，建议先手动退出 Docker Desktop 以防自动拉起虚拟盘。确认继续？",
+                  )
+                }
+              >
+                压缩虚拟盘
+              </button>
             </div>
           </div>
-          <p className="card-lead">
-            这些项调用工具自己的官方命令清理缓存，没有逐文件预览，执行后无法撤销。失败或超时只报告，不会强行终止命令。
-          </p>
-          <div className="table-wrap">
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>名称</th>
-                  <th>占盘大小</th>
-                  <th>状态</th>
-                  <th>说明</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {commandRules.map((rule) => {
-                  const candidate = candidates.get(rule.id);
-                  const state = commandStates[rule.id];
-                  const badge = statusBadge(candidate, rule);
-                  const note = statusNote(candidate);
-                  const running = state?.phase === "running";
-                  // 作用范围要在确认框里写清楚，没解析出缓存路径就不能运行。
-                  const paths = candidate?.anchors ?? [];
-                  const scope = paths.join("、");
 
-                  return (
-                    <Fragment key={rule.id}>
-                      <tr>
-                        <td className="td-nowrap">{rule.name}</td>
-                        <td className="td-num">
-                          {candidate ? formatSize(candidate.allocated) : "—"}
-                        </td>
-                        <td className="td-nowrap">
-                          {badge ? (
-                            <StatusBadge tone={CANDIDATE_TONES[badge.kind]}>
-                              {badge.label}
-                            </StatusBadge>
-                          ) : (
-                            "—"
-                          )}
-                        </td>
-                        <td>
-                          <span>{rule.description}</span>
-                          {rule.warning && <p className="warn-text">注意：{rule.warning}</p>}
-                          {note && <p className="muted" style={{ margin: "3px 0 0" }}>{note}</p>}
-                          {paths.length > 0 && (
-                            <p className="path-text" style={{ margin: "4px 0 0" }} title={scope}>
-                              {scope}
-                            </p>
-                          )}
-                        </td>
-                        <td className="td-ops">
-                          <div className="actions">
-                            <button
-                              type="button"
-                              className="btn btn-danger-outline"
-                              disabled={candidate?.executable !== true || execBusy || scope === ""}
-                              onClick={() => runCommand(rule, scope)}
-                            >
-                              {running ? "运行中…" : "运行"}
-                            </button>
-                            {renderAskButton(rule.id)}
-                          </div>
-                        </td>
-                      </tr>
-
-                      {running && (
-                        <tr className="sub-row">
-                          <td colSpan={5}>
-                            <p className="muted" style={{ margin: 0 }}>
-                              运行中…（超时只报告，不会强行终止）
-                            </p>
-                          </td>
-                        </tr>
-                      )}
-
-                      {state?.phase === "done" && (
-                        <tr className="sub-row">
-                          <td colSpan={5}>{commandResult(state.report)}</td>
-                        </tr>
-                      )}
-
-                      {state?.phase === "failed" && (
-                        <tr className="sub-row">
-                          <td colSpan={5}>
-                            <p className="danger-text" style={{ margin: 0 }}>
-                              执行失败：{state.message}
-                            </p>
-                          </td>
-                        </tr>
-                      )}
-                      {renderAskSubRow(rule.id, 5)}
-                    </Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
+          {/* 5. 虚拟内存状态卡 */}
+          <div className="card slim-card">
+            <div className="slim-card-head">
+              <div>
+                <h4 className="slim-card-title">虚拟内存 (pagefile.sys)</h4>
+                <span className="muted">只读状态检测</span>
+              </div>
+              <strong className="slim-size td-num">
+                {deepSlim && deepSlim.pagefiles.length > 0
+                  ? formatSize(
+                      deepSlim.pagefiles.reduce((sum, p) => sum + (p.sizeBytes ?? 0), 0),
+                    )
+                  : "系统托管"}
+              </strong>
+            </div>
+            <p className="slim-desc">
+              {deepSlim?.pagefiles.some((p) => p.onSystemDrive)
+                ? "当前虚拟内存位于 C 盘。如需释放此空间，可在「系统属性 → 高级 → 性能设置 → 虚拟内存」中迁移至其他 SSD。"
+                : "虚拟内存已不在 C 盘或处于系统自动管理状态，无需手动改动。"}
+            </p>
           </div>
         </div>
-      )}
+      </div>
 
-      {plan && (
-        <PlanPreview
-          // 每份新计划都重建预览：上一次的执行结果、勾选项和展开状态不能带过来，
-          // 否则新计划会沿用旧报告的“已结束”状态而没有“开始清理”按钮。
-          key={plan.planId}
-          planId={plan.planId}
-          summary={plan}
-          // 命令或清空回收站正在进行时不能开始清理，由后端的执行锁兜底。
-          blocked={planning || recycleBusy || anyCommandRunning}
-          onRunningChange={setPlanRunning}
-          onFinished={() => {
-            // 清理已经结束，把界面上的统计和回收站数量重新读一遍。
-            evaluate();
-            refreshRecycle();
+      {/* 进程冲突提示弹窗 */}
+      {conflicts && (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="conflict-title"
+          onClick={() => {
+            if (!closingProcs && !recheckingProcs) setConflicts(null);
           }}
-        />
+        >
+          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <IconWarning width={20} height={20} className="warn-icon" />
+              <h3 id="conflict-title" className="modal-title">
+                检测到正在运行的软件
+              </h3>
+            </div>
+            <p className="modal-desc">
+              以下软件正在后台运行，关闭后可以更彻底地清理其缓存；你也可以手动关闭后点「重新检测」，或直接跳过被占用的单个文件继续清理。
+            </p>
+            <ul className="conflict-list">
+              {conflicts.map((conflict) => (
+                <li key={conflict.appName} className="conflict-row">
+                  <div>
+                    <strong>{conflict.appName}</strong>
+                    <span className="muted">（{conflict.processNames.join("、")}）</span>
+                  </div>
+                  <span className="td-num">{formatSize(conflict.affectedBytes)}</span>
+                </li>
+              ))}
+            </ul>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={closingProcs || recheckingProcs}
+                onClick={handleGracefulCloseAndClean}
+              >
+                {closingProcs ? "正在请求关闭…" : "优雅关闭并清理"}
+              </button>
+              <button
+                type="button"
+                className="btn btn-subtle"
+                disabled={closingProcs || recheckingProcs}
+                onClick={handleRecheckProcesses}
+              >
+                {recheckingProcs ? "检测中…" : "已关闭 · 重新检测"}
+              </button>
+              <button
+                type="button"
+                className="btn btn-subtle"
+                disabled={closingProcs || recheckingProcs}
+                onClick={() => runCleanNow(Array.from(selected))}
+              >
+                跳过占用直接清理
+              </button>
+              <button
+                type="button"
+                className="btn btn-subtle"
+                disabled={closingProcs || recheckingProcs}
+                onClick={() => setConflicts(null)}
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </section>
-  );
-}
-
-// 状态徽标。没有评估结果时返回 null，界面显示占位符。
-function statusBadge(
-  candidate: CandidateInfo | undefined,
-  rule: RuleInfo,
-): { kind: CandidateStatusKind; label: string } | null {
-  if (!candidate) {
-    return null;
-  }
-
-  switch (candidate.status) {
-    case "ready":
-      // 阶段还没开放时不能显示“可执行”，否则会让人以为点了就会清理。
-      return candidate.executable
-        ? { kind: "ready", label: "可执行" }
-        : { kind: "phaseLocked", label: `将在 ${PHASE_LABELS[rule.phase]} 开放` };
-    case "processRunning":
-      return {
-        kind: "processRunning",
-        label: `进程运行中：${candidate.statusDetail ?? "未知进程"}`,
-      };
-    case "notPresent":
-      // 命令类规则的“找不到工具”就是没安装，文案按任务书写成“未安装”。
-      return {
-        kind: "notPresent",
-        label: rule.targetKind === "command" ? "未安装" : "未找到",
-      };
-    case "layoutMismatch":
-      return { kind: "layoutMismatch", label: "布局不符" };
-    case "phaseLocked":
-      return { kind: "phaseLocked", label: candidate.statusDetail ?? "将在后续任务开放" };
-    case "insufficient":
-      return { kind: "insufficient", label: "证据不足" };
-    case "forbidden":
-      return { kind: "forbidden", label: "禁区" };
-  }
-}
-
-// 状态补充说明。开放阶段已经在徽标里，不重复。
-function statusNote(candidate: CandidateInfo | undefined): string | null {
-  if (!candidate || !candidate.statusDetail) {
-    return null;
-  }
-  if (candidate.status === "phaseLocked") {
-    return null;
-  }
-  // 进程占着文件就删不动，直接告诉用户先退出哪个程序。
-  if (candidate.status === "processRunning") {
-    return `请先退出 ${candidate.statusDetail}`;
-  }
-
-  return candidate.statusDetail;
-}
-
-// 命令执行结果：成功看前后对比，失败和超时要如实说明，并附上输出末尾。
-function commandResult(report: CommandReport) {
-  const size = `${formatSize(report.allocatedBefore)} → ${formatSize(report.allocatedAfter)}`;
-
-  return (
-    <>
-      {report.timedOut ? (
-        <p className="warn-text" style={{ margin: 0 }}>
-          命令超时，已停止等待；没有强行终止进程，它可能还在运行（缓存 {size}）
-        </p>
-      ) : report.exitCode === 0 ? (
-        <p className="muted td-num" style={{ margin: 0 }}>
-          命令已结束：缓存 {size}
-        </p>
-      ) : (
-        <p className="danger-text" style={{ margin: 0 }}>
-          命令失败（退出码 {report.exitCode ?? "未知"}）：缓存 {size}
-        </p>
-      )}
-      {report.output && (
-        <p className="path-text" style={{ margin: "4px 0 0" }}>
-          {report.output}
-        </p>
-      )}
-      {report.logError && <p className="danger-text">{report.logError}</p>}
-    </>
-  );
-}
-
-// 提权执行的结果：等待授权、失败原因，或者每个内置操作的说明。
-function elevatedResult(state: ElevatedState) {
-  if (state.phase === "running") {
-    return (
-      <p className="muted" style={{ margin: 0 }}>
-        等待管理员授权并执行…
-      </p>
-    );
-  }
-  if (state.phase === "failed") {
-    return (
-      <p className="danger-text" style={{ margin: 0 }}>
-        提权执行失败：{state.message}
-      </p>
-    );
-  }
-
-  return (
-    <>
-      {state.result.ops.map((op) => (
-        <Fragment key={op.op}>
-          <p className={op.status === "failed" ? "danger-text" : "muted"} style={{ margin: 0 }}>
-            {op.detail}
-          </p>
-          {op.conflicts.length > 0 && (
-            <p className="muted" style={{ margin: "4px 0 0" }}>
-              原位置已有同名文件、因此没有还原：{op.conflicts.join("、")}
-            </p>
-          )}
-        </Fragment>
-      ))}
-    </>
-  );
-}
-
-// 占用检查的结果：占用进程列表，或者“未发现占用 / 检测不完整”。
-function lockResult(state: LockState) {
-  if (state.phase === "loading") {
-    return (
-      <p className="muted" style={{ margin: 0 }}>
-        正在检查占用…
-      </p>
-    );
-  }
-  if (state.phase === "failed") {
-    return (
-      <p className="danger-text" style={{ margin: 0 }}>
-        检测失败：{state.message}
-      </p>
-    );
-  }
-
-  const { report } = state;
-  return (
-    <>
-      {report.lockers.length > 0 ? (
-        <ul className="locker-list" style={{ marginTop: 0 }}>
-          {report.lockers.map((locker) => (
-            <li key={`${locker.pid}-${locker.appName}`}>
-              {locker.appName}（PID {locker.pid}）
-              {locker.service ? `，服务 ${locker.service}` : ""}
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p className="muted" style={{ margin: 0 }}>
-          本次未发现占用（检测 {report.checked}/{report.total} 个文件）
-        </p>
-      )}
-      {!report.complete && (
-        <p className="warn-text">检测不完整：{report.error ?? "未知原因"}</p>
-      )}
-    </>
   );
 }

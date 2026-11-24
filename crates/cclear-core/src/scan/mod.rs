@@ -1,5 +1,6 @@
 //! 并行目录扫描器。
 
+use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -57,6 +58,7 @@ pub struct ScanProgress {
 }
 
 /// 目录树节点。`size` 含整个子树。
+#[derive(Serialize, Deserialize)]
 pub struct DirNode {
     pub id: u32,
     pub parent: Option<u32>,
@@ -69,6 +71,7 @@ pub struct DirNode {
 }
 
 /// Top N 文件。
+#[derive(Serialize, Deserialize)]
 pub struct FileEntry {
     pub path: PathBuf,
     pub logical: u64,
@@ -77,6 +80,7 @@ pub struct FileEntry {
 }
 
 /// 一次扫描的结果。
+#[derive(Serialize, Deserialize)]
 pub struct ScanResult {
     pub roots: Vec<u32>,
     pub nodes: Vec<DirNode>,

@@ -40,6 +40,11 @@ pub struct CmdOutcome {
 ///
 /// 不等待 explorer 退出：它会把命令行转交给已经运行的实例后马上返回。
 pub fn open_in_explorer(path: &Path) -> io::Result<()> {
+    let path = crate::guard::validate_external_path(
+        path.to_str()
+            .ok_or_else(|| io::Error::other("路径无法显示"))?,
+    )
+    .map_err(io::Error::other)?;
     let explorer = known_folder(KnownFolder::Windows)
         .map_err(io::Error::other)?
         .join("explorer.exe");
@@ -329,7 +334,10 @@ fn spawn_command(
             Err(error) => return Err(failed(&error)),
         };
         // 先清空再设置：用户环境里的变量一个都不该进入提权进程。
-        command.env_clear().envs(variables);
+        let Some(directory) = tool.parent() else {
+            return Err(failed("无法确定系统工具目录"));
+        };
+        command.env_clear().envs(variables).current_dir(directory);
     } else {
         command.envs(env.iter().map(|(name, value)| (*name, value.as_str())));
     }

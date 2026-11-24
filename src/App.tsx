@@ -1,63 +1,40 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { appInfo, quarantineOverdue } from "./api";
-import {
-  BrandMark,
-  IconClean,
-  IconHistory,
-  IconMigrate,
-  IconOverview,
-  IconQuarantine,
-  IconSettings,
-  IconSpace,
-} from "./components/Icons";
-import { AlertBanner, StatusBadge } from "./components/Ui";
-import { formatSize } from "./format";
+import { appInfo } from "./api";
+import { BrandMark, IconClean, IconHistory, IconSpace } from "./components/Icons";
+import { StatusBadge } from "./components/Ui";
 import { CleanPage } from "./pages/Clean";
-import { HistoryPage } from "./pages/History";
-import { MigratePage } from "./pages/Migrate";
-import { OverviewPage } from "./pages/Overview";
-import { QuarantinePage } from "./pages/Quarantine";
-import { SettingsPage } from "./pages/Settings";
+import { HistorySettingsPage } from "./pages/HistorySettings";
 import { SpacePage } from "./pages/Space";
-import type { AppInfo, QuarantineBatch } from "./types";
+import type { AppInfo } from "./types";
 
-type PageId = "overview" | "clean" | "space" | "quarantine" | "migrate" | "history" | "settings";
+type PageId = "clean" | "space" | "settings";
 
-const NAV: { id: PageId; label: string; icon: ReactNode }[] = [
-  { id: "overview", label: "总览", icon: <IconOverview /> },
-  { id: "clean", label: "清理", icon: <IconClean /> },
-  { id: "space", label: "空间分析", icon: <IconSpace /> },
-  { id: "quarantine", label: "隔离区", icon: <IconQuarantine /> },
-  { id: "migrate", label: "迁移", icon: <IconMigrate /> },
-  { id: "history", label: "历史", icon: <IconHistory /> },
-  { id: "settings", label: "设置", icon: <IconSettings /> },
+const NAV: { id: PageId; label: string; desc: string; icon: ReactNode }[] = [
+  { id: "clean", label: "一键清理", desc: "垃圾扫描与系统瘦身", icon: <IconClean /> },
+  { id: "space", label: "空间分析", desc: "极速定位 C 盘大文件", icon: <IconSpace /> },
+  { id: "settings", label: "历史与设置", desc: "记录、白名单与规则库", icon: <IconHistory /> },
 ];
 
 export default function App() {
-  const [page, setPage] = useState<PageId>("overview");
+  const [page, setPage] = useState<PageId>("clean");
   const [app, setApp] = useState<AppInfo | null>(null);
-  const [overdue, setOverdue] = useState<QuarantineBatch[]>([]);
-  // 从空间分析页点“迁移到其他盘…”时，把选中目录的节点 ID 传给迁移页。
-  const [migrateSource, setMigrateSource] = useState<number | null>(null);
+  // 清理或导入规则包后通知相关面板刷新
+  const [refreshTick, setRefreshTick] = useState(0);
 
-  const refreshOverdue = () => {
-    quarantineOverdue()
-      .then(setOverdue)
-      .catch(() => setOverdue([]));
-  };
-
-  useEffect(() => {
+  const loadAppInfo = useCallback(() => {
     appInfo()
       .then(setApp)
       .catch(() => setApp(null));
-    refreshOverdue();
   }, []);
 
-  const openMigrateForNode = (nodeId: number) => {
-    setMigrateSource(nodeId);
-    setPage("migrate");
-  };
+  useEffect(() => {
+    loadAppInfo();
+  }, [loadAppInfo, refreshTick]);
+
+  const handleDataChanged = useCallback(() => {
+    setRefreshTick((tick) => tick + 1);
+  }, []);
 
   return (
     <div className="app-shell">
@@ -66,7 +43,7 @@ export default function App() {
           <BrandMark className="sidebar-brand-icon" />
           <div className="sidebar-brand-text">
             <span className="brand-name">CClear</span>
-            <span className="brand-sub">C 盘安全清理与迁移</span>
+            <span className="brand-sub">C 盘极速空间清理</span>
           </div>
         </div>
 
@@ -80,12 +57,10 @@ export default function App() {
               onClick={() => setPage(item.id)}
             >
               <span className="nav-icon">{item.icon}</span>
-              <span className="nav-label">{item.label}</span>
-              {item.id === "quarantine" && overdue.length > 0 && (
-                <span className="nav-pill" title={`有 ${overdue.length} 个超期批次`}>
-                  {overdue.length}
-                </span>
-              )}
+              <span className="nav-text">
+                <span className="nav-label">{item.label}</span>
+                <span className="nav-desc">{item.desc}</span>
+              </span>
             </button>
           ))}
         </nav>
@@ -95,10 +70,15 @@ export default function App() {
             <span>版本</span>
             <span className="td-num">{app ? `v${app.version}` : "—"}</span>
           </div>
-          {/* 权限徽标只用于展示，取不到时保持“普通权限”。 */}
           <div className="sidebar-meta-row">
-            <span>权限</span>
-            <StatusBadge tone={app?.isAdmin ? "caution" : "neutral"}>
+            <span>规则库</span>
+            <span className="td-num">
+              {app ? `${app.rulePackVersion} · ${app.ruleCount} 条` : "—"}
+            </span>
+          </div>
+          <div className="sidebar-meta-row">
+            <span>当前权限</span>
+            <StatusBadge tone={app?.isAdmin ? "safe" : "neutral"}>
               {app?.isAdmin ? "管理员" : "普通权限"}
             </StatusBadge>
           </div>
@@ -107,38 +87,19 @@ export default function App() {
 
       <div className="main-stage">
         <main className="content">
-          {overdue.length > 0 && page !== "quarantine" && (
-            <AlertBanner
-              tone="warn"
-              actions={
-                <button
-                  type="button"
-                  className="btn btn-subtle"
-                  onClick={() => setPage("quarantine")}
-                >
-                  去隔离区处理
-                </button>
-              }
-            >
-              <span>
-                隔离区有 {overdue.length} 个批次存放超过 7 天，共{" "}
-                {formatSize(overdue.reduce((total, batch) => total + batch.size, 0))}，需要你手动处理。
-              </span>
-            </AlertBanner>
-          )}
-
-          {page === "overview" && <OverviewPage />}
-          {page === "clean" && <CleanPage onOpenSettings={() => setPage("settings")} />}
-          {page === "space" && <SpacePage onMigrate={openMigrateForNode} />}
-          {page === "quarantine" && <QuarantinePage onChanged={refreshOverdue} />}
-          {page === "migrate" && (
-            <MigratePage
-              initialSourceId={migrateSource}
-              onSourceHandled={() => setMigrateSource(null)}
+          {/* 保留清理页与空间分析页的运行状态，切换页面不丢扫描结果 */}
+          <div className={page === "clean" ? "page-pane" : "page-pane-hidden"}>
+            <CleanPage onCleaned={handleDataChanged} onOpenSpace={() => setPage("space")} />
+          </div>
+          <div className={page === "space" ? "page-pane" : "page-pane-hidden"}>
+            <SpacePage onRecycled={handleDataChanged} />
+          </div>
+          {page === "settings" && (
+            <HistorySettingsPage
+              refreshTick={refreshTick}
+              onRulePacksChanged={handleDataChanged}
             />
           )}
-          {page === "history" && <HistoryPage />}
-          {page === "settings" && <SettingsPage />}
         </main>
       </div>
     </div>

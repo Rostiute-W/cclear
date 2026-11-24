@@ -4,11 +4,12 @@
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
+use std::path::PathBuf;
 
 use crate::model::FileIdentity;
+use crate::rules::RootMap;
 use crate::rules::forbidden as rules;
-use crate::rules::resolve::RootMap;
-use crate::win::{dirinfo, equals_ignore_case};
+use crate::win::equals_ignore_case;
 
 use super::path;
 
@@ -32,21 +33,37 @@ impl Forbidden {
     pub fn from_rules(roots: &RootMap) -> Self {
         let mut ids = HashSet::new();
 
-        for dir in rules::forbidden_dirs(roots) {
-            let Ok(handle) = dirinfo::open_dir(&dir) else {
-                continue;
-            };
-            if let Ok(identity) = path::identity_of(&handle) {
+        let paths = rules::forbidden_paths(roots);
+        let mut names: Vec<String> = rules::PROTECTED_NAMES
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        for target in paths {
+            if let Some(name) = target.file_name() {
+                names.push(name.to_string_lossy().into_owned());
+            }
+            if let Ok(identity) =
+                path::inspect_path(&target, &Self::empty()).map(|entry| entry.identity)
+            {
                 ids.insert(identity);
             }
         }
 
-        Self {
-            ids,
-            names: rules::forbidden_names()
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
+        Self { ids, names }
+    }
+
+    pub fn protects_name(&self, name: &str) -> bool {
+        self.names
+            .iter()
+            .any(|forbidden| equals_ignore_case(name, forbidden))
+    }
+
+    pub fn protect_paths(&mut self, paths: &[PathBuf]) {
+        let unrestricted = Self::empty();
+        for target in paths {
+            if let Ok(entry) = path::inspect_path(target, &unrestricted) {
+                self.ids.insert(entry.identity);
+            }
         }
     }
 
@@ -57,8 +74,6 @@ impl Forbidden {
         }
 
         let name = name.to_string_lossy();
-        self.names
-            .iter()
-            .any(|forbidden| equals_ignore_case(&name, forbidden))
+        self.protects_name(&name)
     }
 }
